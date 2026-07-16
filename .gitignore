@@ -1,0 +1,19 @@
+# 비밀키
+.env
+
+# 소설 원문 (저작권) — requirements.txt는 예외
+*.txt
+!requirements.txt
+
+# 가상환경
+.venv/
+
+# 로컬 런타임 데이터
+logs/
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
