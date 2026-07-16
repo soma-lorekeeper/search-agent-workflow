@@ -1,9 +1,10 @@
 # 비밀키
 .env
 
-# 소설 원문 (저작권) — requirements.txt는 예외
+# 소설 원문 (저작권) — requirements.txt, eval/ 합성 테스트 원고는 예외
 *.txt
 !requirements.txt
+!eval/*.txt
 
 # 가상환경
 .venv/

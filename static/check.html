@@ -6,35 +6,19 @@
 <title>설정 오류 리포트</title>
 <style>
   :root {
-    color-scheme: light dark;
-    --bg: #f7f7f8;
+    --bg: #ffffff;
     --panel: #ffffff;
-    --border: #e3e3e6;
+    --border: #e5e7eb;
     --text: #1a1a1a;
-    --muted: #7a7a80;
+    --muted: #6b7280;
     --accent: #2563eb;
     --bad: #dc2626;
     --bad-bg: #fef2f2;
     --ok: #16a34a;
     --ok-bg: #f0fdf4;
-    --unknown: #9a7b00;
+    --unknown: #92720a;
     --unknown-bg: #fefbea;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f1115;
-      --panel: #16181d;
-      --border: #2a2d34;
-      --text: #e8e8ea;
-      --muted: #9a9aa2;
-      --accent: #5b8cff;
-      --bad: #f87171;
-      --bad-bg: #2a1616;
-      --ok: #4ade80;
-      --ok-bg: #14231a;
-      --unknown: #f2c94c;
-      --unknown-bg: #26220f;
-    }
+    --code-bg: #f3f4f6;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -62,7 +46,7 @@
     border-radius: 8px;
     padding: 6px 10px;
   }
-  header a:hover { color: var(--text); }
+  header a:hover { color: var(--text); background: #f3f4f6; }
   main { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
   .panel {
     background: var(--panel);
@@ -106,7 +90,7 @@
     margin-left: auto;
   }
   button#run:disabled { opacity: 0.5; cursor: default; }
-  #status { font-size: 13px; color: var(--muted); }
+  #status { font-size: 13px; color: var(--muted); margin-top: 8px; }
   #summary { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
   .claim {
     border: 1px solid var(--border);
@@ -120,8 +104,17 @@
   .badge.contradiction { color: var(--bad); background: var(--bad-bg); }
   .badge.consistent { color: var(--ok); background: var(--ok-bg); }
   .badge.unknown { color: var(--unknown); background: var(--unknown-bg); }
-  .field { font-size: 13px; line-height: 1.5; margin-top: 4px; }
-  .field .k { color: var(--muted); }
+  .field { font-size: 13px; line-height: 1.55; margin-top: 6px; }
+  .field .k { color: var(--muted); font-size: 12px; display: block; margin-bottom: 1px; }
+  .field p { margin: 0; }
+  .field code {
+    background: var(--code-bg);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 0.9em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .field strong { font-weight: 700; }
 </style>
 </head>
 <body>
@@ -147,6 +140,16 @@
 </div>
 
 <script>
+  // 외부 라이브러리 없이 처리하는 최소 마크다운 인라인 렌더러 (굵게/기울임/코드)
+  function renderInline(text) {
+    const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    let s = esc(text || "");
+    s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
+    return `<p>${s}</p>`;
+  }
+
   const textEl = document.getElementById("text");
   const labelEl = document.getElementById("label");
   const fileEl = document.getElementById("file");
@@ -198,29 +201,24 @@
 
       const quote = document.createElement("div");
       quote.className = "field";
-      quote.innerHTML = `<span class="k">추출된 서술 (질문):</span> ${escapeHtml(r.quote || "")}`;
+      const src = r.source_episode ? `${r.source_episode}화` : "-";
+      quote.innerHTML =
+        `<span class="k">추출된 서술 (질문)</span>${renderInline(r.quote)}`;
       div.appendChild(quote);
 
       const evidence = document.createElement("div");
       evidence.className = "field";
-      const src = r.source_episode ? `${r.source_episode}화` : "-";
       evidence.innerHTML =
-        `<span class="k">검색된 근거 (${src}):</span> ${escapeHtml(r.established_fact || "(근거 없음)")}`;
+        `<span class="k">검색된 근거 (${src})</span>${renderInline(r.established_fact || "(근거 없음)")}`;
       div.appendChild(evidence);
 
       const explain = document.createElement("div");
       explain.className = "field";
-      explain.innerHTML = `<span class="k">판단:</span> ${escapeHtml(r.explanation || "")}`;
+      explain.innerHTML = `<span class="k">판단</span>${renderInline(r.explanation)}`;
       div.appendChild(explain);
 
       resultsEl.appendChild(div);
     }
-  }
-
-  function escapeHtml(s) {
-    const d = document.createElement("div");
-    d.textContent = s;
-    return d.innerHTML;
   }
 
   async function run() {
