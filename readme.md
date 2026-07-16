@@ -4,8 +4,8 @@
 답변하는 LangGraph 기반 질의응답 에이전트 PoC. 『전지적 독자 시점』 1~6화 원문을 인덱싱
 대상으로 검증했다.
 
-개발 계획과 target query 정답지는 [`plan.md`](plan.md), 오늘 구현 내용 상세 요약은
-[`SUMMARY.md`](SUMMARY.md) 참고.
+개발 계획과 target query 정답지는 [`plan.md`](plan.md), 저장소/에이전트 동작 방식을 자세히
+알고 싶다면 [`ARCHITECTURE.md`](ARCHITECTURE.md) 참고.
 
 ## 원래 비전
 
@@ -106,11 +106,10 @@ python3.12 -m venv .venv
 
 ## 알려진 한계
 
-자세한 내용은 [`SUMMARY.md`](SUMMARY.md) 참고. 요약하면:
+자세한 내용은 [`ARCHITECTURE.md`](ARCHITECTURE.md) 8절 참고. 요약하면:
 
-- 인덱싱 범위(1~6화)를 벗어나는 전역 질문("소설 전체 요약해줘")에서 사전학습 지식으로
-  할루시네이션 발생 가능 — 미해결.
 - 에디터 통합, 증분 인덱싱, 레트콘 대응, "다음 작성 추천" 기능 없음 (Q&A 코어만 구현).
 - 대화 상태가 인메모리(`MemorySaver`)라 서버 재시작 시 소실.
 - `structured_query`(MySQL/Text2SQL)는 `graph_query`(Neo4j/Text2Cypher)로 대체되어 현재
   에이전트에는 연결되어 있지 않다 (코드와 데이터는 남아 있음).
+- 설정오류(모순) 탐지는 미구현 — 평가 데이터셋(`eval/contradiction_test_set.json`)만 준비됨.
