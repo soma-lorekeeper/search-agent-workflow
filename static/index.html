@@ -56,6 +56,16 @@
     justify-content: space-between;
   }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .nav { display: flex; align-items: center; gap: 8px; }
+  header a {
+    color: var(--muted);
+    font-size: 12px;
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 10px;
+  }
+  header a:hover { color: var(--text); }
   header button {
     background: none;
     border: 1px solid var(--border);
@@ -122,7 +132,10 @@
 <div id="app">
   <header>
     <h1>소설 세계관 Q&A</h1>
-    <button id="reset">새 대화</button>
+    <div class="nav">
+      <a href="/check">설정 오류 리포트 →</a>
+      <button id="reset">새 대화</button>
+    </div>
   </header>
   <div id="messages"></div>
   <div id="inputbar">
