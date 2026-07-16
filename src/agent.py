@@ -9,6 +9,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
+from src import mysqldb
 from src.config import OPENAI_API_KEY, OPENAI_MODEL
 from src.tools import graph_query, vector_search
 
@@ -54,6 +55,10 @@ GRADE_SYSTEM_PROMPT = """\
 보류 상태)에서 멈춰 있고 그 뒤에 무슨 일이 있었는지가 없다면, 아직 불충분하다고 판단하라.
 질문이 "다시 그런 적 있는지" 같은 반복 여부를 묻는데 한 번의 검색만으로 "없다"고 결론
 내렸다면, 다른 표현으로 최소 한 번 더 검색해봤는지 의심하고 불충분하다고 판단하라.
+대화 맥락(시스템 프롬프트)에 안내된 "인덱싱된 화별 요약"의 범위를 벗어나는 정보(그
+범위 이후의 전개, 결말 등)를 묻는 질문이라면, 도구가 못 찾은 게 아니라 애초에 존재하지
+않는 정보다 — 이런 경우는 재검색을 요구하지 말고 충분함으로 판단해서 "정보 없음"으로
+바로 답하게 하라.
 JSON으로만 답하라: {"sufficient": true|false, "hint": "불충분하다면 다음에 무엇을 다르게
 검색해야 하는지에 대한 한 문장 제안, 충분하다면 빈 문자열"}
 """
@@ -67,12 +72,44 @@ class AgentState(TypedDict):
 _llm = ChatOpenAI(model=OPENAI_MODEL, api_key=OPENAI_API_KEY)
 _llm_with_tools = _llm.bind_tools(TOOLS)
 
+_episode_summaries_block_cache: str | None = None
+
+
+def _episode_summaries_block() -> str:
+    """인덱싱된 화별 요약을 시스템 프롬프트에 항상 주입한다.
+    - 거시적 질문("전체 줄거리 요약해줘")에 검색 없이 바로, 근거 있게 답할 수 있게 하고,
+    - DB가 다루는 화 범위를 명시해 그 밖의 내용(예: 결말)을 사전학습 지식으로
+      지어내는 할루시네이션을 막는다. 화당 요약 몇 줄 수준이라 토큰 비용은 무시할 만하다."""
+    global _episode_summaries_block_cache
+    if _episode_summaries_block_cache is None:
+        try:
+            rows = mysqldb.get_all_episode_summaries()
+        except Exception:
+            rows = []
+        if rows:
+            episodes = [r["episode"] for r in rows]
+            lines = [f"- {r['episode']}화: {r['summary']}" for r in rows]
+            _episode_summaries_block_cache = (
+                f"[인덱싱된 화별 요약 — 이 DB는 {min(episodes)}~{max(episodes)}화까지만 다룬다. "
+                "이 범위를 벗어나는 내용(그 이후 전개, 결말 등)을 묻는 질문에는 절대 사전학습된 "
+                "지식으로 채우지 말고, 인덱싱 범위 밖이라 확인할 수 없다고 명확히 밝혀라.]\n"
+                + "\n".join(lines)
+            )
+        else:
+            _episode_summaries_block_cache = ""
+    return _episode_summaries_block_cache
+
+
+def _system_prompt() -> str:
+    block = _episode_summaries_block()
+    return AGENT_SYSTEM_PROMPT + (f"\n\n{block}" if block else "")
+
 
 def agent_node(state: AgentState) -> dict:
     round_no = state.get("tool_rounds", 0)
     messages = state["messages"]
     if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content=AGENT_SYSTEM_PROMPT), *messages]
+        messages = [SystemMessage(content=_system_prompt()), *messages]
     response = _llm_with_tools.invoke(messages)
 
     if response.tool_calls:
@@ -122,7 +159,7 @@ def final_answer_node(state: AgentState) -> dict:
 
     messages = [
         SystemMessage(
-            content=AGENT_SYSTEM_PROMPT
+            content=_system_prompt()
             + "\n\n[시스템] 도구 호출 한도에 도달했다. 더 이상 도구를 호출할 수 없다. "
             "지금까지 얻은 정보만으로 최종 답변을 작성하거나, 확인할 수 없다고 명확히 밝혀라."
         ),

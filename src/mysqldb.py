@@ -100,6 +100,16 @@ def upsert_episode_summary(episode: int, summary: str) -> None:
         conn.close()
 
 
+def get_all_episode_summaries() -> list[dict]:
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT episode, summary FROM episode_summaries ORDER BY episode")
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
 def list_entity_names(limit: int = 200) -> list[str]:
     conn = get_connection()
     try:
