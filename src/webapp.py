@@ -25,13 +25,13 @@ class ChatResponse(BaseModel):
 
 
 @app.get("/")
-def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+def upload_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "upload.html")
 
 
-@app.get("/check")
-def check_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "check.html")
+@app.get("/report")
+def report_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "report.html")
 
 
 @app.post("/chat", response_model=ChatResponse)

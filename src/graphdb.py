@@ -100,6 +100,33 @@ def add_fact(
             )
 
 
+def list_entity_names(limit: int = 300) -> list[str]:
+    """인덱싱 시 LLM 추출 프롬프트에 넘길 '이미 알려진 엔티티 이름' 목록 (표기 통일용)."""
+    driver = get_driver()
+    with driver.session(default_access_mode=READ_ACCESS) as session:
+        result = session.run(
+            "MATCH (n) WHERE n:Character OR n:Item OR n:Location OR n:Faction OR n:Skill "
+            "RETURN DISTINCT n.name AS name LIMIT $limit",
+            limit=limit,
+        )
+        return [r["name"] for r in result]
+
+
+def get_stats() -> dict:
+    """업로드 확인 화면 등에 쓸 요약 통계."""
+    driver = get_driver()
+    with driver.session(default_access_mode=READ_ACCESS) as session:
+        entity_count = session.run(
+            "MATCH (n) WHERE n:Character OR n:Item OR n:Location OR n:Faction OR n:Skill "
+            "RETURN count(n) AS c"
+        ).single()["c"]
+        fact_count = session.run("MATCH (f:Fact) RETURN count(f) AS c").single()["c"]
+        by_label = {}
+        for label in ENTITY_LABELS.values():
+            by_label[label] = session.run(f"MATCH (n:{label}) RETURN count(n) AS c").single()["c"]
+        return {"entities": entity_count, "facts": fact_count, "by_label": by_label}
+
+
 class UnsafeCypherError(Exception):
     pass
 

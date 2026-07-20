@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>원고 접수 · 결</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@600;700&family=IBM+Plex+Sans+KR:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap"
+  rel="stylesheet"
+/>
+<style>
+  :root {
+    --paper: #fbfaf7;
+    --surface: #ffffff;
+    --ink: #24211d;
+    --ink-muted: #6b6355;
+    --rule: #e7e2d6;
+    --rule-strong: #d8d1c1;
+    --mark-rose: #f2c9ce;
+    --mark-sky: #c9dce6;
+    --mark-sage: #cfe2c4;
+    --mark-sage-ink: #3c5c30;
+    --mark-butter: #f1e1a6;
+    --accent: #8b3a46;
+    --accent-ink: #ffffff;
+    --font-display: "Noto Serif KR", serif;
+    --font-body: "IBM Plex Sans KR", -apple-system, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    line-height: 1.6;
+  }
+  a { color: inherit; }
+
+  /* ---------- header / nav ---------- */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 22px 40px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .wordmark { display: flex; align-items: baseline; gap: 10px; }
+  .wordmark .glyph {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 22px;
+  }
+  .wordmark .tagline {
+    font-size: 12px;
+    color: var(--ink-muted);
+    letter-spacing: 0.02em;
+  }
+  nav { display: flex; gap: 4px; }
+  nav a {
+    text-decoration: none;
+    font-size: 13px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    color: var(--ink-muted);
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  nav a:hover { color: var(--ink); background: var(--surface); }
+  nav a.active { color: var(--ink); background: var(--surface); border: 1px solid var(--rule); }
+
+  main {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 56px 24px 100px;
+  }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 14px;
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 34px;
+    line-height: 1.35;
+    margin: 0 0 14px;
+    letter-spacing: -0.01em;
+  }
+  .lede {
+    font-size: 15px;
+    color: var(--ink-muted);
+    max-width: 46em;
+    margin: 0 0 40px;
+  }
+
+  /* ---------- dropzone ---------- */
+  .dropzone {
+    border: 1.5px dashed var(--rule-strong);
+    border-radius: 16px;
+    padding: 40px 24px;
+    text-align: center;
+    background: var(--surface);
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .dropzone:hover, .dropzone.dragover {
+    border-color: var(--accent);
+    background: #fff9f6;
+  }
+  .dropzone:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  .dropzone .icon {
+    width: 40px;
+    height: 40px;
+    margin: 0 auto 14px;
+    color: var(--ink-muted);
+  }
+  .dropzone .primary { font-size: 14px; margin-bottom: 4px; }
+  .dropzone .secondary { font-size: 12px; color: var(--ink-muted); }
+  .dropzone input[type=file] { display: none; }
+
+  /* ---------- manuscript list ---------- */
+  .manuscripts {
+    margin-top: 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .m-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 12px 14px;
+    opacity: 0;
+    transform: translateY(6px);
+    animation: rise 0.35s ease forwards;
+  }
+  @keyframes rise { to { opacity: 1; transform: translateY(0); } }
+  .m-stamp {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 3px 7px;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+  }
+  .m-name { flex: 1; font-size: 13.5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .m-size { font-family: var(--font-mono); font-size: 11px; color: var(--ink-muted); }
+  .m-status {
+    font-size: 12px;
+    color: var(--ink-muted);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 76px;
+    justify-content: flex-end;
+  }
+  .m-status .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--rule-strong);
+    flex-shrink: 0;
+  }
+  .m-row.reading .m-status .dot { background: var(--mark-butter); animation: pulse 1s ease-in-out infinite; }
+  .m-row.reading .m-status { color: #9c7a1f; }
+  .m-row.done .m-status .dot { background: var(--mark-sage-ink); }
+  .m-row.done .m-status { color: var(--mark-sage-ink); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .m-remove {
+    background: none; border: none; color: var(--ink-muted);
+    cursor: pointer; font-size: 15px; line-height: 1; padding: 2px 4px;
+  }
+  .m-remove:hover { color: var(--accent); }
+
+  .actions { margin-top: 28px; display: flex; align-items: center; gap: 14px; }
+  button.primary {
+    font-family: var(--font-body);
+    font-weight: 500;
+    font-size: 14px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    border: none;
+    border-radius: 10px;
+    padding: 12px 22px;
+    cursor: pointer;
+    transition: opacity 0.15s ease, transform 0.1s ease;
+  }
+  button.primary:hover:not(:disabled) { opacity: 0.92; }
+  button.primary:active:not(:disabled) { transform: translateY(1px); }
+  button.primary:disabled { background: var(--rule-strong); cursor: not-allowed; }
+  .actions .hint { font-size: 12px; color: var(--ink-muted); }
+
+  /* ---------- receipt ---------- */
+  .receipt {
+    margin-top: 36px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 14px;
+    padding: 26px 28px;
+    display: none;
+    opacity: 0;
+    animation: rise 0.4s ease forwards;
+  }
+  .receipt.show { display: block; }
+  .receipt .r-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    color: var(--mark-sage-ink);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .receipt h2 {
+    font-family: var(--font-display);
+    font-size: 21px;
+    margin: 0 0 18px;
+  }
+  .r-stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+  }
+  .r-stat { border-left: 2px solid var(--rule); padding-left: 12px; }
+  .r-stat .num { font-family: var(--font-mono); font-size: 22px; font-weight: 500; }
+  .r-stat .label { font-size: 11.5px; color: var(--ink-muted); margin-top: 2px; }
+
+  @media (max-width: 560px) {
+    header { padding: 18px 20px; }
+    main { padding: 40px 18px 80px; }
+    h1 { font-size: 27px; }
+    .r-stats { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wordmark">
+    <span class="glyph">결</span>
+    <span class="tagline">이야기의 결을 기억합니다</span>
+  </div>
+  <nav>
+    <a href="/" class="active">원고 접수</a>
+    <a href="/report">정합성 리포트</a>
+  </nav>
+</header>
+
+<main>
+  <div class="eyebrow">01 · 원고 접수</div>
+  <h1>지금까지 쓴 회차를<br />올려주세요</h1>
+  <p class="lede">
+    1화부터 최신 화까지 한 번에 올리면, 인물과 아이템과 사건이 어떻게 얽혀 있는지
+    읽어 둡니다. 나중에 새 회차를 올릴 때 이 기록과 비교합니다.
+  </p>
+
+  <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="원고 파일 선택">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3">
+      <path d="M12 3v12M12 3l-4 4M12 3l4 4" stroke-linecap="round" stroke-linejoin="round" />
+      <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke-linecap="round" stroke-linejoin="round" />
+    </svg>
+    <div class="primary">원고 파일을 여기로 끌어다 놓으세요</div>
+    <div class="secondary">또는 클릭해서 파일 선택 · .txt, 여러 개 선택 가능</div>
+    <input type="file" id="fileInput" multiple accept=".txt" />
+  </div>
+
+  <div class="manuscripts" id="manuscripts"></div>
+
+  <div class="actions">
+    <button class="primary" id="startBtn" disabled>접수 시작</button>
+    <span class="hint" id="hint">파일을 추가하면 접수를 시작할 수 있어요</span>
+  </div>
+
+  <div class="receipt" id="receipt">
+    <div class="r-eyebrow">접수 완료</div>
+    <h2 id="receiptTitle">10화 접수 완료</h2>
+    <div class="r-stats">
+      <div class="r-stat"><div class="num">24</div><div class="label">인물</div></div>
+      <div class="r-stat"><div class="num">9</div><div class="label">아이템</div></div>
+      <div class="r-stat"><div class="num">6</div><div class="label">장소</div></div>
+      <div class="r-stat"><div class="num">41</div><div class="label">사건 · 관계</div></div>
+    </div>
+  </div>
+</main>
+
+<script>
+  const dropzone = document.getElementById("dropzone");
+  const fileInput = document.getElementById("fileInput");
+  const manuscriptsEl = document.getElementById("manuscripts");
+  const startBtn = document.getElementById("startBtn");
+  const hint = document.getElementById("hint");
+  const receipt = document.getElementById("receipt");
+  const receiptTitle = document.getElementById("receiptTitle");
+
+  let files = [];
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return bytes + "B";
+    return Math.round(bytes / 1024) + "KB";
+  }
+
+  function episodeLabel(name, index) {
+    const m = name.match(/(\d+)/);
+    const n = m ? parseInt(m[1], 10) : index + 1;
+    return String(n).padStart(2, "0") + "화";
+  }
+
+  function render() {
+    manuscriptsEl.innerHTML = "";
+    files.forEach((f, i) => {
+      const row = document.createElement("div");
+      row.className = "m-row";
+      row.style.animationDelay = i * 40 + "ms";
+      row.dataset.index = i;
+      row.innerHTML = `
+        <span class="m-stamp">${episodeLabel(f.name, i)}</span>
+        <span class="m-name">${f.name}</span>
+        <span class="m-size">${formatSize(f.size)}</span>
+        <span class="m-status"><span class="dot"></span><span class="label">대기 중</span></span>
+        <button class="m-remove" title="제거" aria-label="제거">×</button>
+      `;
+      row.querySelector(".m-remove").addEventListener("click", () => {
+        files.splice(i, 1);
+        render();
+      });
+      manuscriptsEl.appendChild(row);
+    });
+    startBtn.disabled = files.length === 0;
+    hint.textContent =
+      files.length === 0
+        ? "파일을 추가하면 접수를 시작할 수 있어요"
+        : `${files.length}개 회차가 대기 중이에요`;
+    receipt.classList.remove("show");
+  }
+
+  function addFiles(fileList) {
+    for (const f of fileList) {
+      if (!files.some((x) => x.name === f.name)) files.push(f);
+    }
+    files.sort((a, b) => {
+      const na = parseInt((a.name.match(/(\d+)/) || [0, 0])[1], 10);
+      const nb = parseInt((b.name.match(/(\d+)/) || [0, 0])[1], 10);
+      return na - nb;
+    });
+    render();
+  }
+
+  dropzone.addEventListener("click", () => fileInput.click());
+  dropzone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      fileInput.click();
+    }
+  });
+  fileInput.addEventListener("change", (e) => addFiles(e.target.files));
+
+  ["dragenter", "dragover"].forEach((evt) =>
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.add("dragover");
+    })
+  );
+  ["dragleave", "drop"].forEach((evt) =>
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.remove("dragover");
+    })
+  );
+  dropzone.addEventListener("drop", (e) => addFiles(e.dataTransfer.files));
+
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  async function startIntake() {
+    startBtn.disabled = true;
+    startBtn.textContent = "읽는 중...";
+    hint.textContent = "";
+
+    const rows = [...manuscriptsEl.querySelectorAll(".m-row")];
+    for (const row of rows) {
+      row.classList.add("reading");
+      row.querySelector(".m-status .label").textContent = "읽는 중";
+      await sleep(320 + Math.random() * 260);
+      row.classList.remove("reading");
+      row.classList.add("done");
+      row.querySelector(".m-status .label").textContent = "완료";
+    }
+
+    receiptTitle.textContent = `${files.length}화 접수 완료`;
+    receipt.classList.add("show");
+    startBtn.textContent = "접수 완료";
+    hint.textContent = "정합성 리포트 페이지에서 새 회차를 검사할 수 있어요";
+  }
+
+  startBtn.addEventListener("click", startIntake);
+
+  render();
+</script>
+</body>
+</html>

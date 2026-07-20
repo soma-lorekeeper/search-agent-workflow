@@ -1,13 +1,4 @@
 services:
-  qdrant:
-    image: qdrant/qdrant
-    container_name: agentic-workflow-qdrant
-    ports:
-      - "6333:6333"   # REST
-      - "6334:6334"   # gRPC
-    volumes:
-      - agentic_qdrant_data:/qdrant/storage
-
   mysql:
     image: mysql:8
     container_name: agentic-workflow-mysql
@@ -31,6 +22,5 @@ services:
       - agentic_neo4j_data:/data
 
 volumes:
-  agentic_qdrant_data:
   agentic_mysql_data:
   agentic_neo4j_data:

@@ -1,11 +1,12 @@
-# search-agent-workflow
+# search-agent-workflow — 결
 
-소설 세계관에 대해 질문하면 VectorDB(Qdrant)와 GraphDB(Neo4j)를 상황에 맞게 조합해 조회하고
-답변하는 LangGraph 기반 질의응답 에이전트 PoC. 『전지적 독자 시점』 1~6화 원문을 인덱싱
-대상으로 검증했다.
+신규 웹소설 회차를 올리면, 기존 회차들과 내용이 어긋나는 부분(설정 오류)을 정확한 표현·근거
+화수와 함께 짚어주는 게 핵심 목표인 PoC. 저장은 Neo4j(GraphDB) 하나로 통일했고, MySQL은
+화별 원문/요약 같은 "기본정보"만 보관한다. VectorDB(Qdrant)는 더 이상 쓰지 않는다.
 
-개발 계획과 target query 정답지는 [`plan.md`](plan.md), 저장소/에이전트 동작 방식을 자세히
-알고 싶다면 [`ARCHITECTURE.md`](ARCHITECTURE.md) 참고.
+개발 계획과 target query 정답지는 [`plan.md`](plan.md) (예전 VectorDB 포함 아키텍처 기준 —
+현재와 다름, 히스토리 참고용), 저장소/에이전트 동작 방식을 자세히 알고 싶다면
+[`ARCHITECTURE.md`](ARCHITECTURE.md) 참고.
 
 ## 원래 비전
 
@@ -25,56 +26,74 @@
 "이 캐릭터가 예전에 이 물건을 소유하고 있었나?"
 이런 질문에 답할 수 있어야 한다.
 
-이 PoC는 이 비전 중 **Q&A 코어**(에디터 통합, 인덱싱 버튼, "다음 작성 추천" 기능은 제외)만
-구현한 것이다.
+원래 비전 중 지금 초점은 **설정 오류 리포트**(신규 회차 ↔ 기존 회차 정합성 검사)다.
+자유 질의응답(Q&A 챗)은 백엔드(`src/agent.py`)에는 남아 있지만, 지금 프론트엔드에는
+페이지가 없다 (아래 "현재 상태" 참고).
+
+## 현재 상태 (모듈화/리팩터링 진행 중)
+
+지금 프론트엔드 두 페이지는 **mock 데이터로 동작한다 — 실제 백엔드를 호출하지 않는다**
+(API 비용 없음). 화면 흐름과 리포트 형식을 먼저 굳히고, 이후 실제 파이프라인과 연결할
+예정이다.
+
+- **`/` — 원고 접수**: 화 파일을 여러 개 한 번에 올리고, 접수(읽기) 진행 상황과 완료 후
+  요약(인물/아이템/장소/사건 수)을 보여준다.
+- **`/report` — 정합성 리포트**: 신규 회차 파일 하나를 올리면, 정확히 어느 표현이 어떤
+  기존 설정과 왜 어긋나는지를 카드로 보여준다. 발견된 모순뿐 아니라 확인됨/확인 불가
+  항목도 접어서 함께 보여준다.
+
+백엔드(`src/agent.py`의 Q&A, `src/contradiction_check.py`의 실제 검사 파이프라인)는
+Neo4j 전용으로 리팩터링되어 있고 `/chat`, `/check_episode` API로 여전히 호출 가능하지만,
+새 프론트엔드 페이지에서는 아직 연결하지 않았다.
 
 ## 아키텍처
 
 ```
-episode1~6.txt (원문)
+episode*.txt (원문, 여러 화 일괄)
       │
-      ▼  src/indexer.py  (화당 LLM 호출 1회: 청크 임베딩 + entities/facts 동시 추출)
+      ▼  src/indexer.py — 화당 LLM 호출 1회 (entities/facts + 요약 동시 추출)
       │
-      ├─▶ Qdrant (청크 임베딩)              src/vectordb.py
-      └─▶ MySQL (entities/facts, 1차 저장)  src/mysqldb.py
-                │
-                ▼  src/graph_migrate.py (LLM 재호출 없이 그대로 이관)
-              Neo4j: (Character/Item/Location/Faction/Skill)
-                     -[:HAS_FACT]->(Fact)-[:ABOUT]->(엔티티)
+      ├─▶ Neo4j: (Character/Item/Location/Faction/Skill)         src/graphdb.py
+      │          -[:HAS_FACT]->(Fact)-[:ABOUT]->(엔티티)
+      └─▶ MySQL: episodes(원문, 화별 요약) — "기본정보"만          src/mysqldb.py
 
-                          │
-        ┌─────────────────┴─────────────────┐
-        ▼                                     ▼
-  vector_search(query)                 graph_query(question)
-  (Qdrant 의미 검색)                    (자연어 → Cypher → Neo4j, Text2Cypher)
-        └─────────────────┬─────────────────┘
-                           ▼
-              src/agent.py — LangGraph 에이전트 루프
-              agent ↔ tools ↔ grade (Self-RAG 스타일), 라운드 상한 하드캡
                            │
                            ▼
-        src/webapp.py (FastAPI) + static/index.html (채팅 UI)
+                  graph_query(question)
+                  (자연어 → Cypher → Neo4j, Text2Cypher)   src/tools.py
+                           │
+        ┌──────────────────┴──────────────────┐
+        ▼                                       ▼
+  src/agent.py                         src/contradiction_check.py
+  LangGraph Q&A 루프                    claim 추출 → graph_query로 근거
+  (agent↔tools↔grade,                   검색(재검색 루프 포함) → 모순 판정
+   /chat API, 프론트 미연결)             → 리포트 (/check_episode API,
+                                          프론트 미연결 — 지금은 mock)
+
+        src/webapp.py (FastAPI)
+        + static/upload.html (원고 접수, mock)
+        + static/report.html (정합성 리포트, mock)
 ```
 
 ## 핵심 코드 위치
 
 | 무엇 | 파일 |
 |---|---|
-| 에이전트 루프 (그래프 조립, 라운드 상한, 종료 로직) | `src/agent.py` |
-| Tool 정의 (`vector_search`, `graph_query`) | `src/tools.py` |
-| Neo4j 연결/쿼리 가드 | `src/graphdb.py` |
-| Qdrant 연결 | `src/vectordb.py` |
-| 인덱싱 파이프라인 (원문 → 청크+엔티티 추출) | `src/indexer.py`, `src/llm_extractor.py` |
-| MySQL → Neo4j 마이그레이션 | `src/graph_migrate.py` |
-| API 서버 / 채팅 프론트 | `src/webapp.py`, `static/index.html` |
-| 로깅 설정 (tool 호출/생성 쿼리/grade 판정 기록) | `src/logging_config.py` |
-| 평가 스크립트 (target query, held-out query) | `src/evaluate.py`, `src/evaluate_v2.py` |
-| 설정오류(모순) 탐지용 평가 데이터셋 | `eval/contradiction_test_set.json` |
+| Q&A 에이전트 루프 (그래프 조립, 라운드 상한, 종료 로직) | `src/agent.py` |
+| 설정 오류 검사 파이프라인 (claim 추출 → 검색 → 판정 → 리포트) | `src/contradiction_check.py` |
+| Tool 정의 (`graph_query`, Text2Cypher) | `src/tools.py` |
+| Neo4j 연결/쿼리 가드/통계 | `src/graphdb.py` |
+| MySQL 연결 ("기본정보": episodes 원문+요약) | `src/mysqldb.py` |
+| 인덱싱 파이프라인 (원문 → Neo4j/MySQL 동시 기록) | `src/indexer.py`, `src/llm_extractor.py` |
+| API 서버 | `src/webapp.py` |
+| 프론트엔드 (mock) | `static/upload.html`, `static/report.html` |
+| 로깅 설정 (tool 호출/생성 Cypher/grade 판정 기록) | `src/logging_config.py` |
+| 평가 스크립트 | `src/evaluate.py`, `src/evaluate_v2.py`, `src/evaluate_contradiction.py` |
+| 설정오류(모순) 탐지용 평가 데이터셋 | `eval/contradiction_test_set.json`, `eval/draft_episode_test.txt` |
 
-### 에이전트 루프 요약
+### Q&A 에이전트 루프 요약
 
-- `agent` 노드가 질문을 보고 `vector_search`/`graph_query` 중 필요한 도구를 선택해 호출한다
-  (둘 다 호출 가능).
+- `agent` 노드가 질문을 보고 `graph_query`를 호출한다 (필요하면 여러 번).
 - 도구 호출 결과는 `grade` 노드가 "충분한지" 판단(Self-RAG 스타일). 불충분하면 힌트를 남기고
   `agent`로 돌아가 재검색한다.
 - `MAX_TOOL_ROUNDS`(기본 3)에 도달하면 `route_after_agent`가 도구를 아예 바인딩하지 않은
@@ -84,7 +103,7 @@ episode1~6.txt (원문)
 ## 실행 방법
 
 ```bash
-# 1. DB 기동 (Qdrant + MySQL + Neo4j)
+# 1. DB 기동 (MySQL + Neo4j)
 docker compose up -d
 
 # 2. .env 작성 (OPENAI_API_KEY 등 — .env.example 참고)
@@ -93,23 +112,23 @@ docker compose up -d
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 4. 인덱싱 (최초 1회, episode1~6.txt는 별도로 data/ 에 준비 필요 — 저작권상 저장소에는 미포함)
+# 4. 인덱싱 (최초 1회, episode*.txt는 별도로 data/ 에 준비 필요 — 저작권상 저장소에는 미포함)
 .venv/bin/python -m src.indexer
-.venv/bin/python -m src.graph_migrate   # MySQL → Neo4j (LLM 재호출 없음)
 
 # 5. 서버 실행
 .venv/bin/uvicorn src.webapp:app --host 127.0.0.1 --port 8000
-# 브라우저에서 http://127.0.0.1:8000
+# 브라우저에서 http://127.0.0.1:8000 (원고 접수), http://127.0.0.1:8000/report (정합성 리포트)
 ```
 
-로그: `logs/agent.log` (라운드별 tool 호출 인자, 생성된 Cypher/SQL, grade 판정 기록).
+로그: `logs/agent.log` (라운드별 tool 호출 인자, 생성된 Cypher, grade 판정 기록).
 
 ## 알려진 한계
 
-자세한 내용은 [`ARCHITECTURE.md`](ARCHITECTURE.md) 8절 참고. 요약하면:
+자세한 내용은 [`ARCHITECTURE.md`](ARCHITECTURE.md) 참고. 요약하면:
 
-- 에디터 통합, 증분 인덱싱, 레트콘 대응, "다음 작성 추천" 기능 없음 (Q&A 코어만 구현).
+- 새 프론트엔드(원고 접수/정합성 리포트)는 아직 mock 데이터로만 동작 — 실제 백엔드
+  미연결.
+- 에디터 통합, 증분 인덱싱, 레트콘 대응, "다음 작성 추천" 기능 없음.
 - 대화 상태가 인메모리(`MemorySaver`)라 서버 재시작 시 소실.
-- `structured_query`(MySQL/Text2SQL)는 `graph_query`(Neo4j/Text2Cypher)로 대체되어 현재
-  에이전트에는 연결되어 있지 않다 (코드와 데이터는 남아 있음).
-- 설정오류(모순) 탐지는 미구현 — 평가 데이터셋(`eval/contradiction_test_set.json`)만 준비됨.
+- 설정 오류 판정 정확도는 (리팩터링 전 VectorDB 포함 버전 기준) 15개 정답셋에서 93% —
+  Neo4j 단독 구조로 바뀐 뒤 재검증 필요.

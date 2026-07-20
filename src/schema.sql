@@ -1,27 +1,9 @@
-CREATE TABLE IF NOT EXISTS entities (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    type VARCHAR(50) NOT NULL,
-    episode_introduced INT,
-    description TEXT,
-    UNIQUE KEY uniq_name_type (name, type)
-);
-
-CREATE TABLE IF NOT EXISTS facts (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    subject_id INT NOT NULL,
-    predicate VARCHAR(100) NOT NULL,
-    object_id INT NULL,
-    object_text VARCHAR(500) NULL,
-    episode INT NOT NULL,
-    valid_from_episode INT,
-    valid_until_episode INT,
-    note TEXT,
-    FOREIGN KEY (subject_id) REFERENCES entities(id),
-    FOREIGN KEY (object_id) REFERENCES entities(id)
-);
-
-CREATE TABLE IF NOT EXISTS episode_summaries (
+-- MySQL은 "기본정보"(화별 원문/요약)만 보관한다. 인물/아이템/관계 등 그래프 성격 데이터는
+-- 전부 Neo4j(graphdb.py)에만 있다 — 예전처럼 MySQL과 Neo4j에 이중 저장하지 않는다.
+CREATE TABLE IF NOT EXISTS episodes (
     episode INT PRIMARY KEY,
-    summary TEXT
+    title VARCHAR(255),
+    raw_text LONGTEXT NOT NULL,
+    summary TEXT,
+    indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );

@@ -1,44 +1,37 @@
 import re
 
-from src import mysqldb, vectordb
+from src import graphdb, mysqldb
 from src.config import DATA_DIR
 from src.llm_extractor import extract_episode
 
-CHUNK_TARGET_CHARS = 1200
 
-
-def chunk_text(text: str, target_chars: int = CHUNK_TARGET_CHARS) -> list[str]:
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    chunks: list[str] = []
-    buffer = ""
-    for para in paragraphs:
-        if buffer and len(buffer) + len(para) > target_chars:
-            chunks.append(buffer.strip())
-            buffer = para
-        else:
-            buffer = f"{buffer}\n\n{para}" if buffer else para
-    if buffer.strip():
-        chunks.append(buffer.strip())
-    return chunks
+def _guess_title(text: str, episode_num: int) -> str:
+    first_line = text.strip().splitlines()[0] if text.strip() else ""
+    m = re.match(r"\[?\s*\d+\s*화\s*\]?\s*(.*)", first_line)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    return f"{episode_num}화"
 
 
 def index_episode(episode_num: int, path) -> dict:
     text = path.read_text(encoding="utf-8")
 
-    chunks = chunk_text(text)
-    n_chunks = vectordb.upsert_chunks(episode_num, chunks)
-
-    known_entities = mysqldb.list_entity_names()
+    known_entities = graphdb.list_entity_names()
     extracted = extract_episode(episode_num, text, known_entities)
 
-    mysqldb.upsert_episode_summary(episode_num, extracted.get("summary", ""))
+    mysqldb.upsert_episode(
+        episode=episode_num,
+        title=_guess_title(text, episode_num),
+        raw_text=text,
+        summary=extracted.get("summary", ""),
+    )
 
-    entity_type_by_name = {}
+    entity_type_by_name: dict[str, str] = {}
     for entity in extracted.get("entities", []):
         name = entity["name"]
         etype = entity.get("type", "character")
         entity_type_by_name[name] = etype
-        mysqldb.get_or_create_entity(
+        graphdb.upsert_entity(
             name=name,
             entity_type=etype,
             episode_introduced=episode_num,
@@ -50,24 +43,28 @@ def index_episode(episode_num: int, path) -> dict:
         subject_name = fact.get("subject")
         if not subject_name:
             continue
-        subject_type = entity_type_by_name.get(subject_name, "character")
-        subject_id = mysqldb.get_or_create_entity(
-            name=subject_name, entity_type=subject_type, episode_introduced=episode_num
-        )
+        subject_type = entity_type_by_name.get(subject_name)
+        if subject_type is None:
+            subject_type = "character"
+            graphdb.upsert_entity(subject_name, subject_type, episode_num, "")
+            entity_type_by_name[subject_name] = subject_type
 
-        object_id = None
         object_name = fact.get("object")
+        object_type = None
         if object_name:
-            object_type = entity_type_by_name.get(object_name, "character")
-            object_id = mysqldb.get_or_create_entity(
-                name=object_name, entity_type=object_type, episode_introduced=episode_num
-            )
+            object_type = entity_type_by_name.get(object_name)
+            if object_type is None:
+                object_type = "character"
+                graphdb.upsert_entity(object_name, object_type, episode_num, "")
+                entity_type_by_name[object_name] = object_type
 
-        mysqldb.insert_fact(
-            subject_id=subject_id,
+        graphdb.add_fact(
+            subject_name=subject_name,
+            subject_type=subject_type,
             predicate=fact.get("predicate", "related_to"),
             episode=episode_num,
-            object_id=object_id,
+            object_name=object_name,
+            object_type=object_type,
             object_text=fact.get("object_text"),
             valid_from_episode=fact.get("valid_from_episode") or episode_num,
             valid_until_episode=fact.get("valid_until_episode"),
@@ -77,22 +74,18 @@ def index_episode(episode_num: int, path) -> dict:
 
     return {
         "episode": episode_num,
-        "chunks": n_chunks,
         "entities": len(extracted.get("entities", [])),
         "facts": n_facts,
     }
 
 
 def run_indexing(episodes: range = range(1, 7)) -> None:
-    vectordb.ensure_collection()
+    graphdb.init_schema()
     mysqldb.init_schema()
     for ep in episodes:
         path = DATA_DIR / f"episode{ep}.txt"
         result = index_episode(ep, path)
-        print(
-            f"[episode {ep}] chunks={result['chunks']} "
-            f"entities={result['entities']} facts={result['facts']}"
-        )
+        print(f"[episode {ep}] entities={result['entities']} facts={result['facts']}")
 
 
 if __name__ == "__main__":

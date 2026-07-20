@@ -2,7 +2,6 @@ langgraph
 langchain-core
 langchain-openai
 openai
-qdrant-client
 pymysql
 neo4j
 python-dotenv

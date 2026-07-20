@@ -1,7 +1,7 @@
 """신규 회차 원고를 기존 세계관 설정과 대조해 설정 오류를 탐지한다.
 
-파이프라인: 신규 회차 원문 → (LLM) 검증할 claim 목록 추출 → claim마다 vector_search/
-graph_query로 기존 설정 근거 검색 → (LLM) 모순 여부 판정 → 리포트 생성.
+파이프라인: 신규 회차 원문 → (LLM) 검증할 claim 목록 추출 → claim마다 graph_query로
+기존 설정 근거 검색 → (LLM) 모순 여부 판정 → 리포트 생성.
 """
 
 import json
@@ -12,12 +12,13 @@ from pathlib import Path
 from openai import OpenAI
 
 from src.config import OPENAI_API_KEY, OPENAI_MODEL, ROOT_DIR
-from src.tools import graph_query, vector_search
+from src.tools import graph_query
 
 _client = OpenAI(api_key=OPENAI_API_KEY)
 logger = logging.getLogger("agent.contradiction")
 
 MAX_CLAIMS = 20
+MAX_CLAIM_ROUNDS = 3  # claim당 검색 재시도 상한 (Q&A 에이전트의 grade 루프와 동일한 취지)
 REPORTS_DIR = ROOT_DIR / "reports"
 
 CLAIM_EXTRACTION_PROMPT = """\
@@ -56,11 +57,19 @@ CLAIM_CHECK_PROMPT = """\
   리포트하면 신뢰를 잃는다.
 - "consistent"는 근거가 claim의 핵심 사실을 지지하거나, 최소한 반박하지 않을 때 쓴다.
 
+지금까지의 검색 결과가 여러 라운드에 걸쳐 누적되어 주어질 수 있다. 이전 라운드 근거로
+불충분해서 검색어를 바꿔 재검색한 것이니, 누적된 근거 전체를 종합해서 판단하라.
+
+label이 "unknown"이면, retry_hint에 "다음 라운드에 검색어를 어떻게 바꿔야 근거를 찾을 수
+있을지"에 대한 한 문장 제안을 반드시 채워라 (예: 다른 동의어, 더 구체적인 인물/사건명,
+claim의 다른 핵심어 사용 등). label이 unknown이 아니면 retry_hint는 빈 문자열로 둔다.
+
 JSON 객체로만 답하라:
 {"label": "contradiction|consistent|unknown",
  "established_fact": "판단 근거가 된 기존 설정 요약 한두 문장 (없으면 빈 문자열)",
  "source_episode": 근거가 된 화 번호(정수, 모르면 null),
- "explanation": "왜 그렇게 판단했는지 한두 문장"}
+ "explanation": "왜 그렇게 판단했는지 한두 문장",
+ "retry_hint": "label이 unknown일 때만: 다음 검색에 쓸 다른 표현/키워드 제안 (아니면 빈 문자열)"}
 """
 
 
@@ -79,36 +88,60 @@ def extract_claims(text: str, max_claims: int = MAX_CLAIMS) -> list[dict]:
     return claims[:max_claims]
 
 
-def check_claim(claim: dict) -> dict:
+def check_claim(claim: dict, max_rounds: int = MAX_CLAIM_ROUNDS) -> dict:
+    """claim 하나를 검사한다. 판정이 "unknown"이면 LLM이 제안한 다른 검색어로 최대
+    max_rounds번까지 재검색한다 (Q&A 에이전트의 grade 재검색 루프와 동일한 취지).
+    라운드마다 누적된 근거를 전부 판정 LLM에 다시 보여준다."""
     quote = claim.get("quote", "")
     entities = claim.get("entities") or []
     entity_str = ", ".join(entities)
 
-    search_query = f"{quote} (관련 대상: {entity_str})" if entities else quote
-    vec_result = vector_search.invoke({"query": search_query, "top_k": 5})
+    search_terms = quote
+    evidence_blocks: list[str] = []
+    verdict: dict = {}
 
-    graph_question = (
-        f'다음 서술과 관련해 확인된 기존 설정 사실을 모두 찾아줘: "{quote}"'
-        + (f" (관련 대상: {entity_str})" if entities else "")
-    )
-    graph_result = graph_query.invoke({"question": graph_question})
+    for round_no in range(1, max_rounds + 1):
+        graph_question = (
+            f'다음 서술과 관련해 확인된 기존 설정 사실을 모두 찾아줘: "{search_terms}"'
+            + (f" (관련 대상: {entity_str})" if entities else "")
+        )
+        graph_result = graph_query.invoke({"question": graph_question})
 
-    user_content = (
-        f"[신규 회차 서술 (claim)]\n{quote}\n\n"
-        f"[카테고리] {claim.get('category', '기타')}\n\n"
-        f"[vector_search 결과]\n{vec_result}\n\n"
-        f"[graph_query 결과]\n{graph_result}"
-    )
-    response = _client.chat.completions.create(
-        model=OPENAI_MODEL,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": CLAIM_CHECK_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-    )
-    verdict = json.loads(response.choices[0].message.content)
-    return {**claim, **verdict}
+        evidence_blocks.append(
+            f"[{round_no}차 검색 — 검색어: {search_terms}]\ngraph_query 결과:\n{graph_result}"
+        )
+
+        user_content = (
+            f"[신규 회차 서술 (claim, 원문 그대로)]\n{quote}\n\n"
+            f"[카테고리] {claim.get('category', '기타')}\n\n"
+            + "\n\n".join(evidence_blocks)
+        )
+        response = _client.chat.completions.create(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": CLAIM_CHECK_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        verdict = json.loads(response.choices[0].message.content)
+        logger.info(
+            "  [%d/%d라운드] 판정=%s%s",
+            round_no,
+            max_rounds,
+            verdict.get("label"),
+            f" | 재검색 힌트: {verdict.get('retry_hint')}" if verdict.get("label") == "unknown" else "",
+        )
+
+        if verdict.get("label") != "unknown":
+            break
+        hint = (verdict.get("retry_hint") or "").strip()
+        if not hint or round_no == max_rounds:
+            break
+        search_terms = hint
+
+    verdict.pop("retry_hint", None)
+    return {**claim, **verdict, "rounds": round_no}
 
 
 def check_new_episode(text: str) -> list[dict]:
@@ -189,6 +222,10 @@ def run_check(path: Path, episode_label: str | None = None) -> Path:
 
 if __name__ == "__main__":
     import sys
+
+    from src.logging_config import setup_logging
+
+    setup_logging()
 
     if len(sys.argv) < 2:
         print("사용법: python -m src.contradiction_check <신규 회차 텍스트 파일> [라벨]")
