@@ -173,24 +173,55 @@
     font-family: var(--font-display);
     font-size: 18px;
     font-weight: 600;
-    margin: 0 0 16px;
+    margin: 0 0 6px;
   }
+  .section-hint { font-size: 12.5px; color: var(--ink-muted); margin: 0 0 16px; }
 
   .redline-card {
     background: var(--surface);
     border: 1px solid var(--rule);
     border-radius: 14px;
-    padding: 22px 22px 18px;
-    margin-bottom: 18px;
+    margin-bottom: 14px;
     opacity: 0;
     transform: translateY(8px);
     animation: rise 0.4s ease forwards;
     transition: box-shadow 0.15s ease, transform 0.15s ease;
+    overflow: hidden;
   }
   .redline-card:hover { box-shadow: 0 6px 20px -12px rgba(36, 33, 29, 0.25); transform: translateY(-1px); }
   @keyframes rise { to { opacity: 1; transform: translateY(0); } }
 
-  .rc-head { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .redline-card summary {
+    list-style: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 15px 20px;
+    transition: background 0.15s ease;
+  }
+  .redline-card summary::-webkit-details-marker { display: none; }
+  .redline-card summary:hover { background: #fdfbf9; }
+  .redline-card summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  .rc-chev {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-muted);
+    flex-shrink: 0;
+    transition: transform 0.15s ease;
+  }
+  .redline-card[open] .rc-chev { transform: rotate(90deg); }
+
+  .rc-oneline {
+    flex: 1;
+    font-size: 14px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .rc-tag {
     font-family: var(--font-mono);
     font-size: 10.5px;
@@ -200,12 +231,20 @@
     border-radius: 6px;
     padding: 3px 8px;
     color: var(--ink-muted);
+    flex-shrink: 0;
   }
   .rc-stamp {
     font-family: var(--font-mono);
     font-size: 10.5px;
     color: var(--mark-rose-ink);
     margin-left: auto;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .rc-details {
+    border-top: 1px solid var(--rule);
+    padding: 18px 20px 20px;
   }
 
   .rc-body {
@@ -369,6 +408,7 @@
     </div>
 
     <h2 class="section-title">발견된 모순</h2>
+    <p class="section-hint">항목을 클릭하면 정확히 어느 표현이 어떤 근거와 왜 어긋나는지 볼 수 있습니다.</p>
     <div id="cardList"></div>
 
     <details class="side-block">
@@ -430,6 +470,7 @@
     contradictions: [
       {
         category: "생사",
+        summary: "이미 죽은 천인호가 다시 등장함",
         excerptBefore: "그날 ",
         highlight: "정희원의 칼끝을 피해 용케 목숨을 건진",
         excerptAfter: " 그는, 상처투성이 몸을 이끌고 이곳까지 몰래 뒤따라온 것이었다.",
@@ -439,6 +480,7 @@
       },
       {
         category: "소유물",
+        summary: "'부러지지 않는 신념'의 소유자가 다르게 서술됨",
         excerptBefore: "이현성은 허리춤에 매달린 ",
         highlight: "'부러지지 않는 신념'",
         excerptAfter: "을 슬쩍 매만졌다.",
@@ -448,6 +490,7 @@
       },
       {
         category: "장소",
+        summary: "두 번째 시나리오의 목적지가 다르게 서술됨",
         excerptBefore: "[두 번째 메인 시나리오 - 조우]의 목적지는 ",
         highlight: "종로3가",
         excerptAfter: "로 표시되어 있었다.",
@@ -476,28 +519,32 @@
   function renderReport() {
     cardList.innerHTML = "";
     MOCK.contradictions.forEach((item, i) => {
-      const card = document.createElement("article");
+      const card = document.createElement("details");
       card.className = "redline-card";
       card.style.animationDelay = i * 90 + "ms";
       card.innerHTML = `
-        <div class="rc-head">
+        <summary>
+          <span class="rc-chev">▸</span>
           <span class="rc-tag">${item.category}</span>
+          <span class="rc-oneline">${item.summary}</span>
           <span class="rc-stamp">근거 ${item.sourceEpisode}화</span>
+        </summary>
+        <div class="rc-details">
+          <div class="rc-body">
+            <div class="rc-block rc-excerpt">
+              <div class="rc-label">신규 원고</div>
+              <p>${buildExcerptHTML(item)}</p>
+            </div>
+            <div class="rc-connector">
+              <span class="badge">모순</span>
+            </div>
+            <div class="rc-block rc-citation">
+              <div class="rc-label">기존 설정 근거</div>
+              <p><span class="ep-stamp">${item.sourceEpisode}화</span>${item.fact}</p>
+            </div>
+          </div>
+          <p class="rc-explain">${item.explain}</p>
         </div>
-        <div class="rc-body">
-          <div class="rc-block rc-excerpt">
-            <div class="rc-label">신규 원고</div>
-            <p>${buildExcerptHTML(item)}</p>
-          </div>
-          <div class="rc-connector">
-            <span class="badge">모순</span>
-          </div>
-          <div class="rc-block rc-citation">
-            <div class="rc-label">기존 설정 근거</div>
-            <p><span class="ep-stamp">${item.sourceEpisode}화</span>${item.fact}</p>
-          </div>
-        </div>
-        <p class="rc-explain">${item.explain}</p>
       `;
       cardList.appendChild(card);
     });
