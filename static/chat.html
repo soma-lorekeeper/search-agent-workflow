@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Q&amp;A 챗봇 · 결</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@600;700&family=IBM+Plex+Sans+KR:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap"
+  rel="stylesheet"
+/>
+<style>
+  :root {
+    --paper: #fbfaf7;
+    --surface: #ffffff;
+    --ink: #24211d;
+    --ink-muted: #6b6355;
+    --rule: #e7e2d6;
+    --rule-strong: #d8d1c1;
+    --mark-sky: #c9dce6;
+    --bot-bubble: #f4f1ec;
+    --accent: #8b3a46;
+    --accent-ink: #ffffff;
+    --code-bg: #eee9e0;
+    --font-display: "Noto Serif KR", serif;
+    --font-body: "IBM Plex Sans KR", -apple-system, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+  }
+  a { color: inherit; }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px 20px;
+    padding: 22px 40px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .wordmark { display: flex; align-items: baseline; gap: 10px; }
+  .wordmark .glyph { font-family: var(--font-display); font-weight: 700; font-size: 22px; }
+  .wordmark .tagline { font-size: 12px; color: var(--ink-muted); }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+  nav a {
+    text-decoration: none;
+    font-size: 13px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    color: var(--ink-muted);
+    transition: background 0.15s ease, color 0.15s ease;
+  }
+  nav a:hover { color: var(--ink); background: var(--surface); }
+  nav a.active { color: var(--ink); background: var(--surface); border: 1px solid var(--rule); }
+
+  .intro {
+    max-width: 720px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 36px 24px 0;
+  }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 12px;
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 26px;
+    line-height: 1.35;
+    margin: 0 0 10px;
+  }
+  .lede { font-size: 14px; color: var(--ink-muted); margin: 0 0 20px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 24px; }
+  .chip {
+    font-size: 12.5px;
+    background: var(--surface);
+    border: 1px solid var(--rule-strong);
+    border-radius: 999px;
+    padding: 7px 14px;
+    cursor: pointer;
+    color: var(--ink);
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .chip:hover { border-color: var(--accent); background: #fff9f6; }
+  .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  #chatWrap {
+    flex: 1;
+    max-width: 720px;
+    width: 100%;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    padding: 0 24px;
+  }
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .msg { display: flex; }
+  .msg.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 82%;
+    padding: 11px 15px;
+    border-radius: 14px;
+    font-size: 14px;
+  }
+  .msg.user .bubble { background: var(--accent); color: var(--accent-ink); border-bottom-right-radius: 4px; white-space: pre-wrap; }
+  .msg.bot .bubble { background: var(--bot-bubble); color: var(--ink); border-bottom-left-radius: 4px; }
+  .msg.bot.pending .bubble { color: var(--ink-muted); }
+  .bubble p { margin: 0 0 8px; }
+  .bubble p:last-child { margin-bottom: 0; }
+  .bubble ul, .bubble ol { margin: 4px 0 8px; padding-left: 20px; }
+  .bubble li { margin: 2px 0; }
+  .bubble code { background: var(--code-bg); border-radius: 4px; padding: 1px 5px; font-size: 0.9em; font-family: var(--font-mono); }
+  .bubble strong { font-weight: 700; }
+  .bubble .src {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    background: var(--mark-sky);
+    color: #2c5266;
+    border-radius: 5px;
+    padding: 1px 6px;
+    margin-right: 4px;
+  }
+
+  #inputbar {
+    display: flex;
+    gap: 8px;
+    padding: 16px 0 24px;
+    border-top: 1px solid var(--rule);
+  }
+  #inputbar textarea {
+    flex: 1;
+    resize: none;
+    border: 1px solid var(--rule-strong);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-family: inherit;
+    background: var(--surface);
+    color: var(--ink);
+    height: 44px;
+  }
+  #inputbar textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #inputbar button {
+    border: none;
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-radius: 10px;
+    padding: 0 20px;
+    font-size: 14px;
+    font-family: var(--font-body);
+    cursor: pointer;
+  }
+  #inputbar button:disabled { opacity: 0.5; cursor: default; }
+  #inputbar button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .mock-note {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 24px 10px;
+    font-size: 11.5px;
+    color: var(--ink-muted);
+    text-align: center;
+  }
+
+  @media (max-width: 640px) {
+    header { padding: 18px 20px; }
+    .intro, #chatWrap, .mock-note { padding-left: 18px; padding-right: 18px; }
+    h1 { font-size: 22px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wordmark">
+    <span class="glyph">결</span>
+    <span class="tagline">이야기의 결을 기억합니다</span>
+  </div>
+  <nav>
+    <a href="/">원고 접수</a>
+    <a href="/library">원고 목록</a>
+    <a href="/report">정합성 리포트</a>
+    <a href="/chat" class="active">Q&amp;A 챗봇</a>
+  </nav>
+</header>
+
+<div class="intro">
+  <div class="eyebrow">04 · Q&amp;A 챗봇</div>
+  <h1>접수된 원고에 대해 물어보세요</h1>
+  <p class="lede">인물, 소유물, 사건에 대해 자유롭게 질문하면 근거 화수와 함께 답합니다.</p>
+  <div class="chips" id="chips"></div>
+</div>
+
+<div id="chatWrap">
+  <div id="messages"></div>
+  <div id="inputbar">
+    <textarea id="input" placeholder="예: 천인호는 몇 화에서 죽어? (Shift+Enter 줄바꿈, Enter 전송)"></textarea>
+    <button id="send">보내기</button>
+  </div>
+</div>
+<p class="mock-note">지금은 mock 데모라 정해진 예시 질문에만 답합니다 — 위 칩을 눌러보세요.</p>
+
+<script>
+  // 외부 라이브러리 없는 최소 마크다운 렌더러
+  function renderMarkdown(text) {
+    const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const inline = (s) => {
+      s = esc(s);
+      s = s.replace(/`([^`]+)`/g, "<code>$1</code>");
+      s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      return s;
+    };
+    let html = "";
+    let listType = null;
+    let para = [];
+    const flushPara = () => { if (para.length) { html += "<p>" + para.join("<br>") + "</p>"; para = []; } };
+    const closeList = () => { if (listType) { html += "</" + listType + ">"; listType = null; } };
+    for (const raw of text.split("\n")) {
+      const line = raw.trimEnd();
+      const ulItem = line.match(/^[-*]\s+(.*)/);
+      if (!line.trim()) { flushPara(); closeList(); continue; }
+      if (ulItem) {
+        flushPara();
+        if (listType !== "ul") { closeList(); html += "<ul>"; listType = "ul"; }
+        html += `<li>${inline(ulItem[1])}</li>`;
+        continue;
+      }
+      closeList();
+      para.push(inline(line));
+    }
+    flushPara();
+    closeList();
+    return html;
+  }
+
+  // ---- mock 질문/답변 세트 (실제로는 graph_query 기반 에이전트가 답할 자리) ----
+  const CANNED = [
+    {
+      match: /천인호.*(죽|사망)|죽.*천인호/,
+      answer:
+        "<span class=\"src\">6화</span>천인호는 6화에서 죽습니다.\n\n" +
+        "**정희원**이 철두파를 도륙하는 과정에서 얼굴을 정수리부터 아래로 꿰뚫어 살해했습니다.",
+    },
+    {
+      match: /강철 방패|낡은.*방패/,
+      answer:
+        "<span class=\"src\">6화</span>'낡은 강철 방패'는 **김독자**가 **이현성**에게 줬습니다.\n\n" +
+        "- 5화: 이길영이 어둠 자락에서 방패를 발견\n" +
+        "- 6화: 김독자가 이현성에게 건넴, 이현성이 몇 번이나 꼈다 뺐다 하며 만족스러워함",
+    },
+    {
+      match: /유중혁.*계약|계약.*유중혁/,
+      answer:
+        "아니요. **1~6화 기준으로 김독자가 유중혁과 정식 계약을 맺은 적은 확인되지 않습니다.**\n\n" +
+        "확인된 계약은 <span class=\"src\">3화</span>비형과의 스트림 계약뿐입니다.",
+    },
+    {
+      match: /부러진 신념|성유물/,
+      answer:
+        "<span class=\"src\">3화</span>어룡의 핵을 도깨비 거래소에 올려 **'부러진 신념'**을 교환으로 받았습니다.\n\n" +
+        "- 5화: 실제 수령, 어둠 파수꾼과의 전투에서 사용\n" +
+        "- 6화: 랜덤 아이템 박스에 넣어 **'부러지지 않는 신념'**(성유물급)으로 승격\n\n" +
+        "최종 소유자는 김독자입니다.",
+    },
+    {
+      match: /요약|줄거리/,
+      answer:
+        "현재 접수된 건 <span class=\"src\">1~6화</span>까지입니다. 그 범위 안에서만 답할게요.\n\n" +
+        "- 1화: 김독자, 지하철 첫 시나리오 돌파\n" +
+        "- 2화: 유중혁 조우, 어룡 뱃속으로 추락\n" +
+        "- 3화: 어룡 처치, 비형과 계약\n" +
+        "- 4화: 금호역 정착, 철두파와 대치\n" +
+        "- 5화: 어둠 자락 탐험, 한명오의 절도 발각\n" +
+        "- 6화: 정희원 각성, 천인호 사망, 부러지지 않는 신념 완성",
+    },
+    {
+      match: /이현성.*배후성|배후성.*이현성/,
+      answer: "<span class=\"src\">2화</span>이현성의 배후성은 **'강철의 주인'**입니다. 2화에서 처음 언급됩니다.",
+    },
+  ];
+
+  const FALLBACK =
+    "음, 지금은 mock 데모라 이 질문엔 준비된 답이 없어요. 위에 있는 예시 질문 칩을 눌러보시겠어요?";
+
+  const EXAMPLES = [
+    "천인호는 몇 화에서 죽어?",
+    "낡은 강철 방패는 누가 누구에게 줬어?",
+    "김독자가 유중혁과 정식으로 계약을 맺은 적이 있어?",
+    "소설 전체 줄거리 요약해줘",
+  ];
+
+  const messagesEl = document.getElementById("messages");
+  const inputEl = document.getElementById("input");
+  const sendEl = document.getElementById("send");
+  const chipsEl = document.getElementById("chips");
+
+  EXAMPLES.forEach((q) => {
+    const chip = document.createElement("button");
+    chip.className = "chip";
+    chip.textContent = q;
+    chip.addEventListener("click", () => {
+      inputEl.value = q;
+      send();
+    });
+    chipsEl.appendChild(chip);
+  });
+
+  function addMessage(role, html) {
+    const row = document.createElement("div");
+    row.className = "msg " + role;
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    if (role === "bot") bubble.innerHTML = html;
+    else bubble.textContent = html;
+    row.appendChild(bubble);
+    messagesEl.appendChild(row);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return bubble;
+  }
+
+  function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+  function mockAnswer(question) {
+    const hit = CANNED.find((c) => c.match.test(question));
+    return renderMarkdown(hit ? hit.answer : FALLBACK);
+  }
+
+  async function send() {
+    const text = inputEl.value.trim();
+    if (!text) return;
+    inputEl.value = "";
+    sendEl.disabled = true;
+    addMessage("user", text);
+
+    const pendingRow = document.createElement("div");
+    pendingRow.className = "msg bot pending";
+    const pendingBubble = document.createElement("div");
+    pendingBubble.className = "bubble";
+    pendingBubble.textContent = "생각 중...";
+    pendingRow.appendChild(pendingBubble);
+    messagesEl.appendChild(pendingRow);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+
+    await sleep(500 + Math.random() * 500);
+    pendingRow.remove();
+    addMessage("bot", mockAnswer(text));
+
+    sendEl.disabled = false;
+    inputEl.focus();
+  }
+
+  sendEl.addEventListener("click", send);
+  inputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+
+  addMessage(
+    "bot",
+    renderMarkdown("안녕하세요. 접수된 1~6화에 대해 궁금한 걸 물어보세요. 위 예시 질문을 눌러보셔도 좋아요.")
+  );
+</script>
+</body>
+</html>

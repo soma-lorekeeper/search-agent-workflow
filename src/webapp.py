@@ -34,6 +34,16 @@ def report_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "report.html")
 
 
+@app.get("/library")
+def library_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "library.html")
+
+
+@app.get("/chat")
+def chat_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "chat.html")
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest) -> ChatResponse:
     answer = ask(req.message, thread_id=req.thread_id)
