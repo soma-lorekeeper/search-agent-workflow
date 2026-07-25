@@ -1,10 +1,12 @@
 # 비밀키
 .env
 
-# 소설 원문 (저작권) — requirements.txt, eval/ 합성 테스트 원고는 예외
+# 소설 원문 (저작권) — requirements.txt는 예외
 *.txt
 !requirements.txt
-!eval/*.txt
+
+# 다른 팀원의 별도 레포(클론) — 라이브러리로 import만 하고, 우리 레포엔 커밋하지 않는다
+lorekeeper-poc/
 
 # 가상환경
 .venv/

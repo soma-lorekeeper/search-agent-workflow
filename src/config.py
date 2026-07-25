@@ -4,22 +4,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+# lorekeeper 패키지(../lorekeeper-poc/poc/src/client.py 등)도 load_dotenv()를 호출하지만,
+# 그쪽 탐색 경로는 lorekeeper-poc/ 기준이라 이 프로젝트 루트의 .env를 못 찾는다.
+# 여기서 먼저 로드해 NEO4J_*/OPENAI_API_KEY를 프로세스 환경변수로 채워두면,
+# lorekeeper 쪽의 load_dotenv()는 이미 있는 값을 덮어쓰지 않으므로(override=False 기본값)
+# import 순서와 무관하게 항상 이 .env 값이 사용된다.
 load_dotenv(ROOT_DIR / ".env")
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
-# 인덱싱(대량 호출)은 비용 절감을 위해 별도로 저렴한 모델을 쓸 수 있게 분리.
-# 지정 안 하면 OPENAI_MODEL과 동일한 값을 사용.
-OPENAI_EXTRACTION_MODEL = os.environ.get("OPENAI_EXTRACTION_MODEL", OPENAI_MODEL)
-
-MYSQL_HOST = os.environ.get("MYSQL_HOST", "127.0.0.1")
-MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3307"))
-MYSQL_USER = os.environ.get("MYSQL_USER", "root")
-MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "agentic123")
-MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "lorekeeper_agentic")
-
-NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "agentic1234")
 
 DATA_DIR = ROOT_DIR / "data"

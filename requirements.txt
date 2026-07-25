@@ -1,9 +1,12 @@
+# lorekeeper-poc(../lorekeeper-poc를 이 폴더 안에 clone한 것)를 라이브러리로 설치.
+# 내부 로직(poc/src/*.py)은 건드리지 않고 import만 한다: from lorekeeper import indexing, build_retrievers, build_retrieval_tools
+-e ./lorekeeper-poc/poc
+
+# 우리 쪽 오케스트레이션(에이전트 루프, API 서버)
 langgraph
 langchain-core
 langchain-openai
 openai
-pymysql
-neo4j
 python-dotenv
 fastapi
 uvicorn

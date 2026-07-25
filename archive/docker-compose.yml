@@ -1,0 +1,26 @@
+services:
+  mysql:
+    image: mysql:8
+    container_name: agentic-workflow-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=agentic123
+      - MYSQL_DATABASE=lorekeeper_agentic
+    ports:
+      - "3307:3306"
+    volumes:
+      - agentic_mysql_data:/var/lib/mysql
+
+  neo4j:
+    image: neo4j:5
+    container_name: agentic-workflow-neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/agentic1234
+    ports:
+      - "7474:7474"   # Browser
+      - "7687:7687"   # Bolt
+    volumes:
+      - agentic_neo4j_data:/data
+
+volumes:
+  agentic_mysql_data:
+  agentic_neo4j_data:

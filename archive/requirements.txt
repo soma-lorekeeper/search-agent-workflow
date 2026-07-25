@@ -1,0 +1,9 @@
+langgraph
+langchain-core
+langchain-openai
+openai
+pymysql
+neo4j
+python-dotenv
+fastapi
+uvicorn

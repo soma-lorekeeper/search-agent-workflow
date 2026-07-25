@@ -1,26 +1,28 @@
+# lorekeeper-poc(../lorekeeper-poc, 이 폴더 안엔 clone본)의 docker-compose.yml과 동일한 설정.
+# lorekeeper 패키지의 인덱싱/리트리버가 이 Neo4j 인스턴스에 붙는다 — 인증정보를
+# lorekeeper-poc 쪽과 반드시 맞춰야 하므로(schema.py 등 내부 로직은 건드리지 않음) 그대로 따른다.
 services:
-  mysql:
-    image: mysql:8
-    container_name: agentic-workflow-mysql
-    environment:
-      - MYSQL_ROOT_PASSWORD=agentic123
-      - MYSQL_DATABASE=lorekeeper_agentic
-    ports:
-      - "3307:3306"
-    volumes:
-      - agentic_mysql_data:/var/lib/mysql
-
   neo4j:
-    image: neo4j:5
+    image: neo4j:5.26-community
     container_name: agentic-workflow-neo4j
-    environment:
-      - NEO4J_AUTH=neo4j/agentic1234
     ports:
-      - "7474:7474"   # Browser
+      - "7474:7474"   # Neo4j Browser
       - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/lorekeeper
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
     volumes:
-      - agentic_neo4j_data:/data
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "lorekeeper", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
 volumes:
-  agentic_mysql_data:
-  agentic_neo4j_data:
+  neo4j_data:
+  neo4j_logs:
