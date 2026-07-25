@@ -179,6 +179,8 @@
   .m-row.reading .m-status { color: #9c7a1f; }
   .m-row.done .m-status .dot { background: var(--mark-sage-ink); }
   .m-row.done .m-status { color: var(--mark-sage-ink); }
+  .m-row.error .m-status .dot { background: var(--accent); }
+  .m-row.error .m-status { color: var(--accent); }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
   .m-remove {
     background: none; border: none; color: var(--ink-muted);
@@ -203,8 +205,7 @@
   button.primary:active:not(:disabled) { transform: translateY(1px); }
   button.primary:disabled { background: var(--rule-strong); cursor: not-allowed; }
   .actions .hint { font-size: 12px; color: var(--ink-muted); }
-  .actions .demo-link { font-size: 12px; color: var(--accent); text-decoration: underline; }
-  .actions .demo-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .cost-note { font-size: 11.5px; color: var(--ink-muted); margin-top: 10px; }
 
   /* ---------- receipt ---------- */
   .receipt {
@@ -290,17 +291,17 @@
   <div class="actions">
     <button class="primary" id="startBtn" disabled>접수 시작</button>
     <span class="hint" id="hint">파일을 추가하면 접수를 시작할 수 있어요</span>
-    <a href="#" id="demoLink" class="demo-link">예시 회차로 채우기</a>
   </div>
+  <p class="cost-note">회차마다 실제 LLM 호출이 일어납니다(비용 발생) — 회차는 반드시 화 순서대로 올려주세요.</p>
 
   <div class="receipt" id="receipt">
     <div class="r-eyebrow">접수 완료</div>
     <h2 id="receiptTitle">10화 접수 완료</h2>
     <div class="r-stats">
-      <div class="r-stat"><div class="num">24</div><div class="label">인물</div></div>
-      <div class="r-stat"><div class="num">9</div><div class="label">아이템</div></div>
-      <div class="r-stat"><div class="num">6</div><div class="label">장소</div></div>
-      <div class="r-stat"><div class="num">41</div><div class="label">사건 · 관계</div></div>
+      <div class="r-stat"><div class="num" id="statCharacter">0</div><div class="label">인물</div></div>
+      <div class="r-stat"><div class="num" id="statItem">0</div><div class="label">아이템</div></div>
+      <div class="r-stat"><div class="num" id="statLocation">0</div><div class="label">장소</div></div>
+      <div class="r-stat"><div class="num" id="statEvent">0</div><div class="label">사건</div></div>
     </div>
   </div>
 </main>
@@ -355,11 +356,10 @@
     receipt.classList.remove("show");
   }
 
-  document.getElementById("demoLink").addEventListener("click", (e) => {
-    e.preventDefault();
-    const mk = (name, size) => new File([new Uint8Array(size)], name);
-    addFiles([mk("episode1.txt", 65721), mk("episode2.txt", 72836), mk("episode3.txt", 50144)]);
-  });
+  function episodeNumber(name, index) {
+    const m = name.match(/(\d+)/);
+    return m ? parseInt(m[1], 10) : index + 1;
+  }
 
   function addFiles(fileList) {
     for (const f of fileList) {
@@ -396,29 +396,63 @@
   );
   dropzone.addEventListener("drop", (e) => addFiles(e.dataTransfer.files));
 
-  function sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
+  function fillStats(labels) {
+    document.getElementById("statCharacter").textContent = labels.Character || 0;
+    document.getElementById("statItem").textContent = labels.Item || 0;
+    document.getElementById("statLocation").textContent = labels.Location || 0;
+    document.getElementById("statEvent").textContent = labels.Event || 0;
   }
 
   async function startIntake() {
     startBtn.disabled = true;
-    startBtn.textContent = "읽는 중...";
+    startBtn.textContent = "인덱싱 중...";
     hint.textContent = "";
+    receipt.classList.remove("show");
 
     const rows = [...manuscriptsEl.querySelectorAll(".m-row")];
-    for (const row of rows) {
+    let lastResult = null;
+    let indexedCount = 0;
+
+    for (let i = 0; i < files.length; i++) {
+      const row = rows[i];
+      const chapter = episodeNumber(files[i].name, i);
       row.classList.add("reading");
-      row.querySelector(".m-status .label").textContent = "읽는 중";
-      await sleep(320 + Math.random() * 260);
-      row.classList.remove("reading");
-      row.classList.add("done");
-      row.querySelector(".m-status .label").textContent = "완료";
+      row.querySelector(".m-status .label").textContent = "인덱싱 중";
+
+      try {
+        const text = await files[i].text();
+        const res = await fetch("/api/index", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chapter, text }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.detail || `서버 오류 (${res.status})`);
+        }
+        lastResult = await res.json();
+        row.classList.remove("reading");
+        row.classList.add("done");
+        row.querySelector(".m-status .label").textContent = "완료";
+        indexedCount++;
+      } catch (err) {
+        row.classList.remove("reading");
+        row.classList.add("error");
+        row.querySelector(".m-status .label").textContent = "실패";
+        hint.textContent = `${chapter}화 인덱싱 실패: ${err.message}`;
+        startBtn.disabled = false;
+        startBtn.textContent = "다시 시도";
+        return;
+      }
     }
 
-    receiptTitle.textContent = `${files.length}화 접수 완료`;
-    receipt.classList.add("show");
+    if (lastResult) {
+      receiptTitle.textContent = `${indexedCount}화 접수 완료`;
+      fillStats(lastResult.labels);
+      receipt.classList.add("show");
+    }
     startBtn.textContent = "접수 완료";
-    hint.textContent = "정합성 리포트 페이지에서 새 회차를 검사할 수 있어요";
+    hint.textContent = "원고 목록 페이지에서 확인할 수 있어요";
   }
 
   startBtn.addEventListener("click", startIntake);

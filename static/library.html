@@ -175,6 +175,22 @@
     font-size: 24px;
     margin: 0 0 22px;
   }
+  .reader-summary {
+    background: #f2f7f9;
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 26px;
+    max-width: 62ch;
+  }
+  .reader-summary-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--mark-sky-ink);
+    margin-bottom: 6px;
+  }
+  .reader-summary p { margin: 0; font-size: 13.5px; }
   .reader-body {
     font-size: 15.5px;
     line-height: 1.9;
@@ -188,6 +204,25 @@
     font-size: 12px;
     color: var(--ink-muted);
   }
+  .shelf-summary {
+    font-size: 11.5px;
+    color: var(--ink-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding-left: 2px;
+  }
+  .empty-state, .error-state {
+    grid-column: 1 / -1;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 14px;
+    padding: 40px 30px;
+    text-align: center;
+    color: var(--ink-muted);
+    font-size: 13.5px;
+  }
+  .empty-state a, .error-state a { color: var(--accent); text-decoration: underline; }
 
   @media (max-width: 760px) {
     header { padding: 18px 20px; }
@@ -232,120 +267,99 @@
 </div>
 
 <script>
-  // ---- mock 데이터 (실제로는 접수된 원고 메타데이터 + 원문을 백엔드에서 가져올 자리) ----
-  const EPISODES = [
-    {
-      ep: 1,
-      title: "지하철의 마지막 페이지",
-      uploaded: "2026-07-11",
-      chars: 65721,
-      body: [
-        "김독자는 퇴근길 지하철 안에서, 십 년 넘게 혼자 읽어온 웹소설이 현실이 되는 순간을 맞는다. 화면 속 이야기가 아니라 눈앞의 승객들이 진짜로 첫 시나리오의 대상이 된 것이다.",
-        "도깨비가 나타나 생명체를 해치라는 조건을 내걸자, 사람들은 서로를 향해 칼을 겨눈다. 김독자는 소설 속에서 읽었던 지식을 떠올려, 사람 대신 곤충과 메뚜기 알을 죽이는 방식으로 조건을 우회한다.",
-        "직접 죽이지 않고도 살아남는 길이 있다는 걸 증명한 첫 순간이었다.",
-      ],
-    },
-    {
-      ep: 2,
-      title: "한강의 배후",
-      uploaded: "2026-07-11",
-      chars: 72836,
-      body: [
-        "지하철이 동호대교 위에 멈춰 서고, 성좌와 배후성이라는 새로운 규칙이 승객들 앞에 모습을 드러낸다.",
-        "김독자는 유중혁이라는, 원작 속 진짜 주인공과 처음으로 마주친다. 유중혁은 동료가 될 것을 제안하지만, 마지막 시험대에서 김독자를 놓아버리고 만다.",
-        "모든 배후성의 제안을 거절한 채, 김독자는 한강의 괴수 어룡의 입속으로 떨어진다.",
-      ],
-    },
-    {
-      ep: 3,
-      title: "뱃속에서 벌인 협상",
-      uploaded: "2026-07-11",
-      chars: 50144,
-      body: [
-        "어룡의 뱃속에서 눈을 뜬 김독자는 절망 대신 계산을 시작한다. 도깨비 비형과 접촉해 히든 시나리오를 제안받고, 스톤호그의 가시와 망치 해마의 점액을 이용해 나흘 만에 어룡을 안에서부터 무너뜨린다.",
-        "탈출 직후 비형과 전속 스트림 계약을 맺으며, 김독자는 비로소 이 세계에서 자신만의 자리를 만들기 시작한다.",
-      ],
-    },
-    {
-      ep: 4,
-      title: "금호역의 질서",
-      uploaded: "2026-07-11",
-      chars: 66426,
-      body: [
-        "지상은 이미 독안개로 뒤덮여 있었다. 금호역 지하로 내려간 김독자는 이현성, 유상아, 이길영과 재회하고, 천인호가 이끄는 철두파가 만들어 놓은 배급 질서와 마주한다.",
-        "직접 죽이지 않고 무력화한다는 첫 시나리오의 원칙은 여기서도 그대로 이어진다. 능력치가 처음으로 공개되고, 생존자들 사이의 서열과 자원 다툼이 본격적으로 시작된다.",
-      ],
-    },
-    {
-      ep: 5,
-      title: "어둠 자락의 대가",
-      uploaded: "2026-07-11",
-      chars: 66261,
-      body: [
-        "식량 문제를 풀기 위해 일행은 약수역 터널의 어둠 자락으로 향한다. 이길영이 낡은 강철 방패를 발견하고, 어둠 파수꾼과의 전투 중 한명오는 아스모데우스의 저주를 얻는다.",
-        "다툼 끝에 한명오가 유상아의 자전거를 몰래 가져갔다는 사실도 이 화에서 처음 드러난다. 김독자는 전리품을 모아 상위 아이템 합성을 준비한다.",
-      ],
-    },
-    {
-      ep: 6,
-      title: "부러지지 않는 신념",
-      uploaded: "2026-07-11",
-      chars: 70442,
-      body: [
-        "합성 끝에 김독자는 성유물급 검 '부러지지 않는 신념'을 얻는다. 금호역으로 돌아온 그는 천인호와 철두파의 악행을 낱낱이 폭로하고, 정희원은 전투 중 '멸악의 심판자'로 각성해 철두파를 도륙하며 천인호를 죽인다.",
-        "이후 일행은 사명대사 동상을 부수고 다음 시나리오 거점인 충무로로 향하다, 그 입구에서 이지혜와 조우하며 이번 화는 끝난다.",
-      ],
-    },
-  ];
-
   const shelfEl = document.getElementById("shelf");
   const readerEl = document.getElementById("reader");
-  let activeEp = EPISODES[0].ep;
+  let episodes = [];
+  let activeChapter = null;
+
+  function escapeHtml(s) {
+    const d = document.createElement("div");
+    d.textContent = s || "";
+    return d.innerHTML;
+  }
 
   function formatChars(n) {
     return n.toLocaleString("ko-KR") + "자";
   }
 
+  function stamp(n) {
+    return String(n).padStart(2, "0") + "화";
+  }
+
   function renderShelf() {
     shelfEl.innerHTML = "";
-    EPISODES.forEach((e) => {
+    episodes.forEach((e) => {
       const btn = document.createElement("button");
-      btn.className = "shelf-item" + (e.ep === activeEp ? " active" : "");
+      btn.className = "shelf-item" + (e.chapter === activeChapter ? " active" : "");
       btn.innerHTML = `
         <div class="shelf-row1">
-          <span class="shelf-stamp">${String(e.ep).padStart(2, "0")}화</span>
-          <span class="shelf-title">${e.title}</span>
+          <span class="shelf-stamp">${stamp(e.chapter)}</span>
         </div>
-        <div class="shelf-meta">${e.uploaded} · ${formatChars(e.chars)}<span class="shelf-badge">인덱싱 완료</span></div>
+        <div class="shelf-summary">${escapeHtml(e.summary)}</div>
+        <div class="shelf-meta">${formatChars(e.chars)}<span class="shelf-badge">인덱싱 완료</span></div>
       `;
-      btn.addEventListener("click", () => {
-        activeEp = e.ep;
-        renderShelf();
-        renderReader();
-      });
+      btn.addEventListener("click", () => selectEpisode(e.chapter));
       shelfEl.appendChild(btn);
     });
   }
 
-  function renderReader() {
-    const e = EPISODES.find((x) => x.ep === activeEp);
-    readerEl.innerHTML = `
-      <div class="reader-meta">
-        <span class="reader-stamp">${String(e.ep).padStart(2, "0")}화</span>
-        <span class="reader-info">${e.uploaded} · ${formatChars(e.chars)}</span>
-      </div>
-      <h2>${e.title}</h2>
-      <div class="reader-body">
-        ${e.body.map((p) => `<p>${p}</p>`).join("")}
-      </div>
-      <div class="reader-note">
-        실제 원고는 이보다 훨씬 길며, 이 화면은 확인용 발췌만 보여줍니다.
-      </div>
-    `;
+  function renderParagraphs(text) {
+    const paras = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+    return (paras.length ? paras : [text]).map((p) => `<p>${escapeHtml(p)}</p>`).join("");
   }
 
-  renderShelf();
-  renderReader();
+  async function selectEpisode(chapter) {
+    activeChapter = chapter;
+    renderShelf();
+    readerEl.className = "reader";
+    readerEl.innerHTML = `<p style="color:var(--ink-muted);font-size:13px;">불러오는 중...</p>`;
+    try {
+      const res = await fetch(`/api/episodes/${chapter}`);
+      if (!res.ok) throw new Error(`서버 오류 (${res.status})`);
+      const e = await res.json();
+      readerEl.innerHTML = `
+        <div class="reader-meta">
+          <span class="reader-stamp">${stamp(e.chapter)}</span>
+          <span class="reader-info">${formatChars(e.chars)}</span>
+        </div>
+        <h2>${stamp(e.chapter)}</h2>
+        <div class="reader-summary">
+          <div class="reader-summary-label">요약</div>
+          <p>${escapeHtml(e.summary) || "(요약 없음)"}</p>
+        </div>
+        <div class="reader-body">${renderParagraphs(e.raw_text)}</div>
+      `;
+    } catch (err) {
+      readerEl.className = "error-state";
+      readerEl.innerHTML = `${stamp(chapter)}를 불러오지 못했습니다: ${escapeHtml(err.message)}`;
+    }
+  }
+
+  async function loadEpisodes() {
+    shelfEl.innerHTML = `<div style="padding:16px;font-size:13px;color:var(--ink-muted);">불러오는 중...</div>`;
+    try {
+      const res = await fetch("/api/episodes");
+      if (!res.ok) throw new Error(`서버 오류 (${res.status})`);
+      episodes = await res.json();
+    } catch (err) {
+      shelfEl.innerHTML = "";
+      readerEl.className = "error-state";
+      readerEl.innerHTML = `원고 목록을 불러오지 못했습니다: ${escapeHtml(err.message)}`;
+      return;
+    }
+
+    if (episodes.length === 0) {
+      shelfEl.innerHTML = "";
+      readerEl.className = "empty-state";
+      readerEl.innerHTML = `아직 접수된 회차가 없습니다. <a href="/">원고 접수</a> 페이지에서 먼저 회차를 올려주세요.`;
+      return;
+    }
+
+    renderShelf();
+    selectEpisode(episodes[0].chapter);
+  }
+
+  loadEpisodes();
 </script>
 </body>
 </html>
