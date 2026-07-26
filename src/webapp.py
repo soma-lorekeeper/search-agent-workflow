@@ -85,11 +85,6 @@ def report_history_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "report_history.html")
 
 
-@app.get("/chat")
-def chat_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "chat.html")
-
-
 # ---------- 인덱싱 API ----------
 
 
