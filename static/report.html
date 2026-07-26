@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>정합성 리포트 · 결</title>
+<title>정합성 리포트 · lorekeeper</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link
@@ -137,6 +137,16 @@
   .demo-hint a { color: var(--accent); text-decoration: underline; }
   .demo-hint a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+  .error-state {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 14px;
+    padding: 28px 24px;
+    color: var(--ink-muted);
+    font-size: 13.5px;
+  }
+  .error-state a { color: var(--accent); text-decoration: underline; }
+
   /* ---------- progress ---------- */
   .progress-wrap { margin-top: 28px; display: none; }
   .progress-wrap.show { display: block; }
@@ -159,9 +169,71 @@
     color: var(--ink-muted);
   }
 
+  /* ---------- claim별 진행 상황 ---------- */
+  .claim-progress { margin-top: 36px; display: none; }
+  .claim-progress.show { display: block; }
+  .claim-progress .section-hint { font-family: var(--font-mono); }
+  .claim-list {
+    border: 1px solid var(--rule);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .claim-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 11px 16px;
+    font-size: 13.5px;
+    background: var(--surface);
+    opacity: 0;
+    animation: claimRise 0.3s ease forwards;
+  }
+  .claim-row + .claim-row { border-top: 1px solid var(--rule); }
+  @keyframes claimRise { to { opacity: 1; } }
+  .claim-row .rc-tag { flex-shrink: 0; }
+  .claim-row .txt {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--ink-muted);
+  }
+  .claim-row.is-done .txt { color: var(--ink); }
+  .claim-status {
+    flex-shrink: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    width: 68px;
+    text-align: right;
+  }
+  .claim-status.running { color: var(--ink-muted); }
+  .claim-status.running::before {
+    content: "";
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-right: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    vertical-align: middle;
+    animation: claimPulse 1.1s ease-in-out infinite;
+  }
+  .claim-status.contradiction { color: var(--mark-rose-ink); }
+  .claim-status.consistent { color: var(--mark-sage-ink); }
+  .claim-status.unknown { color: var(--mark-butter-ink); }
+  @keyframes claimPulse {
+    0%, 100% { opacity: 0.3; transform: scale(0.8); }
+    50% { opacity: 1; transform: scale(1); }
+  }
+
   /* ---------- report ---------- */
   .report { margin-top: 44px; display: none; }
-  .report.show { display: block; }
+  .report.show { display: block; animation: reportReveal 0.5s cubic-bezier(0.2, 0.8, 0.2, 1); }
+  @keyframes reportReveal {
+    from { opacity: 0; transform: translateY(6px) scale(0.99); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
   .summary-strip {
     display: flex;
     gap: 22px;
@@ -372,63 +444,77 @@
 
 <header>
   <div class="wordmark">
-    <span class="glyph">결</span>
+    <span class="glyph">lorekeeper</span>
     <span class="tagline">이야기의 결을 기억합니다</span>
   </div>
   <nav>
     <a href="/">원고 접수</a>
     <a href="/library">원고 목록</a>
     <a href="/report" class="active">정합성 리포트</a>
+    <a href="/reports">검증 히스토리</a>
     <a href="/chat">Q&amp;A 챗봇</a>
   </nav>
 </header>
 
 <main>
-  <div class="eyebrow">02 · 정합성 검사</div>
-  <h1>새 회차를 그동안의<br />이야기에 비춰봅니다</h1>
-  <p class="lede">
+  <div class="eyebrow" id="pageEyebrow">02 · 정합성 검사</div>
+  <h1 id="pageTitle">새 회차를 그동안의<br />이야기에 비춰봅니다</h1>
+  <p class="lede" id="pageLede">
     새로 쓴 회차를 올리면, 정확히 어느 표현이 어떤 기존 설정과 어긋나는지, 그리고 왜
     어긋나는지를 짚어 보여드립니다.
   </p>
 
-  <div class="panel">
-    <div class="file-slot" id="fileSlot" role="button" tabindex="0" aria-label="검사할 회차 파일 선택">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3">
-        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" stroke-linejoin="round" />
-        <path d="M14 3v5h5" stroke-linejoin="round" />
-      </svg>
-      <span id="fileSlotText">검사할 새 회차 파일을 선택하세요 (.txt)</span>
-      <input type="file" id="fileInput" accept=".txt" />
+  <div id="uploadSection">
+    <div class="panel">
+      <div class="file-slot" id="fileSlot" role="button" tabindex="0" aria-label="검사할 회차 파일 선택">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3">
+          <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" stroke-linejoin="round" />
+          <path d="M14 3v5h5" stroke-linejoin="round" />
+        </svg>
+        <span id="fileSlotText">검사할 새 회차 파일을 선택하세요 (.txt)</span>
+        <input type="file" id="fileInput" accept=".txt" />
+      </div>
+      <button class="primary" id="startBtn" disabled>검사 시작</button>
     </div>
-    <button class="primary" id="startBtn" disabled>검사 시작</button>
+    <p class="demo-hint">
+      검사할 파일이 없다면 <a href="#" id="demoLink">이미 인덱싱된 회차로 채우기</a>
+    </p>
+    <p class="demo-hint">claim 추출 + claim별 검증 LLM 호출이 일어납니다(비용 발생). 이 창을
+      닫아도 서버에서 계속 진행되며, 다시 열면 진행 상황을 이어서 보여줍니다.</p>
   </div>
-  <p class="demo-hint">
-    검사할 파일이 없다면 <a href="#" id="demoLink">예시 회차로 채우기</a>
-  </p>
+
+  <p class="demo-hint" id="viewBanner" style="display:none;"></p>
+  <div class="error-state" id="viewError" style="display:none;"></div>
 
   <div class="progress-wrap" id="progressWrap">
     <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
     <div class="progress-caption" id="progressCaption">대기 중...</div>
   </div>
 
+  <div class="claim-progress" id="claimProgress">
+    <h2 class="section-title">claim 검증 중</h2>
+    <p class="section-hint" id="claimProgressHint">추출된 서술을 하나씩 검증하고 있습니다.</p>
+    <div class="claim-list" id="claimList"></div>
+  </div>
+
   <div class="report" id="report">
     <div class="summary-strip">
-      <div class="summary-item flag"><div class="num">3</div><div class="label">모순 발견</div></div>
-      <div class="summary-item ok"><div class="num">6</div><div class="label">확인됨</div></div>
-      <div class="summary-item unk"><div class="num">1</div><div class="label">확인 불가</div></div>
+      <div class="summary-item flag"><div class="num" id="flagCount">0</div><div class="label">모순 발견</div></div>
+      <div class="summary-item ok"><div class="num" id="okCount">0</div><div class="label">확인됨</div></div>
+      <div class="summary-item unk"><div class="num" id="unkCount">0</div><div class="label">확인 불가</div></div>
     </div>
 
     <h2 class="section-title">발견된 모순</h2>
-    <p class="section-hint">항목을 클릭하면 정확히 어느 표현이 어떤 근거와 왜 어긋나는지 볼 수 있습니다.</p>
+    <p class="section-hint" id="cardHint">항목을 클릭하면 정확히 어느 표현이 어떤 근거와 왜 어긋나는지 볼 수 있습니다.</p>
     <div id="cardList"></div>
 
     <details class="side-block">
-      <summary>확인됨 — 기존 설정과 어긋나지 않음 (6건)</summary>
+      <summary id="okSummary">확인됨 — 기존 설정과 어긋나지 않음</summary>
       <div class="side-list" id="okList"></div>
     </details>
 
     <details class="side-block">
-      <summary>확인 불가 — 근거 부족 (1건)</summary>
+      <summary id="unkSummary">확인 불가 — 근거 부족</summary>
       <div class="side-list" id="unkList"></div>
     </details>
   </div>
@@ -439,15 +525,32 @@
   const fileSlotText = document.getElementById("fileSlotText");
   const fileInput = document.getElementById("fileInput");
   const startBtn = document.getElementById("startBtn");
+  const demoLink = document.getElementById("demoLink");
   const progressWrap = document.getElementById("progressWrap");
   const progressFill = document.getElementById("progressFill");
   const progressCaption = document.getElementById("progressCaption");
+  const claimProgress = document.getElementById("claimProgress");
+  const claimProgressHint = document.getElementById("claimProgressHint");
+  const claimList = document.getElementById("claimList");
   const report = document.getElementById("report");
   const cardList = document.getElementById("cardList");
+  const cardHint = document.getElementById("cardHint");
   const okList = document.getElementById("okList");
   const unkList = document.getElementById("unkList");
+  const flagCount = document.getElementById("flagCount");
+  const okCount = document.getElementById("okCount");
+  const unkCount = document.getElementById("unkCount");
+  const okSummary = document.getElementById("okSummary");
+  const unkSummary = document.getElementById("unkSummary");
+  const pageEyebrow = document.getElementById("pageEyebrow");
+  const pageTitle = document.getElementById("pageTitle");
+  const pageLede = document.getElementById("pageLede");
+  const uploadSection = document.getElementById("uploadSection");
+  const viewBanner = document.getElementById("viewBanner");
+  const viewError = document.getElementById("viewError");
 
-  let selectedFile = null;
+  let selectedName = null;
+  let selectedText = null;
 
   fileSlot.addEventListener("click", () => fileInput.click());
   fileSlot.addEventListener("keydown", (e) => {
@@ -456,160 +559,289 @@
       fileInput.click();
     }
   });
-  fileInput.addEventListener("change", (e) => setFile(e.target.files[0]));
+  fileInput.addEventListener("change", (e) => readFile(e.target.files[0]));
   ["dragenter", "dragover"].forEach((evt) =>
     fileSlot.addEventListener(evt, (e) => { e.preventDefault(); fileSlot.classList.add("dragover"); })
   );
   ["dragleave", "drop"].forEach((evt) =>
     fileSlot.addEventListener(evt, (e) => { e.preventDefault(); fileSlot.classList.remove("dragover"); })
   );
-  fileSlot.addEventListener("drop", (e) => setFile(e.dataTransfer.files[0]));
+  fileSlot.addEventListener("drop", (e) => readFile(e.dataTransfer.files[0]));
 
-  function setFile(f) {
-    if (!f) return;
-    selectedFile = f;
-    fileSlotText.textContent = f.name;
+  function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+
+  function applySelection(name, text) {
+    selectedName = name;
+    selectedText = text;
+    fileSlotText.textContent = name;
     fileSlot.classList.add("has-file");
     startBtn.disabled = false;
     report.classList.remove("show");
   }
 
-  document.getElementById("demoLink").addEventListener("click", (e) => {
+  function readFile(f) {
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => applySelection(f.name, String(reader.result));
+    reader.onerror = () => alert("파일을 읽지 못했습니다: " + reader.error);
+    reader.readAsText(f, "utf-8");
+  }
+
+  demoLink.addEventListener("click", async (e) => {
     e.preventDefault();
-    setFile(new File([new Uint8Array(66000)], "episode7_draft.txt"));
+    const original = demoLink.textContent;
+    demoLink.textContent = "불러오는 중...";
+    try {
+      const episodes = await fetch("/api/episodes").then((r) => r.json());
+      if (!episodes.length) {
+        alert("아직 인덱싱된 회차가 없습니다. 먼저 원고 접수 페이지에서 회차를 인덱싱해주세요.");
+        return;
+      }
+      const latest = episodes[episodes.length - 1];
+      const detail = await fetch(`/api/episodes/${latest.chapter}`).then((r) => r.json());
+      applySelection(`${latest.chapter}화_예시.txt`, detail.raw_text);
+    } catch (err) {
+      alert("예시 회차를 불러오지 못했습니다: " + err.message);
+    } finally {
+      demoLink.textContent = original;
+    }
   });
 
   function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-  // ---- mock 데이터 (실제 검사 파이프라인과 나중에 교체될 자리) ----
-  const MOCK = {
-    contradictions: [
-      {
-        category: "생사",
-        summary: "이미 죽은 천인호가 다시 등장함",
-        excerptBefore: "그날 ",
-        highlight: "정희원의 칼끝을 피해 용케 목숨을 건진",
-        excerptAfter: " 그는, 상처투성이 몸을 이끌고 이곳까지 몰래 뒤따라온 것이었다.",
-        sourceEpisode: 6,
-        fact: "정희원이 철두파를 도륙하는 과정에서 천인호의 얼굴을 정수리부터 아래로 꿰뚫어 살해했다.",
-        explain: "천인호는 6화 전투에서 이미 사망한 것으로 확인되어, 이후 살아서 등장했다는 서술과 양립할 수 없습니다.",
-      },
-      {
-        category: "소유물",
-        summary: "'부러지지 않는 신념'의 소유자가 다르게 서술됨",
-        excerptBefore: "이현성은 허리춤에 매달린 ",
-        highlight: "'부러지지 않는 신념'",
-        excerptAfter: "을 슬쩍 매만졌다.",
-        sourceEpisode: 6,
-        fact: "'부러지지 않는 신념'은 6화에서 김독자가 랜덤 아이템 박스를 통해 얻은 성유물이다.",
-        explain: "이 성유물의 소유자는 김독자로 확인되어, 이현성이 지니고 있다는 서술과 어긋납니다.",
-      },
-      {
-        category: "장소",
-        summary: "두 번째 시나리오의 목적지가 다르게 서술됨",
-        excerptBefore: "[두 번째 메인 시나리오 - 조우]의 목적지는 ",
-        highlight: "종로3가",
-        excerptAfter: "로 표시되어 있었다.",
-        sourceEpisode: 6,
-        fact: "두 번째 메인 시나리오 '조우'의 다음 거점은 시스템 메시지로 '충무로'라 명시된다.",
-        explain: "같은 시나리오의 목적지가 원문에서는 충무로로 지정되어 있어, 종로3가라는 서술과 양립할 수 없습니다.",
-      },
-    ],
-    consistent: [
-      { category: "장소", text: "충무로 입구에 다다르자 이지혜가 무심한 얼굴로 일행을 맞았다.", sourceEpisode: 6 },
-      { category: "관계", text: "한명오가 예전에 유상아의 자전거를 몰래 가져간 일이 다시 언급되었다.", sourceEpisode: 5 },
-      { category: "능력", text: "정희원의 안광이 가라앉으며 평소 모습으로 돌아왔다.", sourceEpisode: 6 },
-      { category: "생사", text: "\"천인호였다.\"", sourceEpisode: 6 },
-      { category: "관계", text: "이현성이 정희원 쪽을 멍하니 바라보다 놀라는 모습을 보였다.", sourceEpisode: 6 },
-      { category: "소유물", text: "그 성유물은 랜덤 아이템 박스에서 나온 것이었다.", sourceEpisode: 6 },
-    ],
-    unknown: [
-      { category: "시점/순서", text: "\"한강에서 어룡을 같이 처리했을 때도 그랬지.\"" },
-    ],
-  };
-
-  function buildExcerptHTML(item) {
-    return `${item.excerptBefore}<mark>${item.highlight}</mark>${item.excerptAfter}`;
+  function labelFromName(name) {
+    return name.replace(/\.[^./\\]+$/, "") || "무제";
   }
 
-  function renderReport() {
+  function renderReport(results) {
+    const contradictions = results.filter((r) => r.label === "contradiction");
+    const consistent = results.filter((r) => r.label === "consistent");
+    const unknown = results.filter((r) => r.label === "unknown");
+
+    flagCount.textContent = contradictions.length;
+    okCount.textContent = consistent.length;
+    unkCount.textContent = unknown.length;
+    okSummary.textContent = `확인됨 — 기존 설정과 어긋나지 않음 (${consistent.length}건)`;
+    unkSummary.textContent = `확인 불가 — 근거 부족 (${unknown.length}건)`;
+
     cardList.innerHTML = "";
-    MOCK.contradictions.forEach((item, i) => {
-      const card = document.createElement("details");
-      card.className = "redline-card";
-      card.style.animationDelay = i * 90 + "ms";
-      card.innerHTML = `
-        <summary>
-          <span class="rc-chev">▸</span>
-          <span class="rc-tag">${item.category}</span>
-          <span class="rc-oneline">${item.summary}</span>
-          <span class="rc-stamp">근거 ${item.sourceEpisode}화</span>
-        </summary>
-        <div class="rc-details">
-          <div class="rc-body">
-            <div class="rc-block rc-excerpt">
-              <div class="rc-label">신규 원고</div>
-              <p>${buildExcerptHTML(item)}</p>
+    if (!contradictions.length) {
+      cardHint.textContent = "설정 오류가 발견되지 않았습니다.";
+    } else {
+      cardHint.textContent = "항목을 클릭하면 정확히 어느 표현이 어떤 근거와 왜 어긋나는지 볼 수 있습니다.";
+      contradictions.forEach((item, i) => {
+        const src = item.source_episode;
+        const srcLabel = src ? `${src}화` : "출처 불명";
+        const card = document.createElement("details");
+        card.className = "redline-card";
+        card.style.animationDelay = i * 90 + "ms";
+        card.innerHTML = `
+          <summary>
+            <span class="rc-chev">▸</span>
+            <span class="rc-tag">${escapeHtml(item.category || "기타")}</span>
+            <span class="rc-oneline">${escapeHtml(item.explanation || item.quote || "")}</span>
+            <span class="rc-stamp">근거 ${srcLabel}</span>
+          </summary>
+          <div class="rc-details">
+            <div class="rc-body">
+              <div class="rc-block rc-excerpt">
+                <div class="rc-label">신규 원고</div>
+                <p><mark>${escapeHtml(item.quote || "")}</mark></p>
+              </div>
+              <div class="rc-connector">
+                <span class="badge">모순</span>
+              </div>
+              <div class="rc-block rc-citation">
+                <div class="rc-label">기존 설정 근거</div>
+                <p><span class="ep-stamp">${srcLabel}</span>${escapeHtml(item.established_fact || "")}</p>
+              </div>
             </div>
-            <div class="rc-connector">
-              <span class="badge">모순</span>
-            </div>
-            <div class="rc-block rc-citation">
-              <div class="rc-label">기존 설정 근거</div>
-              <p><span class="ep-stamp">${item.sourceEpisode}화</span>${item.fact}</p>
-            </div>
+            <p class="rc-explain">${escapeHtml(item.explanation || "")}</p>
           </div>
-          <p class="rc-explain">${item.explain}</p>
-        </div>
-      `;
-      cardList.appendChild(card);
-    });
+        `;
+        cardList.appendChild(card);
+      });
+    }
 
     okList.innerHTML = "";
-    MOCK.consistent.forEach((item) => {
+    consistent.forEach((item) => {
+      const src = item.source_episode ? `${item.source_episode}화` : "-";
       const row = document.createElement("div");
       row.className = "side-row";
-      row.innerHTML = `<span class="rc-tag">${item.category}</span><span class="txt">${item.text}</span><span class="ep">${item.sourceEpisode}화</span>`;
+      row.innerHTML = `<span class="rc-tag">${escapeHtml(item.category || "기타")}</span><span class="txt">${escapeHtml(item.quote || "")}</span><span class="ep">${src}</span>`;
       okList.appendChild(row);
     });
 
     unkList.innerHTML = "";
-    MOCK.unknown.forEach((item) => {
+    unknown.forEach((item) => {
       const row = document.createElement("div");
       row.className = "side-row";
-      row.innerHTML = `<span class="rc-tag">${item.category}</span><span class="txt">${item.text}</span>`;
+      row.innerHTML = `<span class="rc-tag">${escapeHtml(item.category || "기타")}</span><span class="txt">${escapeHtml(item.quote || "")}</span>`;
       unkList.appendChild(row);
     });
   }
 
+  const CLAIM_STATUS_LABEL = { contradiction: "모순", consistent: "일치", unknown: "확인불가" };
+
+  function renderClaimProgress(claims) {
+    const done = claims.filter((c) => c.status === "done").length;
+    claimProgressHint.textContent = `${done}/${claims.length}건 검증 완료`;
+
+    // 이미 그려진 행은 status만 갱신하고(깜빡임 방지), 새 claim만 새로 추가한다.
+    while (claimList.children.length < claims.length) {
+      const row = document.createElement("div");
+      row.className = "claim-row";
+      row.style.animationDelay = claimList.children.length * 40 + "ms";
+      claimList.appendChild(row);
+    }
+    claims.forEach((c, i) => {
+      const row = claimList.children[i];
+      const isDone = c.status === "done";
+      row.classList.toggle("is-done", isDone);
+      const statusClass = isDone ? c.label || "unknown" : "running";
+      const statusText = isDone ? CLAIM_STATUS_LABEL[c.label] || "확인불가" : "검증 중";
+      row.innerHTML = `
+        <span class="rc-tag">${escapeHtml(c.category || "기타")}</span>
+        <span class="txt">${escapeHtml(c.quote || "")}</span>
+        <span class="claim-status ${statusClass}">${statusText}</span>
+      `;
+    });
+  }
+
+  const LAST_LABEL_KEY = "gyeol.report.lastLabel";
+
+  // claim 목록이 뜨는 순간 진행 UI로 전환하며, 완료될 때까지 상태를 폴링한다.
+  // 새로 시작하든(runCheck) 재접속 후 이어보든(resumeIfPending) 이 함수 하나로 처리한다.
+  async function pollUntilDone(label) {
+    let state;
+    do {
+      const res = await fetch(`/api/report/${encodeURIComponent(label)}`);
+      if (!res.ok) return null;
+      state = await res.json();
+      if (state.claims && state.claims.length) {
+        progressWrap.classList.remove("show");
+        claimProgress.classList.add("show");
+        renderClaimProgress(state.claims);
+      }
+      if (state.status === "running") await sleep(1500);
+    } while (state.status === "running");
+    return state;
+  }
+
+  async function revealResult(state) {
+    claimProgress.classList.remove("show");
+    if (!state) return;
+    if (state.status === "error") {
+      progressWrap.classList.add("show");
+      progressFill.style.width = "100%";
+      progressCaption.textContent = "검사 실패: " + (state.detail || "알 수 없는 오류");
+      await sleep(1000);
+      progressWrap.classList.remove("show");
+    } else if (state.status === "done") {
+      // 모든 claim이 끝난 뒤 리포트를 한 번에 보여준다("짠").
+      renderReport(state.results || []);
+      report.classList.add("show");
+    }
+  }
+
   async function runCheck() {
+    if (!selectedText) return;
+    const label = labelFromName(selectedName);
+    localStorage.setItem(LAST_LABEL_KEY, label);
+
     startBtn.disabled = true;
     fileSlot.style.pointerEvents = "none";
     report.classList.remove("show");
+    claimProgress.classList.remove("show");
+    claimList.innerHTML = "";
     progressWrap.classList.add("show");
-    progressFill.style.width = "0%";
+    progressFill.style.width = "10%";
+    progressCaption.textContent = "원고를 읽고 claim을 추출하는 중...";
 
-    const steps = [
-      { pct: 18, text: "원고를 읽는 중..." },
-      { pct: 42, text: "1~6화와 대조하는 중..." },
-      { pct: 68, text: "인물·아이템 관계를 확인하는 중..." },
-      { pct: 90, text: "표현을 다시 살펴보는 중..." },
-      { pct: 100, text: "리포트를 정리하는 중..." },
-    ];
-    for (const step of steps) {
-      progressFill.style.width = step.pct + "%";
-      progressCaption.textContent = step.text;
-      await sleep(480 + Math.random() * 260);
+    try {
+      await fetch("/api/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label, text: selectedText }),
+      });
+      await revealResult(await pollUntilDone(label));
+    } catch (err) {
+      progressWrap.classList.add("show");
+      progressCaption.textContent = "검사 요청 실패: " + err.message;
+    } finally {
+      startBtn.disabled = false;
+      startBtn.textContent = "다시 검사";
+      fileSlot.style.pointerEvents = "auto";
     }
+  }
 
-    renderReport();
-    await sleep(150);
-    progressWrap.classList.remove("show");
-    report.classList.add("show");
+  // 탭을 닫았다 다시 열어도(세션 유지 여부와 무관하게) 서버는 백그라운드에서 계속 진행 중일
+  // 수 있다 — 마지막으로 시작한 label을 기억해뒀다가, 페이지가 열리면 그 상태를 그대로
+  // 이어서 보여준다(진행 중이면 폴링 재개, 이미 끝났으면 리포트 바로 표시).
+  async function resumeIfPending() {
+    const label = localStorage.getItem(LAST_LABEL_KEY);
+    if (!label) return;
+    const res = await fetch(`/api/report/${encodeURIComponent(label)}`).catch(() => null);
+    if (!res || !res.ok) return;
+    const state = await res.json();
 
-    startBtn.disabled = false;
-    startBtn.textContent = "다시 검사";
-    fileSlot.style.pointerEvents = "auto";
+    if (state.status === "done" || state.status === "error") {
+      await revealResult(state);
+      return;
+    }
+    if (state.status === "running") {
+      startBtn.disabled = true;
+      startBtn.textContent = "검사 중...";
+      fileSlot.style.pointerEvents = "none";
+      progressWrap.classList.add("show");
+      progressCaption.textContent = "이전 검사가 이어서 진행 중입니다...";
+      await revealResult(await pollUntilDone(label));
+      startBtn.disabled = false;
+      startBtn.textContent = "다시 검사";
+      fileSlot.style.pointerEvents = "auto";
+    }
+  }
+  function formatTime(iso) {
+    if (!iso) return "-";
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleString("ko-KR", {
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+    });
+  }
+
+  // 검증 히스토리(/reports)에서 넘어온 경우 — 새 검사 패널은 숨기고, 저장된 리포트를
+  // reports/ 디렉터리 기반 API(/api/reports/{label})에서 그대로 불러와 보여준다.
+  async function loadSavedReport(label) {
+    pageEyebrow.textContent = "02 · 정합성 검사 · 히스토리";
+    pageTitle.innerHTML = "지난 검사 리포트를<br />다시 확인합니다";
+    pageLede.innerHTML = `<a href="/reports">← 검증 히스토리로 돌아가기</a> · 새 검사를 시작하려면 <a href="/report">여기서 새로 시작</a>하세요.`;
+    uploadSection.style.display = "none";
+
+    try {
+      const res = await fetch(`/api/reports/${encodeURIComponent(label)}`);
+      if (!res.ok) throw new Error(res.status === 404 ? "해당 검사 기록을 찾을 수 없습니다." : `서버 오류 (${res.status})`);
+      const data = await res.json();
+      viewBanner.style.display = "block";
+      viewBanner.textContent = `"${data.label}" · ${formatTime(data.generated_at)}에 생성된 리포트입니다.`;
+      renderReport(data.results || []);
+      report.classList.add("show");
+    } catch (err) {
+      viewError.style.display = "block";
+      viewError.innerHTML = `리포트를 불러오지 못했습니다: ${escapeHtml(err.message)} — <a href="/reports">검증 히스토리로 돌아가기</a>`;
+    }
+  }
+
+  const viewLabel = new URLSearchParams(window.location.search).get("label");
+  if (viewLabel) {
+    loadSavedReport(viewLabel);
+  } else {
+    resumeIfPending();
   }
 
   startBtn.addEventListener("click", runCheck);

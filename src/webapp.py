@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -16,6 +18,10 @@ from lorekeeper.indexing import indexing as run_indexing
 
 from src import config  # noqa: F401 — import 시점에 .env를 로드해 NEO4J_*/OPENAI_API_KEY를 환경변수로 채운다
 from src.config import DATA_DIR
+from src.contradiction import save_report_files
+from src.contradiction.pipeline import REPORTS_DIR, check_new_episode_streaming
+
+logger = logging.getLogger("webapp")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 DATA_DIR.mkdir(exist_ok=True)
@@ -74,6 +80,11 @@ def report_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "report.html")
 
 
+@app.get("/reports")
+def report_history_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "report_history.html")
+
+
 @app.get("/chat")
 def chat_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "chat.html")
@@ -125,6 +136,163 @@ def index_status() -> list[JobStatus]:
         )
         for chapter, state in sorted(_job_state.items())
     ]
+
+
+# ---------- 설정 오류 리포트 API ----------
+# 인덱싱과 달리 회차 순서를 지킬 필요가 없다(검사 대상 회차 하나를 그 시점의 그래프와
+# 대조할 뿐, 검사끼리 서로 의존하지 않는다). 그래서 큐 없이 요청마다
+# asyncio.create_task로 바로 백그라운드에 띄운다 — 브라우저 연결과 무관하게 계속 진행되는
+# 성질은 인덱싱 워커와 동일하다.
+
+_report_state: dict[str, dict] = {}  # label -> {"status": "running"|"done"|"error", "claims": [...], ...}
+
+
+async def _run_report_check(label: str, text: str) -> None:
+    def on_claims_extracted(claims: list[dict]) -> None:
+        # claim 추출 직후 시점 — 프론트가 이 시점부터 claim별 진행 목록을 그릴 수 있게 한다.
+        _report_state[label]["claims"] = [
+            {
+                "index": i,
+                "quote": c.get("quote", ""),
+                "category": c.get("category", "기타"),
+                "status": "running",
+                "label": None,
+                "established_fact": None,
+                "source_episode": None,
+                "explanation": None,
+            }
+            for i, c in enumerate(claims)
+        ]
+
+    def on_claim_done(index: int, result: dict) -> None:
+        entry = _report_state[label]["claims"][index]
+        entry.update(
+            {
+                "status": "done",
+                "label": result.get("label"),
+                "established_fact": result.get("established_fact"),
+                "source_episode": result.get("source_episode"),
+                "explanation": result.get("explanation"),
+            }
+        )
+
+    try:
+        results = await check_new_episode_streaming(text, on_claims_extracted, on_claim_done)
+        save_report_files(results, label)
+        _report_state[label]["status"] = "done"
+        _report_state[label]["results"] = results
+    except Exception as exc:  # noqa: BLE001 — 실패 사유를 상태로 노출해야 프론트가 보여줄 수 있다
+        logger.exception("설정 오류 검사 실패 | label=%s", label)
+        _report_state[label]["status"] = "error"
+        _report_state[label]["detail"] = str(exc)
+
+
+class ReportRequest(BaseModel):
+    label: str
+    text: str
+
+
+class ReportAck(BaseModel):
+    label: str
+    status: str
+
+
+@app.post("/api/report", response_model=ReportAck, status_code=202)
+async def start_report(req: ReportRequest) -> ReportAck:
+    """설정 오류 검사를 백그라운드로 시작하고 즉시 응답한다. 실제 검사(claim 추출 → claim별
+    병렬 검증 → 리포트 생성)는 이 요청의 커넥션과 무관하게 진행된다."""
+    _report_state[req.label] = {"status": "running", "claims": []}
+    asyncio.create_task(_run_report_check(req.label, req.text))
+    return ReportAck(label=req.label, status="queued")
+
+
+class ReportStatus(BaseModel):
+    label: str
+    status: str
+    detail: str | None = None
+    claims: list[dict] | None = None
+    results: list[dict] | None = None
+
+
+@app.get("/api/report/{label}", response_model=ReportStatus)
+def get_report(label: str) -> ReportStatus:
+    state = _report_state.get(label)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"'{label}' 검사 기록이 없습니다.")
+    return ReportStatus(
+        label=label,
+        status=state["status"],
+        detail=state.get("detail"),
+        claims=state.get("claims"),
+        results=state.get("results"),
+    )
+
+
+# ---------- 검증 히스토리 API ----------
+# _report_state(위)는 서버 프로세스 메모리라 재시작하면 사라진다. 히스토리는 그와 무관하게
+# reports/ 디렉터리에 저장된 *_contradiction_report.json 파일을 그대로 진실의 원천으로 삼는다
+# (save_report_files가 검사 완료 시마다 label·생성시각·results를 함께 기록해둔다).
+
+
+def _report_counts(results: list[dict]) -> dict[str, int]:
+    counts = {"contradiction": 0, "consistent": 0, "unknown": 0}
+    for r in results:
+        if r.get("label") in counts:
+            counts[r["label"]] += 1
+    return counts
+
+
+def _load_report_file(label: str) -> dict:
+    path = REPORTS_DIR / f"{label}_contradiction_report.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"'{label}' 리포트가 없습니다.")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+class ReportHistoryItem(BaseModel):
+    label: str
+    generated_at: str
+    total: int
+    counts: dict[str, int]
+
+
+@app.get("/api/reports", response_model=list[ReportHistoryItem])
+def list_reports() -> list[ReportHistoryItem]:
+    if not REPORTS_DIR.exists():
+        return []
+    items = []
+    for path in sorted(REPORTS_DIR.glob("*_contradiction_report.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        results = payload.get("results", [])
+        items.append(
+            ReportHistoryItem(
+                label=payload.get("label", path.stem),
+                generated_at=payload.get("generated_at", ""),
+                total=len(results),
+                counts=_report_counts(results),
+            )
+        )
+    items.sort(key=lambda it: it.generated_at, reverse=True)
+    return items
+
+
+class ReportDetail(BaseModel):
+    label: str
+    generated_at: str
+    results: list[dict]
+
+
+@app.get("/api/reports/{label}", response_model=ReportDetail)
+def get_saved_report(label: str) -> ReportDetail:
+    payload = _load_report_file(label)
+    return ReportDetail(
+        label=payload.get("label", label),
+        generated_at=payload.get("generated_at", ""),
+        results=payload.get("results", []),
+    )
 
 
 # ---------- 원고 목록/뷰어 API ----------
