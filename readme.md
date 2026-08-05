@@ -43,21 +43,97 @@ retrievers = build_retrievers()   # {"vector_cypher", "hybrid_cypher", "entity_s
 tools = build_retrieval_tools()   # neo4j_graphrag.tool.Tool 리스트 — LangGraph 등에 배선
 ```
 
-## 실행 방법
+## 이 서버의 위치
+
+**API 서버(`lorekeeper-backend`)가 호출하는 쪽이다.** 스스로 외부 요청을 받지 않는다.
+
+프로덕션에서는 API 서버와 **같은 EC2**에 뜨고 `127.0.0.1:8000`에만 바인딩한다.
+보안 그룹에도 열려 있지 않아서 EC2 주소를 알아도 외부에서 접근할 수 없다.
+
+```
+CloudFront ──/api/*──▶ Spring (:8080) ──▶ 이 서버 (127.0.0.1:8000)
+                          │                    │
+                          └──────┬─────────────┘
+                                 ▼
+                    PostgreSQL / Neo4j  (두 서버가 같은 DB를 본다)
+```
+
+## 로컬 실행
 
 ```bash
-# 1. Neo4j 기동 (lorekeeper-poc와 동일 인증정보 neo4j/lorekeeper 사용)
+# 1. 별도 레포를 라이브러리로 클론 (.gitignore 대상이라 이 레포에 없다)
+git clone https://github.com/Gomdadi/lorekeeper-poc.git
+
+# 2. DB 기동 — Neo4j + PostgreSQL
 docker compose up -d
 
-# 2. .env 확인 (.env.example 참고) — OPENAI_API_KEY, NEO4J_URI/USER/PASSWORD
+# 3. .env 구성 (.env.example 참고)
+cp .env.example .env    # OPENAI_API_KEY 를 채운다
 
-# 3. 의존성 설치 (lorekeeper-poc를 editable install)
+# 4. 의존성 설치 (lorekeeper-poc 를 editable install)
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 4. 서버 실행 (지금은 정적 mock 페이지만 서빙)
+# 5. 서버 실행
 .venv/bin/uvicorn src.webapp:app --host 127.0.0.1 --port 8000
 ```
+
+> **파이썬은 3.12로 고정한다.** 의존성 `python-mecab-ko`의 aarch64 휠이 cp312까지만
+> 제공된다. CI와 프로덕션도 같은 버전을 쓴다.
+
+> **포트 충돌 주의** — `lorekeeper-backend`의 `compose.dev.yml`도 5432와 7687을 쓴다.
+> 두 레포는 **같은 DB를 공유하는 것이 정상**이므로, 둘 중 한쪽만 띄우고 나머지는 그걸
+> 그대로 쓰면 된다.
+
+### 확인
+
+```bash
+curl localhost:8000/api/health | python3 -m json.tool
+```
+
+## 환경 분리
+
+| | 로컬 | 프로덕션 |
+|---|---|---|
+| 설정 | `.env` | `/opt/agent/agent.env` — 배포 시 SSM/Secrets Manager 에서 생성 |
+| Neo4j | `docker compose` 컨테이너 | 전용 EC2 (사설 IP) |
+| PostgreSQL | `docker compose` 컨테이너 | RDS. 비밀번호는 RDS가 Secrets Manager에서 회전 |
+| OpenAI 키 | `.env` | SSM SecureString `/mono/openai_api_key` |
+
+**프로덕션 자격증명은 이 레포에 없다.** 인스턴스가 자기 IAM 역할로 읽어간다.
+전체 그림은
+[deploy-local-and-prod.md](https://github.com/soma-lorekeeper/mvp-infra-iac/blob/main/deploy-local-and-prod.md).
+
+## 연동 점검 — `GET /api/health`
+
+이 서버가 두 DB에 실제로 닿는지 점검한다. API 서버가 이 결과를 받아 자기 것과 합쳐
+프론트에 내려준다.
+
+```json
+{
+  "service": "agent",
+  "status": "ok",
+  "checks": {
+    "neo4j":    { "ok": true, "detail": { "uri": "bolt://..." },  "latency_ms": 10.1 },
+    "postgres": { "ok": true, "detail": { "server": "PostgreSQL 17.10", "target": "host:5432/db" }, "latency_ms": 13.6 }
+  }
+}
+```
+
+**DB가 죽어도 HTTP 200을 준다.** 상태는 본문의 `status`로 구분한다 — 5xx를 내면 호출자가
+"에이전트가 죽음"과 "에이전트는 살아있고 DB만 죽음"을 구분하지 못한다.
+
+`detail.target`에는 호스트/DB만 남긴다. `DATABASE_URL`에 섞인 자격증명은 노출하지 않는다.
+
+## 배포
+
+`main`에 푸시하면 GitHub Actions가 소스를 묶어 S3에 올리고 SSM으로 EC2에서 설치·재기동한다.
+
+의존성 설치는 러너가 아니라 **인스턴스에서** 한다 — 러너는 x86_64, 인스턴스는 arm64라
+휠이 다르기 때문이다. `lorekeeper-poc`도 설치 직전에 클론한다.
+
+원고(`data/`)와 리포트(`reports/`)는 아티팩트에 담지 않는다. 서버의 `/opt/agent/state/`를
+심볼릭 링크로 연결해 재배포해도 유지된다.
 
 ## 남은 작업 (다음 단계)
 

@@ -10,3 +10,9 @@ openai
 python-dotenv
 fastapi
 uvicorn
+
+# 연동 점검용. lorekeeper 가 neo4j 드라이버를 이미 끌고 오지만,
+# /api/health 가 그 전이 의존성에 기대지 않도록 직접 선언한다.
+neo4j
+# 관계형 DB 점검. [binary] 는 libpq 를 함께 담은 휠이라 시스템에 libpq 를 깔 필요가 없다.
+psycopg[binary]
