@@ -1,0 +1,90 @@
+# main 에 푸시되면 소스를 묶어 S3 에 올리고, SSM 으로 EC2 에서 설치·재기동한다.
+#
+# 이 에이전트 서버는 외부에 노출되지 않는다. 같은 EC2 의 127.0.0.1:8000 에만 뜨고,
+# 요청의 주체는 항상 lorekeeper-backend(스프링)다.
+#
+# 필요한 GitHub 변수 (Settings > Secrets and variables > Actions > Variables):
+#   AWS_ROLE_ARN, AWS_REGION, ARTIFACT_BUCKET, API_INSTANCE_ID
+# mvp-infra-iac 의 ./setup-github.sh 가 terraform output 을 읽어 한 번에 설정해준다.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-agent
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC 토큰 발급에 필요
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 아티팩트에는 소스만 담는다. 의존성 설치와 lorekeeper-poc 클론은
+      # 인스턴스에서 한다 — 러너(x86_64)와 인스턴스(arm64)의 휠이 다르기 때문이다.
+      #
+      # data/ 와 reports/ 는 서버의 영속 디렉터리를 쓰므로 올리지 않는다.
+      # 원고는 저작물이라 애초에 레포에도 없다(.gitignore).
+      - name: Package
+        run: |
+          tar -czf agent.tar.gz \
+            --exclude='.git' \
+            --exclude='.venv' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='./data' \
+            --exclude='./reports' \
+            --exclude='./lorekeeper-poc' \
+            .
+          ls -lh agent.tar.gz
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload artifact
+        run: aws s3 cp agent.tar.gz "s3://${{ vars.ARTIFACT_BUCKET }}/agent.tar.gz"
+
+      # 실행 전에 S3 에서 배포 스크립트 최신본을 받는다. 이 단계가 없으면 인스턴스에
+      # 처음 깔린 버전이 계속 돌아서, mvp-infra-iac 에서 절차를 고쳐도 반영되지 않는다.
+      # 내려받기는 인스턴스 자신의 IAM 역할로 한다.
+      - name: Deploy via SSM
+        run: |
+          CMD=$(aws ssm send-command \
+            --instance-ids "${{ vars.API_INSTANCE_ID }}" \
+            --document-name AWS-RunShellScript \
+            --parameters "commands=[\"aws s3 cp s3://${{ vars.ARTIFACT_BUCKET }}/deploy-agent-remote.sh /usr/local/bin/deploy-agent --region ${{ vars.AWS_REGION }}\",\"chmod 755 /usr/local/bin/deploy-agent\",\"/usr/local/bin/deploy-agent\"]" \
+            --timeout-seconds 1800 \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command: $CMD"
+
+          # 파이썬 의존성 설치(kiwipiepy/numpy 등)에 몇 분 걸린다.
+          for _ in $(seq 1 120); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD" --instance-id "${{ vars.API_INSTANCE_ID }}" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success|Failed|TimedOut|Cancelled) break ;;
+            esac
+            sleep 10
+          done
+
+          aws ssm get-command-invocation \
+            --command-id "$CMD" --instance-id "${{ vars.API_INSTANCE_ID }}" \
+            --query 'StandardOutputContent' --output text | tail -30
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::배포 실패 ($STATUS)"
+            aws ssm get-command-invocation \
+              --command-id "$CMD" --instance-id "${{ vars.API_INSTANCE_ID }}" \
+              --query 'StandardErrorContent' --output text | tail -30
+            exit 1
+          fi

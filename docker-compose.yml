@@ -1,8 +1,12 @@
-# lorekeeper-poc(../lorekeeper-poc, 이 폴더 안엔 clone본)의 docker-compose.yml과 동일한 설정.
-# lorekeeper 패키지의 인덱싱/리트리버가 이 Neo4j 인스턴스에 붙는다 — 인증정보를
-# lorekeeper-poc 쪽과 반드시 맞춰야 하므로(schema.py 등 내부 로직은 건드리지 않음) 그대로 따른다.
+# 로컬 개발용 DB 스택. 프로덕션에서는 둘 다 별도 리소스다
+# (Neo4j = 전용 EC2, PostgreSQL = RDS). 여기 값들은 전부 로컬 전용이라 비밀이 아니다.
+#
+#   docker compose up -d
 services:
   neo4j:
+    # lorekeeper-poc(../lorekeeper-poc, 이 폴더 안엔 clone본)의 docker-compose.yml과 동일한 설정.
+    # lorekeeper 패키지의 인덱싱/리트리버가 이 Neo4j 인스턴스에 붙는다 — 인증정보를
+    # lorekeeper-poc 쪽과 반드시 맞춰야 하므로(schema.py 등 내부 로직은 건드리지 않음) 그대로 따른다.
     image: neo4j:5.26-community
     container_name: agentic-workflow-neo4j
     ports:
@@ -23,6 +27,26 @@ services:
       timeout: 5s
       retries: 10
 
+  postgres:
+    # 프로덕션 RDS 와 같은 메이저 버전. lorekeeper-backend 의 compose.dev.yml 과도
+    # 같은 DB/계정을 쓴다 — 두 서비스가 같은 관계형 데이터를 본다.
+    image: postgres:17-alpine
+    container_name: agentic-workflow-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: lorekeeper
+      POSTGRES_USER: lorekeeper
+      POSTGRES_PASSWORD: lorekeeper
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lorekeeper -d lorekeeper"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
 volumes:
   neo4j_data:
   neo4j_logs:
+  postgres_data:
