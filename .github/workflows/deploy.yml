@@ -32,9 +32,12 @@ jobs:
       #
       # data/ 와 reports/ 는 서버의 영속 디렉터리를 쓰므로 올리지 않는다.
       # 원고는 저작물이라 애초에 레포에도 없다(.gitignore).
+      #
+      # 결과 파일은 반드시 아카이브 대상 밖에 쓴다. 같은 디렉터리에 쓰면 tar 가
+      # 자기가 만드는 파일을 읽으면서 "file changed as we read it" 으로 실패한다.
       - name: Package
         run: |
-          tar -czf agent.tar.gz \
+          tar -czf "$RUNNER_TEMP/agent.tar.gz" \
             --exclude='.git' \
             --exclude='.venv' \
             --exclude='__pycache__' \
@@ -43,7 +46,7 @@ jobs:
             --exclude='./reports' \
             --exclude='./lorekeeper-poc' \
             .
-          ls -lh agent.tar.gz
+          ls -lh "$RUNNER_TEMP/agent.tar.gz"
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -51,7 +54,7 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Upload artifact
-        run: aws s3 cp agent.tar.gz "s3://${{ vars.ARTIFACT_BUCKET }}/agent.tar.gz"
+        run: aws s3 cp "$RUNNER_TEMP/agent.tar.gz" "s3://${{ vars.ARTIFACT_BUCKET }}/agent.tar.gz"
 
       # 실행 전에 S3 에서 배포 스크립트 최신본을 받는다. 이 단계가 없으면 인스턴스에
       # 처음 깔린 버전이 계속 돌아서, mvp-infra-iac 에서 절차를 고쳐도 반영되지 않는다.
