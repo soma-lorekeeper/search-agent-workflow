@@ -1,11 +1,19 @@
 import asyncio
 import logging
+import math
+import os
+import time
+import uuid
+from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, JSONResponse
+from openai import RateLimitError
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 
 from lorekeeper.client import get_driver
 
@@ -29,43 +37,129 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 DATA_DIR.mkdir(exist_ok=True)
 
 # ---------- 인덱싱 작업 큐 ----------
-# 작업 id(job_id)는 이 서버가 만들지 않는다 — API 서버(Spring)가 발급해서 넘겨준다.
-# 이 서버는 "Spring이 준 id로 일하는 워커"일 뿐이고, 작업의 정체성과 결과의 진실의 원천은
-# Spring(PostgreSQL) 쪽에 있다. 그래야 응답이 유실되거나 이 서버가 재시작해도 Spring이
-# 자기가 발급한 id로 다시 물어볼 수 있다(모르는 id면 404 — 아래 조회 API 참고).
+# 작업 id(jobId)는 이 서버가 UUID로 발급한다. 예전에는 Spring이 발급한 id로 일했지만,
+# 이제 요청 하나가 여러 화를 묶어서 들어오고 그 묶음의 진행 상태(화별 waiting/running/
+# done/error)를 관리하는 주체가 이 서버라서, 묶음의 이름도 여기서 짓는 게 맞다.
+# Spring은 201 응답으로 받은 jobId로 진행 상황을 조회한다.
 #
 # 처리는 요청 커넥션과 완전히 분리된 백그라운드 워커가 한다 — 요청한 쪽이 끊겨도,
 # 애초에 기다리는 클라이언트가 없어도 서버 프로세스가 떠 있는 한 계속 진행된다.
-# PriorityQueue를 화 번호로 정렬해서, 여러 화를 한꺼번에 큐에 넣어도(예: 4화를 2화보다
-# 먼저 요청해도) lorekeeper가 요구하는 오름차순 순차 인덱싱이 지켜지게 한다.
+# 큐는 단순 FIFO다: 예전에는 화 번호로 정렬하는 PriorityQueue였지만, 이제 "오름차순"은
+# 요청 자체가 보장해야 하는 조건이고(어기면 400) 한 요청 안의 화들은 받은 순서대로
+# 처리하므로, 큐가 순서를 다시 정할 이유가 없다.
 #
-# 큐와 워커는 작품 구분 없이 전역이다. 지금 KG에는 작품 격리가 아예 없어서(kg_scope 참고)
-# 그래프 전체가 "인덱싱된 작품 하나"이고, 여러 작품을 동시에 인덱싱하는 상황 자체가 없다.
-# 여기서 work_id별로 큐를 쪼개면 없는 격리를 있는 척하게 될 뿐이다 — KG가 work_id를 갖게
-# 되는 시점에 큐/워커를 작품별로 나눈다.
+# 큐와 워커는 작품 구분 없이 전역이고 워커는 하나뿐이다. 지금 KG에는 작품 격리가 아예
+# 없어서(kg_scope 참고) 그래프 전체가 "인덱싱된 작품 하나"이고, 여러 작품을 동시에
+# 인덱싱하는 상황 자체가 없다. 여기서 workId별로 큐를 쪼개면 없는 격리를 있는 척하게 될
+# 뿐이다 — KG가 workId를 갖게 되는 시점에 큐/워커를 작품별로 나눈다.
+#
+# 작업 상태는 이 프로세스 메모리에만 있다. 재시작하면 상태가 사라지고 진행 중이던 인덱싱도
+# 함께 끊긴다 — 스펙이 인정하는 정상 시나리오다(Spring은 조회에서 404를 보면 다시 POST한다).
+# 그렇게 다시 보내도 안전한 근거는 _already_indexed의 완료 마커다.
+#
+# job 한 건의 모양:
+#   {"user_id": 42, "work_id": 7, "requested_at": "2026-08-11T03:11:00Z",
+#    "episodes": [{"episode_id": 101, "episode_no": 6, "text": "...",
+#                  "status": "waiting", "error": None}, ...]}
+# text를 상태에 함께 들고 있는 건 워커가 나중에 꺼내 쓰기 때문이고, 조회 응답에는 나가지
+# 않는다(응답 모델이 episodeId/status/error만 뽑는다).
 
-_index_jobs: dict[str, dict] = {}  # job_id -> {"status": "queued"|"running"|"done"|"error", ...}
-_index_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+_index_jobs: dict[str, dict] = {}  # job_id -> 위 모양의 dict
+_index_queue: asyncio.Queue = asyncio.Queue()  # 접수된 job_id의 FIFO
 
 
 async def _index_worker() -> None:
-    """서버가 떠 있는 동안 계속 도는 단일 워커. 큐에서 화 번호가 가장 작은 것부터 하나씩
-    꺼내 순차 인덱싱한다. 동시에 여러 화를 처리하지 않는다(lorekeeper의 누적 컨텍스트가
+    """서버가 떠 있는 동안 계속 도는 단일 워커. 큐에서 작업을 하나씩 꺼내 그 작업의 화들을
+    순서대로 인덱싱한다. 동시에 여러 화를 처리하지 않는다(lorekeeper의 누적 컨텍스트가
     이전 화 완료를 전제하므로 순차 처리 필수)."""
     while True:
-        episode_number, job_id, work_id, text = await _index_queue.get()
-        _index_jobs[job_id] = {"status": "running"}
+        job_id = await _index_queue.get()
         try:
-            # KG의 작품 범위를 아는 유일한 지점. 지금은 격리가 없어 빈 필터를 돌려주고 경고만
-            # 남기지만, work_id를 여기서 반드시 통과시켜야 격리가 생겼을 때 고칠 곳이 하나로 남는다.
-            kg_scope(work_id)
-            result = await run_indexing(episode_number, text)
-            _index_jobs[job_id] = {"status": "done", "result": result}
-        except Exception as exc:  # noqa: BLE001 — 실패 사유를 상태로 노출해야 호출자가 보여줄 수 있다
-            logger.exception("인덱싱 실패 | job_id=%s episode=%s", job_id, episode_number)
-            _index_jobs[job_id] = {"status": "error", "detail": str(exc)}
+            await _run_index_job(job_id)
+        except Exception:  # noqa: BLE001 — 워커가 죽으면 이후 모든 작업이 멈춘다
+            logger.exception("인덱싱 작업 처리 중 예기치 못한 오류 | jobId=%s", job_id)
         finally:
             _index_queue.task_done()
+
+
+async def _run_index_job(job_id: str) -> None:
+    """작업 하나(=여러 화)를 episodeNo 오름차순으로 순차 인덱싱한다.
+
+    한 화가 실패하면 뒤의 화는 아예 시도하지 않고 전부 error로 표시한다. 인덱싱은 이전
+    화까지 누적된 그래프를 컨텍스트로 읽어서 다음 화를 해석하므로, 중간이 빈 채로 뒤를
+    이어붙이면 그래프가 조용히 잘못된 상태가 된다 — 멈추는 편이 낫다.
+    """
+    job = _index_jobs[job_id]
+    failed_no: int | None = None
+
+    for episode in job["episodes"]:
+        if episode["status"] == "done":
+            # 접수 시점에 완료 마커가 확인된 화 — 다시 인덱싱하지 않는다.
+            continue
+        if failed_no is not None:
+            episode["status"] = "error"
+            episode["error"] = f"Skipped due to preceding episode ({failed_no}) failure"
+            continue
+
+        episode["status"] = "running"
+        try:
+            # KG의 작품 범위를 아는 유일한 지점. 지금은 격리가 없어 빈 필터를 돌려주고 경고만
+            # 남기지만, workId를 여기서 반드시 통과시켜야 격리가 생겼을 때 고칠 곳이 하나로 남는다.
+            # userId는 kg_scope에도 넘기지 않는다 — 그래프에는 workId조차 없어서 사용자 단위
+            # 격리는 더더욱 불가능하고, 지금 넘겨봐야 무시되는 인자가 하나 늘 뿐이다. 사용자는
+            # 로그로만 남겨 "누가 넣은 그래프인지" 추적할 수 있게 한다.
+            kg_scope(job["work_id"])
+            logger.info(
+                "인덱싱 시작 | jobId=%s userId=%s workId=%s episodeId=%s episodeNo=%s",
+                job_id,
+                job["user_id"],
+                job["work_id"],
+                episode["episode_id"],
+                episode["episode_no"],
+            )
+            await _run_indexing_with_retry(episode["episode_no"], episode["text"])
+            episode["status"] = "done"
+        except Exception as exc:  # noqa: BLE001 — 실패 사유를 상태로 노출해야 호출자가 보여줄 수 있다
+            logger.exception(
+                "인덱싱 실패 | jobId=%s episodeId=%s episodeNo=%s",
+                job_id,
+                episode["episode_id"],
+                episode["episode_no"],
+            )
+            episode["status"] = "error"
+            episode["error"] = str(exc)
+            failed_no = episode["episode_no"]
+
+
+# 접수 시점의 TPM 계산은 어디까지나 추정이라, 201을 받은 요청도 실제 호출에서 순간적으로
+# 한도에 걸릴 수 있다. 그건 Spring에 돌려줘봐야 똑같은 요청을 다시 만들 뿐이므로 여기서
+# 삼키고 재시도한다(스펙 6절: "서버가 내부적으로 백오프 재시도, Spring은 관여하지 않는다").
+_RATE_LIMIT_RETRIES = 3
+_RATE_LIMIT_BACKOFF_SECONDS = 20  # 20초 → 40초 → 80초. TPM 창이 60초라 한 번 쉬면 대개 회복된다.
+
+
+async def _run_indexing_with_retry(episode_no: int, text: str) -> dict:
+    """lorekeeper 인덱싱을 부르되, OpenAI의 rate limit(429)만 백오프 재시도한다.
+
+    다른 예외는 재시도해도 결과가 달라지지 않으므로(원고 파싱 실패, DB 연결 끊김 등)
+    그대로 올려보내 화 상태를 error로 만든다.
+    """
+    for attempt in range(_RATE_LIMIT_RETRIES + 1):
+        try:
+            return await run_indexing(episode_no, text)
+        except RateLimitError:
+            if attempt == _RATE_LIMIT_RETRIES:
+                raise
+            delay = _RATE_LIMIT_BACKOFF_SECONDS * (2**attempt)
+            logger.warning(
+                "OpenAI rate limit — %d초 후 재시도 | episodeNo=%s (%d/%d)",
+                delay,
+                episode_no,
+                attempt + 1,
+                _RATE_LIMIT_RETRIES,
+            )
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 @asynccontextmanager
@@ -76,8 +170,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# NOTE: 이 서버의 API는 전부 API 서버(Spring)가 호출하는 내부 API다. 작업형 API(인덱싱·설정
-# 오류 탐지)는 "job_id는 Spring이 발급하고 이 서버는 그 id로 일한다"는 한 가지 규칙을 공유한다.
+# NOTE: 이 서버의 API는 전부 API 서버(Spring)가 호출하는 내부 API다. 인증은 없다 —
+# 호출자가 Spring 하나뿐이고 이 서버는 127.0.0.1에만 떠 있어 외부에서 닿을 수 없다.
+# 작업형 API 둘은 작업 id 발급 주체가 서로 다르다: 인덱싱은 이 서버가 jobId를 발급하고
+# (요청 하나가 여러 화를 묶는 단위라서), 설정 오류 탐지는 여전히 Spring이 발급한 job_id로
+# 일한다. 필드 표기도 그래서 다르다 — 인덱싱만 스펙대로 camelCase이고 나머지는 snake_case다.
 # static/ 아래 페이지들은 그 위에 얹힌 개발용 데모지 제품 화면이 아니다.
 
 
@@ -105,67 +202,269 @@ def library_page() -> FileResponse:
 
 
 # ---------- 인덱싱 API ----------
+# 요청·응답 필드는 스펙대로 camelCase다. 파이썬 쪽 필드 이름은 snake_case로 두고 alias로만
+# 바꾼다 — 필드 이름 자체를 camelCase로 쓰면 이 파일 안에 이름 규칙이 두 개 생긴다.
 
 
-class IndexRequest(BaseModel):
-    # job_id는 호출자(Spring)가 만들어 넘긴다 — 이 서버는 그 id로 일할 뿐이다.
-    # work_id는 지금 KG에서 실제 필터로 쓰이지 않지만(kg_scope 참고) 인터페이스에는 처음부터
-    # 둔다. 나중에 격리가 생겨도 API 계약을 다시 깨지 않기 위해서다.
-    job_id: str
-    work_id: int
-    episode_number: int
-    text: str
+class CamelModel(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
 
 
-class JobAck(BaseModel):
-    job_id: str
-    status: str
+# ---------- 완료 마커 ----------
+# "이 화가 인덱싱됐는가"의 진실은 이 서버의 메모리가 아니라 Neo4j다. lorekeeper 인덱싱의
+# 마지막 쓰기가 Chapter-[:IN_STORY]->Story(id:'main') 관계이므로(lorekeeper-poc의
+# context.update_global_summary — 전역 요약 갱신과 같은 쿼리에서 한 번에 MERGE된다),
+# 이 관계가 있으면 그 화는 추출·근거링크·요약까지 전부 끝났다는 뜻이다.
+#
+# 그래서 접수 시점에 화마다 이 마커를 확인한다:
+#   - 있으면 → 일하지 않고 즉시 done
+#   - 없으면 → 처음부터 다시 인덱싱(중간까지 쓰다 만 결과 위에 다시 돌려도 Neo4jWriter가
+#     전부 upsert라 같은 값으로 수렴한다)
+# 재시작으로 진행 상태가 날아가 Spring이 같은 화를 다시 보내도 안전한 이유가 이것이다.
+_INDEXED_MARKER_CYPHER = """
+MATCH (c:Chapter)-[:IN_STORY]->(:Story {id: 'main'})
+WHERE c.number IN $chapters
+RETURN c.number AS chapter
+"""
 
 
-@app.post("/api/index", response_model=JobAck, status_code=202)
-async def index_episode(req: IndexRequest) -> JobAck:
-    """인덱싱을 큐에 넣고 즉시 응답한다. 실제 처리(lorekeeper.indexing 호출)는
-    _index_worker가 이 요청의 커넥션과 무관하게 백그라운드에서 진행한다.
-    lorekeeper는 Chunk 단위로만 원문을 보관하므로, "원고 목록" 뷰어에서 보여줄 원문
-    전체는 우리 쪽에서 별도로 data/episode{N}.txt에 저장해 둔다(이건 큐잉 전에 바로 처리)."""
-    known = _index_jobs.get(req.job_id)
-    if known is not None:
-        # 같은 job_id로 다시 들어온 요청은 새 작업이 아니라 호출자의 재시도(응답 유실·타임아웃)로
-        # 본다. 다시 큐에 넣으면 같은 화를 두 번 인덱싱해 그래프가 오염되고 LLM 비용도 두 배다.
-        return JobAck(job_id=req.job_id, status=known["status"])
+def _already_indexed(episode_nos: list[int]) -> set[int]:
+    """완료 마커가 있는 화 번호 집합을 Neo4j에 한 번에 물어본다(요청당 쿼리 1회).
 
-    (DATA_DIR / f"episode{req.episode_number}.txt").write_text(req.text, encoding="utf-8")
-    _index_jobs[req.job_id] = {"status": "queued"}
-    # 정렬 키는 화 번호가 먼저다(오름차순 순차 인덱싱). 뒤의 job_id는 같은 화가 두 번
-    # 들어왔을 때의 타이브레이커 — 없으면 우선순위 비교가 원고 본문끼리의 문자열 비교로 넘어간다.
-    await _index_queue.put((req.episode_number, req.job_id, req.work_id, req.text))
-    return JobAck(job_id=req.job_id, status="queued")
-
-
-class IndexStatus(BaseModel):
-    job_id: str
-    status: str
-    detail: str | None = None
-    result: dict | None = None
-
-
-@app.get("/api/index/{job_id}", response_model=IndexStatus)
-def get_index_job(job_id: str) -> IndexStatus:
-    """작업 하나의 진행 상태. 서버 프로세스 메모리에만 있으므로 재시작하면 사라진다 —
-    그래도 되는 건 이게 "작업 중 상태"일 뿐 진실이 아니기 때문이다. 무엇이 실제로 인덱싱됐는지의
-    정답은 Neo4j(/api/episodes)이고, 작업 이력의 정답은 API 서버의 DB다.
-
-    모르는 job_id는 404다. 그래야 호출자가 "접수된 적 없음/재시작으로 유실됨"과
-    "아직 처리 중"을 구분할 수 있다(빈 상태를 200으로 주면 영원히 기다리게 된다).
+    조회 자체가 실패하면(그래프가 죽었거나 접속 불가) "모른다"가 아니라 "안 됐다"로 본다.
+    실제로 인덱싱돼 있었다면 다시 돌려도 같은 결과로 수렴하지만, 반대로 판단하면 안 된 화를
+    done으로 보고해 영영 빠진 화가 생긴다.
     """
-    state = _index_jobs.get(job_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail=f"'{job_id}' 인덱싱 작업 기록이 없습니다.")
-    return IndexStatus(
+    try:
+        driver = get_driver()
+        try:
+            records, _, _ = driver.execute_query(
+                _INDEXED_MARKER_CYPHER,
+                {"chapters": episode_nos},
+                database_=LOREKEEPER_DATABASE,
+            )
+        finally:
+            driver.close()
+    except Exception:  # noqa: BLE001 — 마커 확인 실패는 작업 거절 사유가 아니다
+        logger.warning("완료 마커 확인 실패 — 전부 인덱싱 대상으로 취급한다 | episodeNos=%s", episode_nos)
+        return set()
+    return {r["chapter"] for r in records}
+
+
+# ---------- TPM(분당 토큰) ----------
+# 한 화를 인덱싱하면 LLM을 여러 번 부른다(추출 + 회차 요약 + 전역 요약 …). 조직 단위 분당
+# 토큰 한도를 넘기면 OpenAI가 429를 돌려주는데, 그건 이미 절반쯤 일한 뒤라 되돌리기 어렵다.
+# 그래서 접수 시점에 "이 요청이 대략 몇 토큰을 쓸지"를 추정해 남은 여유와 비교하고, 모자라면
+# 아예 받지 않는다(429 + Retry-After). 받지 않은 요청은 어디에도 저장하지 않는다.
+#
+# 추정 휴리스틱 — 정확할 필요는 없고 과소추정만 피하면 된다:
+#   화당 토큰 ≈ 원고 글자수 / _CHARS_PER_TOKEN * _PASSES_PER_EPISODE + _CONTEXT_TOKENS_PER_EPISODE
+#   - _CHARS_PER_TOKEN=1.5: 한국어는 대략 1.5자에 1토큰(o200k 기준 경험값).
+#   - _PASSES_PER_EPISODE=4: 원고 전문이 프롬프트/응답에 실리는 횟수 — 추출 입력, 추출 결과
+#     (그래프 JSON), 회차 요약 입력, 전역 요약 입력. 원고가 몇 번 왕복하는지의 대략치다.
+#   - _CONTEXT_TOKENS_PER_EPISODE=15000: 원고 길이와 무관하게 매 화 깔리는 고정 비용
+#     (그래프 덤프 + 누적 요약 + few-shot 예시).
+#
+# 이 값은 예약이 아니라 추정이다: 201을 받은 요청도 실제 호출에서 순간 한도에 걸릴 수 있고,
+# 그때는 워커가 백오프로 알아서 재시도한다(_run_indexing_with_retry).
+INDEX_TPM_LIMIT = int(os.environ.get("INDEX_TPM_LIMIT", "200000"))
+_TPM_WINDOW_SECONDS = 60
+_CHARS_PER_TOKEN = 1.5
+_PASSES_PER_EPISODE = 4
+_CONTEXT_TOKENS_PER_EPISODE = 15000
+
+# (기록 시각(monotonic), 추정 토큰). 최근 _TPM_WINDOW_SECONDS초치만 남기는 슬라이딩 윈도우다.
+_tpm_window: deque[tuple[float, int]] = deque()
+
+
+def _estimate_tokens(texts: list[str]) -> int:
+    """인덱싱할 원고들이 쓸 토큰 추정치(위 휴리스틱)."""
+    return sum(
+        int(len(text) / _CHARS_PER_TOKEN * _PASSES_PER_EPISODE) + _CONTEXT_TOKENS_PER_EPISODE
+        for text in texts
+    )
+
+
+def _tpm_remaining(now: float) -> int:
+    """창을 흘려보내고 남은 여유 토큰을 돌려준다(음수는 0으로 자른다)."""
+    while _tpm_window and now - _tpm_window[0][0] >= _TPM_WINDOW_SECONDS:
+        _tpm_window.popleft()
+    used = sum(tokens for _, tokens in _tpm_window)
+    return max(0, INDEX_TPM_LIMIT - used)
+
+
+def _tpm_retry_after(now: float) -> int:
+    """가장 오래된 기록이 창 밖으로 나가 여유가 생기기까지 남은 초."""
+    if not _tpm_window:
+        return _TPM_WINDOW_SECONDS
+    return max(1, math.ceil(_TPM_WINDOW_SECONDS - (now - _tpm_window[0][0])))
+
+
+def _now_rfc3339() -> str:
+    """RFC 3339 UTC(2026-08-11T03:11:00Z). 이 서버의 모든 시각 표기는 이 형식이다."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class IndexEpisode(CamelModel):
+    # episodeId는 Spring의 식별자다 — 이 서버는 해석하지 않고 상태 조회에서 그대로 돌려주기만 한다.
+    # episodeNo가 실제 인덱싱 단위(lorekeeper의 Chapter.number)다.
+    episode_id: int
+    episode_no: int
+    # text는 없으면 400으로 돌려주려고 일부러 옵셔널로 받는다. 필수로 선언하면 FastAPI가
+    # 먼저 422를 내는데, 스펙은 검증 실패를 400 {"detail": ...}로 정해뒀다.
+    text: str | None = None
+
+
+class IndexRequest(CamelModel):
+    # userId × workId가 작품 하나를 가리킨다. 둘 다 지금 KG에서 실제 필터로 쓰이지 않지만
+    # (kg_scope 참고) 인터페이스에는 처음부터 둔다 — 격리가 생겨도 API 계약을 다시 깨지 않게.
+    user_id: int
+    work_id: int
+    # 비었을 때 422가 아니라 400을 주려고 기본값을 둔다(text와 같은 이유).
+    episodes: list[IndexEpisode] = []
+
+
+class IndexAccepted(CamelModel):
+    job_id: str
+    user_id: int
+    work_id: int
+    episode_ids: list[int]
+    requested_at: str
+    remaining_tpm: int
+
+
+@app.post("/api/index", response_model=IndexAccepted, status_code=201)
+async def index_episodes(req: IndexRequest):
+    """여러 화를 한 작업으로 접수하고 즉시 응답한다.
+
+    실제 처리(lorekeeper.indexing 호출)는 _index_worker가 이 요청의 커넥션과 무관하게
+    백그라운드에서, 받은 순서대로 하나씩 진행한다.
+
+    접수 순서: 입력 검증 → 화별 완료 마커 확인 → TPM 여유 확인 → 저장·큐잉.
+    TPM에서 거절(429)당한 요청은 어디에도 남지 않아야 하므로, 상태 등록과 원고 파일 쓰기는
+    모두 그 확인을 통과한 뒤에 한다.
+    """
+    if not req.episodes:
+        raise HTTPException(status_code=400, detail="episodes must not be empty")
+
+    previous_no: int | None = None
+    for episode in req.episodes:
+        if not episode.text:
+            raise HTTPException(
+                status_code=400, detail=f"episode {episode.episode_id} must have text"
+            )
+        # 같은 번호가 두 번 오는 것도 막는다(오름차순 위반). 한 요청 안에서 같은 화를 두 번
+        # 인덱싱하는 건 그래프에 이득이 없고 비용만 두 배다.
+        if previous_no is not None and episode.episode_no <= previous_no:
+            raise HTTPException(
+                status_code=400, detail="episodes must be sorted by ascending episodeNo"
+            )
+        previous_no = episode.episode_no
+
+    # 이미 인덱싱된 화는 일하지 않으므로 TPM도 쓰지 않는다 — 재제출뿐인 요청이 429로
+    # 거절당하면 "안전한 재제출"이라는 스펙의 전제가 깨진다.
+    indexed = _already_indexed([e.episode_no for e in req.episodes])
+    pending_texts = [e.text or "" for e in req.episodes if e.episode_no not in indexed]
+
+    now = time.monotonic()
+    remaining = _tpm_remaining(now)
+    estimated = _estimate_tokens(pending_texts)
+    if estimated > remaining:
+        logger.warning(
+            "TPM 부족으로 인덱싱 요청 거절 | userId=%s workId=%s 추정=%d 여유=%d",
+            req.user_id,
+            req.work_id,
+            estimated,
+            remaining,
+        )
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(_tpm_retry_after(now))},
+            content={
+                "detail": "TPM limit exceeded. Retry after the Retry-After period.",
+                "remainingTpm": remaining,
+            },
+        )
+    if estimated:
+        _tpm_window.append((now, estimated))
+
+    job_id = str(uuid.uuid4())
+    requested_at = _now_rfc3339()
+    _index_jobs[job_id] = {
+        "user_id": req.user_id,
+        "work_id": req.work_id,
+        "requested_at": requested_at,
+        "episodes": [
+            {
+                "episode_id": e.episode_id,
+                "episode_no": e.episode_no,
+                "text": e.text or "",
+                # 마커가 이미 있는 화는 큐에 들어가기 전부터 done이다.
+                "status": "done" if e.episode_no in indexed else "waiting",
+                "error": None,
+            }
+            for e in req.episodes
+        ],
+    }
+
+    # lorekeeper는 Chunk 단위로만 원문을 보관하므로, "원고 목록" 뷰어에서 보여줄 원문 전체는
+    # 우리 쪽에서 별도로 data/episode{N}.txt에 저장해 둔다.
+    for episode in req.episodes:
+        (DATA_DIR / f"episode{episode.episode_no}.txt").write_text(
+            episode.text or "", encoding="utf-8"
+        )
+
+    await _index_queue.put(job_id)
+    return IndexAccepted(
         job_id=job_id,
-        status=state["status"],
-        detail=state.get("detail"),
-        result=state.get("result"),
+        user_id=req.user_id,
+        work_id=req.work_id,
+        episode_ids=[e.episode_id for e in req.episodes],
+        requested_at=requested_at,
+        remaining_tpm=_tpm_remaining(now),
+    )
+
+
+class IndexEpisodeStatus(CamelModel):
+    episode_id: int
+    # waiting | running | done | error. 모든 화가 done 또는 error면 그 작업은 끝난 것이다
+    # (작업 단위 status 필드는 따로 두지 않는다 — 화별 상태에서 유도되는 값이라 두 곳에
+    # 같은 사실을 적어두면 어긋날 수 있다).
+    status: str
+    error: str | None = None
+
+
+class IndexJobStatus(CamelModel):
+    job_id: str
+    user_id: int
+    work_id: int
+    episodes: list[IndexEpisodeStatus]
+
+
+@app.get("/api/index/jobs/{job_id}", response_model=IndexJobStatus)
+def get_index_job(job_id: str) -> IndexJobStatus:
+    """작업 하나의 화별 진행 상태. 서버 프로세스 메모리에만 있으므로 재시작하면 사라지고,
+    진행 중이던 인덱싱도 함께 끊긴다 — 그래도 되는 건 이게 "작업 중 상태"일 뿐 진실이 아니기
+    때문이다. 무엇이 실제로 인덱싱됐는지의 정답은 Neo4j(완료 마커)이고, 작업 이력의 정답은
+    API 서버의 DB다.
+
+    모르는 jobId는 404다. 그래야 호출자가 "접수된 적 없음/재시작으로 유실됨"과 "아직 처리 중"을
+    구분할 수 있다(빈 상태를 200으로 주면 영원히 기다리게 된다). Spring은 404를 보면 같은
+    화들을 다시 POST하면 된다 — 끝난 화는 완료 마커 덕분에 다시 인덱싱되지 않는다.
+    """
+    job = _index_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"'{job_id}' 인덱싱 작업 기록이 없습니다.")
+    return IndexJobStatus(
+        job_id=job_id,
+        user_id=job["user_id"],
+        work_id=job["work_id"],
+        episodes=[
+            IndexEpisodeStatus(
+                episode_id=e["episode_id"], status=e["status"], error=e["error"]
+            )
+            for e in job["episodes"]
+        ],
     )
 
 
@@ -227,6 +526,13 @@ class DetectRequest(BaseModel):
     work_id: int
     episode_number: int
     text: str
+
+
+class JobAck(BaseModel):
+    # 인덱싱과 달리 여기서는 job_id를 Spring이 발급한다 — 검사 요청 하나가 회차 하나라
+    # 호출자가 부여한 id를 그대로 쓰는 편이 단순하다. 필드도 기존 snake_case 그대로다.
+    job_id: str
+    status: str
 
 
 @app.post("/api/detect", response_model=JobAck, status_code=202)
