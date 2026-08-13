@@ -211,16 +211,21 @@ def generate_report(
     return "\n".join(lines)
 
 
-def save_report_files(results: list[dict], label: str) -> dict:
+def save_report_files(results: list[dict], label: str, display_label: str | None = None) -> dict:
     """리포트를 reports/{label}_contradiction_report.{md,json}으로 저장한다.
 
-    JSON에는 label·생성 시각을 결과 배열과 함께 담는다 — 검증 히스토리 목록
-    (웹앱의 GET /api/reports)이 reports/ 디렉터리를 스캔할 때 이 메타데이터로 목록을
-    구성하므로, 순수 results 배열만 있던 예전 포맷보다 정보가 하나 더 필요하다.
+    이 파일들은 디버깅용 흔적일 뿐 더 이상 진실의 원천이 아니다 — 웹앱에서 넘어오는 검사
+    결과의 정답은 API 서버(Spring)가 PostgreSQL에 저장한 쪽이고, 여기 파일은 "그때 모델이
+    실제로 뭐라고 판정했는지"를 서버에 들어가서 눈으로 확인할 때만 쓴다. 그래서 파일 키(label)는
+    사람이 정한 이름이 아니라 작업 id(job_id)여야 한다: 그래야 Spring의 작업 기록과 파일이
+    1:1로 대응돼 "이 검사 결과의 원본"을 찾아갈 수 있다.
+
+    display_label은 md 리포트 제목에만 쓰는 사람용 이름이다. 파일명이 job_id면 제목까지
+    job_id가 되어 열어봐도 몇 화 검사였는지 알 수 없어서 분리했다.
     """
     REPORTS_DIR.mkdir(exist_ok=True)
     generated_at = datetime.now().isoformat(timespec="seconds")
-    report_md = generate_report(results, label, generated_at)
+    report_md = generate_report(results, display_label or label, generated_at)
     (REPORTS_DIR / f"{label}_contradiction_report.md").write_text(report_md, encoding="utf-8")
     payload = {"label": label, "generated_at": generated_at, "results": results}
     (REPORTS_DIR / f"{label}_contradiction_report.json").write_text(

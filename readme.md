@@ -17,11 +17,9 @@ agentic-workflow/
 ├─ src/                   # 우리 오케스트레이션 레이어 (지금은 최소 스캐폴딩만)
 │  ├─ config.py           # .env 로드 (NEO4J_*, OPENAI_API_KEY 등)
 │  └─ webapp.py           # FastAPI — 지금은 정적 페이지 서빙만, 백엔드 API 없음
-├─ static/                # 프론트 mock 페이지 (archive 이전 세션에서 디자인한 것 그대로 유지)
-│  ├─ upload.html         # 원고 접수
-│  ├─ library.html        # 원고 목록 + 뷰어
-│  ├─ report.html          # 정합성(모순) 리포트
-│  └─ chat.html           # Q&A 챗봇
+├─ static/                # 개발용 데모 페이지 (제품 화면 아님 — 제품 프론트는 API 서버 쪽이다)
+│  ├─ upload.html         # 원고 접수 (POST /api/index 로 직접 job_id를 발급해 호출)
+│  └─ library.html        # 원고 목록 + 뷰어
 ├─ data/                  # 원문(episode*.txt, 저작권상 미커밋) — lorekeeper.indexing()에 넣을 입력
 ├─ docker-compose.yml     # lorekeeper-poc와 동일한 Neo4j 5.26+APOC 설정 (인증정보 반드시 일치)
 ├─ requirements.txt
