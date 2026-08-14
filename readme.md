@@ -33,8 +33,7 @@ search-agent-workflow/
 ├─ data/                      # 원문(저작권상 미커밋)
 ├─ docker-compose.yml         # 로컬 Neo4j 2026.07 + PostgreSQL 17
 ├─ requirements.txt           # 운영 의존성
-├─ requirements-dev.txt       # + 테스트
-└─ archive/                   # 이전 세션의 자체 구현. 참고용 보존, 실행 대상 아님
+└─ requirements-dev.txt       # + 테스트
 ```
 
 ## 지식 그래프 계층
