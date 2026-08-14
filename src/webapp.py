@@ -15,13 +15,13 @@ from openai import RateLimitError
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
-from lorekeeper.client import get_driver
+from src.lorekeeper.client import get_driver
 
 # lorekeeper/__init__.py가 `indexing`이라는 이름을 함수(async def indexing(...))로 재노출해서
-# `from lorekeeper import indexing`은 함수를 가리킨다. DATABASE 상수는 서브모듈 경로로
+# `from src.lorekeeper import indexing`은 함수를 가리킨다. DATABASE 상수는 서브모듈 경로로
 # 직접 가져와야 한다(패키지 네임스페이스의 재바인딩을 건너뛴다).
-from lorekeeper.indexing import DATABASE as LOREKEEPER_DATABASE
-from lorekeeper.indexing import indexing as run_indexing
+from src.lorekeeper.indexing import DATABASE as LOREKEEPER_DATABASE
+from src.lorekeeper.indexing import indexing as run_indexing
 
 from src import config  # noqa: F401 — import 시점에 .env를 로드해 NEO4J_*/OPENAI_API_KEY를 환경변수로 채운다
 from src.chat import run_chat

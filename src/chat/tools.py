@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import psycopg
-from lorekeeper import build_retrieval_tools
+from src.lorekeeper import build_retrieval_tools
 from neo4j_graphrag.tool import Tool
 
 from src import config  # noqa: F401 — import 시점에 .env를 로드해 DATABASE_URL을 환경변수로 채운다

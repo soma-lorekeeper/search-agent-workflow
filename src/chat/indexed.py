@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import logging
 
-from lorekeeper.client import get_driver
-from lorekeeper.indexing import DATABASE as LOREKEEPER_DATABASE
+from src.lorekeeper.client import get_driver
+from src.lorekeeper.indexing import DATABASE as LOREKEEPER_DATABASE
 
 from src.chat.kg_scope import kg_scope
 

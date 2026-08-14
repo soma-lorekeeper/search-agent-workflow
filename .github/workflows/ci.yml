@@ -19,11 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # requirements.txt 의 `-e ./lorekeeper-poc/poc` 는 별도 퍼블릭 레포다.
-      # 이 레포에 커밋되지 않으므로(.gitignore) 설치 전에 클론해 온다.
-      - name: Clone lorekeeper-poc
-        run: git clone --depth 1 https://github.com/Gomdadi/lorekeeper-poc.git lorekeeper-poc
-
       # python-mecab-ko 의 aarch64 휠이 cp312 까지만 있어 프로덕션도 3.12 를 쓴다.
       # 러너와 프로덕션 버전을 맞춰야 "여기선 되는데 저기선 안 되는" 문제를 피한다.
       - uses: actions/setup-python@v5
