@@ -48,11 +48,6 @@ from src.service.index.splitters import KSSSentenceSplitter, WholeTextSplitter
 # LOREKEEPER_REASONING 환경변수로 덮어쓸 수 있다.
 _EXTRACT_REASONING = os.environ.get("LOREKEEPER_REASONING", "high")
 
-# 근거·벡터용 KSS 조각 크기(글자). 100자면 청크당 평균 약 3문장으로, 근거를 문장 단위로
-# 정밀하게 짚기에 적합하다.
-DEFAULT_KSS_CHUNK_SIZE = 100
-
-
 def _label_counts(driver, database: str, tenant: Tenant) -> dict[str, int]:
     """메타 라벨을 제외한 라벨별 노드 수(간단한 결과 출력용). 이 소설 범위만 센다."""
     records, _, _ = driver.execute_query(
@@ -89,7 +84,7 @@ async def indexing(tenant: Tenant, chapter: int, text: str) -> dict:
     반환: 라벨/관계 카운트·토큰·요약을 담은 dict.
 
     드라이버·DB·reasoning·청크 크기는 파라미터가 아니라 모듈 상수를 쓴다
-    (DATABASE / _EXTRACT_REASONING / DEFAULT_KSS_CHUNK_SIZE). 드라이버는 이 함수가 열고 닫는다.
+    (DATABASE / _EXTRACT_REASONING / splitters의 청크 기본값). 드라이버는 이 함수가 열고 닫는다.
     """
     database = DATABASE
     driver = get_driver()
@@ -112,11 +107,9 @@ async def indexing(tenant: Tenant, chapter: int, text: str) -> dict:
         )
 
         # 2. 근거·벡터용 KSS 청킹. raw.chunks는 (a)Chunk 레이어 생성과 (b)추출 마커 조립에
-        #    함께 쓰이므로 여기서 한 번만 쪼갠다. overlap=0: 겹침이 있으면 경계 문장이 인접
-        #    두 [C{i}] 마커에 중복 노출돼 LLM의 evidence_chunk 번호 선택이 모호해지므로 끈다.
-        raw = await KSSSentenceSplitter(
-            chunk_size=DEFAULT_KSS_CHUNK_SIZE, chunk_overlap=0
-        ).run(text)
+        #    함께 쓰이므로 여기서 한 번만 쪼갠다. 크기·겹침은 splitters의 기본값을 쓴다
+        #    (그 값을 그렇게 정한 이유도 거기 적혀 있다).
+        raw = await KSSSentenceSplitter().run(text)
 
         # 3. Chunk/Chapter provenance 레이어 생성(Chunk 노드·임베딩·NEXT_CHUNK + Chapter +
         #    IN_CHAPTER + 벡터 인덱스). 상세는 chunks.write_chunk_layer 참고.
