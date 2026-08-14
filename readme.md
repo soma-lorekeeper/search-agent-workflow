@@ -149,11 +149,16 @@ curl localhost:8000/api/health | python3 -m json.tool
 원고(`data/`)와 리포트(`reports/`)는 아티팩트에 담지 않는다. 서버의 `/opt/agent/state/`를
 심볼릭 링크로 연결해 재배포해도 유지된다.
 
-## 남은 작업 (다음 단계)
+## 남은 작업
 
-- `lorekeeper.indexing()`을 실제로 호출하는 인덱싱 진입점 (원고 접수 페이지와 연결)
-- `build_retrieval_tools()` 기반 LangGraph Q&A 에이전트 재구현 (archive의 `agent.py` 대체)
-- lorekeeper 스키마(`Character/Location/Event/CharacterState/Organization/Item`) 위에서
-  동작하는 설정 오류 탐지 파이프라인 재구현 (archive의 `contradiction_check.py` 대체,
-  `entity_state_history` 리트리버 활용 검토)
-- 프론트 4페이지를 mock에서 실제 API 연결로 전환
+- **Spring 계약 조율** — 탐지·채팅 요청에 `userId` 추가, 탐지는 camelCase 전환,
+  조회 경로가 `/api/detect/jobs/{jobId}`로 옮겨갔고 status 어휘가 대문자가 됐다.
+  `detection_findings` 스키마 마이그레이션도 배포 전에 적용돼야 한다
+  (`docs/detecting-api-spec.md` 5절).
+- **배포 스크립트** — 기동 진입점이 `src.webapp:app`에서 `src.app:app`으로 바뀌었다.
+  원격 배포 스크립트는 이 레포 밖(mvp-infra-iac)에 있어 함께 고쳐야 한다.
+- **하네스 재측정** — 검출 22/25는 Neo4j 5.26에서 잰 값이다. 2026.07은 검색 쿼리
+  경로가 달라(라이브러리가 SEARCH 절로 전환) 근거가 달라질 수 있다. 한 번 다시 돌려
+  수치를 확인하는 편이 좋다.
+- **인덱싱의 이벤트 루프 블로킹** — `indexing()`이 async인데 내부는 동기 드라이버라,
+  한 화 인덱싱(약 2분) 동안 서버 전체가 멈춘다. 예전부터 있던 문제다.
