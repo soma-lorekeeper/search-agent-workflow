@@ -21,3 +21,14 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# IDE
+.idea/
+
+# 클로드 로컬 설정 (개인 권한 설정 — 팀 공유 대상 아님)
+.claude/settings.local.json
+
+# 평가 하네스 아티팩트 — LLM 응답 캐시·리포트라 수백 MB. 재실행으로 재생성 가능
+data/eval_claims/
+data/eval_retrieval/
+scratchpad_uvicorn.log

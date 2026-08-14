@@ -16,7 +16,7 @@ from typing import Any
 
 from openai import AsyncOpenAI, RateLimitError
 
-from src.config import OPENAI_API_KEY, OPENAI_MODEL
+from src.config import OPENAI_API_KEY, OPENAI_MODEL, VERIFY_REASONING_EFFORT
 from src.contradiction.prompts import VERIFIER_SYSTEM_PROMPT, VERIFY_CACHE_KEY
 from src.contradiction.tools import TOOL_GUIDE, format_tool_result
 
@@ -107,6 +107,7 @@ async def verify_claim(
         offer_tools = tool_calls_used < MAX_TOOL_CALLS
         kwargs: dict[str, Any] = {
             "model": OPENAI_MODEL,
+            "reasoning_effort": VERIFY_REASONING_EFFORT,
             "messages": messages,
             "response_format": {"type": "json_object"},
             "prompt_cache_key": VERIFY_CACHE_KEY,

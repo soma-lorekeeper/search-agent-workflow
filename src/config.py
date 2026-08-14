@@ -12,6 +12,14 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-terra")
+
+# 추론 강도(reasoning_effort)를 추출용/검증용으로 분리해 둔다.
+# 쓰이는 곳이 둘인데 서로 독립이기 때문이다 — 추출(pipeline._extract_claims_from_chunk)은
+# 1단계 후보 선정 성능을, 검증(agent.verify_claim)은 2단계 judge 성능을 좌우한다.
+# 지금 값(high)은 확정이 아니라 보수적 출발점이다. 추출은 P2에서 Recall@B를 기준으로,
+# 검증은 P4에서 동결 후보 풀 위의 A/B로 각각 medium/high를 재확정한다.
+EXTRACT_REASONING_EFFORT = os.environ.get("EXTRACT_REASONING_EFFORT", "high")
+VERIFY_REASONING_EFFORT = os.environ.get("VERIFY_REASONING_EFFORT", "high")
 
 DATA_DIR = ROOT_DIR / "data"
