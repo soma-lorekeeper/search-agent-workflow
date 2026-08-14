@@ -123,8 +123,8 @@ Retry-After: 60
   "userId": 42,
   "workId": 7,
   "episodes": [
-    { "episodeId": 101, "status": "done", "error": null },
-    { "episodeId": 102, "status": "running", "error": null }
+    { "episodeId": 101, "status": "DONE", "error": null },
+    { "episodeId": 102, "status": "RUNNING", "error": null }
   ]
 }
 ```
@@ -133,19 +133,19 @@ Retry-After: 60
 
 | status | 의미 |
 |---|---|
-| `waiting` | 대기 중 (앞 화가 처리 중) |
-| `running` | 인덱싱 진행 중 (화당 약 2분) |
-| `done` | 완료 |
-| `error` | 실패. `error` 필드에 사유 |
+| `QUEUED` | 대기 중 (앞 화가 처리 중) |
+| `RUNNING` | 인덱싱 진행 중 (화당 약 2분) |
+| `DONE` | 완료 |
+| `ERROR` | 실패. `error` 필드에 사유 |
 
-- 모든 화가 `done` 또는 `error`가 되면 잡은 종료 상태다. 더 이상 변하지 않는다
-- **한 화가 실패하면 그 뒤의 화들은 처리하지 않고 `error`로 표기된다** (`error: "Skipped due to preceding episode (6) failure"`). 누적 컨텍스트 의존 때문이다. 실패 원인 해소 후 실패 화부터 재제출하면 된다
+- 모든 화가 `DONE` 또는 `ERROR`가 되면 잡은 종료 상태다. 더 이상 변하지 않는다
+- **한 화가 실패하면 그 뒤의 화들은 처리하지 않고 `ERROR`로 표기된다** (`error: "Skipped due to preceding episode (6) failure"`). 누적 컨텍스트 의존 때문이다. 실패 원인 해소 후 실패 화부터 재제출하면 된다
 
 ### Response `404 Not Found` — 상태 소실
 
 진행 상태는 파이썬 서버 메모리에만 있다. **서버가 재시작되면 상태가 사라지고, 진행 중이던 작업도 함께 중단된다.** 이것은 계약에 포함된 정상 시나리오다:
 
-**Spring 대응**: 404를 받으면 해당 화들을 **다시 POST로 제출**한다. 이미 인덱싱이 끝난 화는 서버가 감지해(5장) 작업 없이 즉시 `done` 처리되므로, 재제출은 항상 안전하다 — 중복 작업 없이 수렴한다.
+**Spring 대응**: 404를 받으면 해당 화들을 **다시 POST로 제출**한다. 이미 인덱싱이 끝난 화는 서버가 감지해(5장) 작업 없이 즉시 `DONE` 처리되므로, 재제출은 항상 안전하다 — 중복 작업 없이 수렴한다.
 
 결과적으로 Spring의 예외 대응은 하나로 통일된다: **429든 404든 재시작이든, 대응은 "POST 재제출"이다.**
 
@@ -155,7 +155,7 @@ Retry-After: 60
 
 재제출된 화에 대해 서버는 이 마커를 확인하고:
 
-- 마커 있음 → 작업 없이 즉시 `done`
+- 마커 있음 → 작업 없이 즉시 `DONE`
 - 마커 없음 → 처음부터 재실행 (중간에 죽었던 화의 부분 산출물 위에 재실행해도 결과가 수렴한다)
 
 Spring은 이 동작을 신뢰하고, 완료 여부가 불확실할 때 그냥 재제출하면 된다.
@@ -173,10 +173,10 @@ Spring은 이 동작을 신뢰하고, 완료 여부가 불확실할 때 그냥 �
 
 ```
 Spring → POST /api/index (6화, 7화)      → 201 { jobId: "abc" }
-Spring → GET /api/index/jobs/abc          → 6화 running, 7화 waiting
+Spring → GET /api/index/jobs/abc          → 6화 RUNNING, 7화 QUEUED
   (10초 간격 폴링, 화당 ~2분)
-Spring → GET /api/index/jobs/abc          → 6화 done, 7화 running
-Spring → GET /api/index/jobs/abc          → 6화 done, 7화 done   ← 종료
+Spring → GET /api/index/jobs/abc          → 6화 DONE, 7화 RUNNING
+Spring → GET /api/index/jobs/abc          → 6화 DONE, 7화 DONE   ← 종료
 ```
 
 ### 7.2 TPM 거절 → 재제출
@@ -192,10 +192,10 @@ Spring → POST /api/index (6화)            → 201 { jobId: "def" }
 
 ```
 Spring → POST /api/index (6화, 7화)      → 201 { jobId: "abc" }
-  (6화 done, 7화 running 중 파이썬 서버 재시작)
+  (6화 DONE, 7화 RUNNING 중 파이썬 서버 재시작)
 Spring → GET /api/index/jobs/abc          → 404
 Spring → POST /api/index (6화, 7화)      → 201 { jobId: "ghi" }
-Spring → GET /api/index/jobs/ghi          → 6화 done (즉시, 스킵됨), 7화 running
+Spring → GET /api/index/jobs/ghi          → 6화 DONE (즉시, 스킵됨), 7화 RUNNING
 ```
 
 ## 8. 미확정 사항 (TBD)

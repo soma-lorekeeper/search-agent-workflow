@@ -27,8 +27,9 @@ search-agent-workflow/
 ├─ scripts/eval_claims.py     # 탐지 파이프라인 평가 하네스. 프롬프트 문안의 원천이다
 ├─ tests/                     # LLM·DB를 실제로 부르지 않는다(전부 가짜로 대체)
 ├─ docs/
-│  ├─ api-spec.md             # Indexing API 스펙 (Spring 팀용)
-│  └─ detect-api-spec.md      # Detection API 스펙 (Spring 팀용)
+│  ├─ indexing-api-spec.md    # Indexing API 스펙 (Spring 팀용)
+│  ├─ detecting-api-spec.md   # Detecting API 스펙 (Spring 팀용)
+│  └─ claim-pipeline-eval-result.md  # 파이프라인 확정 근거(실측)
 ├─ data/                      # 원문(저작권상 미커밋)
 ├─ docker-compose.yml         # 로컬 Neo4j 2026.07 + PostgreSQL 17
 ├─ requirements.txt           # 운영 의존성

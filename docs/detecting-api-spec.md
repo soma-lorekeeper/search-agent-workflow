@@ -4,7 +4,7 @@
 |---|---|
 | 버전 | v1 (2026-08-15) |
 | 대상 독자 | Spring 서버 개발팀 |
-| 범위 | **설정 오류 탐지 API만.** 인덱싱 API는 `docs/api-spec.md` 참고 |
+| 범위 | **설정 오류 탐지 API만.** 인덱싱 API는 `docs/indexing-api-spec.md` 참고 |
 
 ## 1. 개요
 
