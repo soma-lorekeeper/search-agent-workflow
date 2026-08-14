@@ -13,7 +13,6 @@ import time
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "neo4j")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
 def _timed(fn):
@@ -47,18 +46,15 @@ def _check_neo4j():
 
 
 def _check_postgres():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL 이 설정되지 않았다")
+    # 접속은 repository의 팩토리를 그대로 쓴다 — 점검이 실제 경로와 다른 방식으로
+    # 붙으면 "점검은 통과하는데 조회는 실패하는" 상태를 못 잡는다.
+    from src.repository.postgres import client
 
-    import psycopg
-
-    with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT version()")
-            version = cur.fetchone()[0]
-    # 자격증명이 섞인 URL 을 그대로 노출하지 않는다. 호스트/DB 만 남긴다.
-    _, _, hostpart = DATABASE_URL.rpartition("@")
-    return {"server": version.split(",")[0], "target": hostpart or "unknown"}
+    with client.connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version()")
+        version = cur.fetchone()[0]
+    # 자격증명이 섞인 URL 을 그대로 노출하지 않는다.
+    return {"server": version.split(",")[0], "target": client.target()}
 
 
 def collect():

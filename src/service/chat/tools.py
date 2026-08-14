@@ -17,12 +17,11 @@ KG 3종은 lorekeeper의 retriever를 그대로 실행기로 쓰고(src/service/
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
-import psycopg
 from src.common.tenant import Tenant
+from src.repository.postgres import client as pg_client
 from src.repository.neo4j.retrieval import build_retrieval_tools
 from neo4j_graphrag.tool import Tool
 
@@ -135,15 +134,6 @@ def _kg_entity_search(
 # ---------- PostgreSQL 원고/작품 도구 ----------
 
 
-def _connect() -> psycopg.Connection:
-    """원고 DB 커넥션. 채팅 도구 호출은 드물고 짧아서 풀 없이 매번 새로 연다 — 대신
-    connect_timeout을 둬서 DB가 죽었을 때 대화 전체가 멈추지 않게 한다(health_service와 동일)."""
-    url = os.environ.get("DATABASE_URL", "")
-    if not url:
-        raise RuntimeError("DATABASE_URL이 설정되지 않아 원고 DB를 읽을 수 없다.")
-    return psycopg.connect(url, connect_timeout=5)
-
-
 def _episode_manuscript(user_id: int, work_id: int, episode_number: int) -> tuple[str, str]:
     """회차 원고를 원본 DB에서 읽는다.
 
@@ -156,7 +146,7 @@ def _episode_manuscript(user_id: int, work_id: int, episode_number: int) -> tupl
     KG는 버티고 이 조회만 뚫린다. 인자를 받아 두는 건 그때 SQL에 조건을 더하는 것이
     시그니처 변경 없이 되게 하려는 것이다.
     """
-    with _connect() as conn, conn.cursor() as cur:
+    with pg_client.connect() as conn, conn.cursor() as cur:
         cur.execute(
             "select episode_number, title, content from episodes "
             "where work_id=%s and episode_number=%s",
@@ -192,7 +182,7 @@ def _work_settings(user_id: int, work_id: int) -> tuple[str, str]:
     KG는 버티고 이 조회만 뚫린다. 인자를 받아 두는 건 그때 SQL에 조건을 더하는 것이
     시그니처 변경 없이 되게 하려는 것이다.
     """
-    with _connect() as conn, conn.cursor() as cur:
+    with pg_client.connect() as conn, conn.cursor() as cur:
         cur.execute("select title from works where id=%s", (work_id,))
         row = cur.fetchone()
 

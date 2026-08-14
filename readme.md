@@ -113,6 +113,14 @@ curl localhost:8000/api/health | python3 -m json.tool
 | PostgreSQL | `docker compose` 컨테이너 | RDS. 비밀번호는 RDS가 Secrets Manager에서 회전 |
 | OpenAI 키 | `.env` | SSM SecureString `/mono/openai_api_key` |
 
+**두 DB 모두 API 서버(`lorekeeper-backend`)와 공유한다.** PostgreSQL은 원고를 읽고
+탐지 결과를 그쪽 테이블에 쓰는 통로이고, Neo4j는 이쪽만 쓰지만 그쪽 헬스체크가 읽는다.
+접속 변수의 형식은 서로 다르니 주의한다 — Spring은 URL·계정·비밀번호를 세 변수로 나눠
+받고(`SPRING_DATASOURCE_*`), 여기는 자격증명까지 담은 DSN 하나(`DATABASE_URL`)로 받는다.
+
+로컬에서 두 레포의 compose를 동시에 올리면 Neo4j·PostgreSQL 포트가 겹친다. **한쪽만**
+띄우고 다른 쪽은 그것을 가리킨다.
+
 **프로덕션 자격증명은 이 레포에 없다.** 인스턴스가 자기 IAM 역할로 읽어간다.
 전체 그림은
 [deploy-local-and-prod.md](https://github.com/soma-lorekeeper/mvp-infra-iac/blob/main/deploy-local-and-prod.md).
