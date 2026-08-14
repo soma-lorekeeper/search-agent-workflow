@@ -7,10 +7,9 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from openai import RateLimitError
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
@@ -25,16 +24,12 @@ from src.lorekeeper.indexing import indexing as run_indexing
 
 from src import config  # noqa: F401 — import 시점에 .env를 로드해 NEO4J_*/OPENAI_API_KEY를 환경변수로 채운다
 from src.chat import run_chat
-from src.chat.kg_scope import KG_INDEXED_WORK_ID, kg_scope, require_indexed_work
-from src.config import DATA_DIR
+from src.chat.kg_scope import kg_scope, require_indexed_work
 from src.contradiction import save_report_files
 from src.contradiction.pipeline import check_new_episode_streaming
 from src.health import collect as collect_health
 
 logger = logging.getLogger("webapp")
-
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
-DATA_DIR.mkdir(exist_ok=True)
 
 # ---------- 인덱싱 작업 큐 ----------
 # 작업 id(jobId)는 이 서버가 UUID로 발급한다. 예전에는 Spring이 발급한 id로 일했지만,
@@ -213,7 +208,6 @@ app = FastAPI(lifespan=lifespan)
 # 작업형 API 둘은 작업 id 발급 주체가 서로 다르다: 인덱싱은 이 서버가 jobId를 발급하고
 # (요청 하나가 여러 화를 묶는 단위라서), 설정 오류 탐지는 여전히 Spring이 발급한 job_id로
 # 일한다. 필드 표기도 그래서 다르다 — 인덱싱만 스펙대로 camelCase이고 나머지는 snake_case다.
-# static/ 아래 페이지들은 그 위에 얹힌 개발용 데모지 제품 화면이 아니다.
 
 
 @app.get("/api/health")
@@ -227,16 +221,6 @@ def health() -> dict:
     내면 "에이전트가 죽음"과 "에이전트는 살아있고 DB 만 죽음"을 호출자가 구분하지 못한다.
     """
     return collect_health()
-
-
-@app.get("/")
-def upload_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "upload.html")
-
-
-@app.get("/library")
-def library_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "library.html")
 
 
 # ---------- 인덱싱 API ----------
@@ -349,22 +333,6 @@ def _now_rfc3339() -> str:
 
 
 # ---------- 원고 원문 파일 ----------
-# 파일 이름에 작품을 넣는다. 예전 이름(episode{N}.txt)은 화 번호만 써서, 작품이 달라도 같은
-# 파일을 가리켰다 — 뷰어가 다른 작품의 원고를 보여주거나 서로 덮어쓰는 사고가 난다.
-# 지금은 접수 관문이 작품 하나만 통과시키므로 실제로 섞일 일이 없지만, 이름이 작품을 구분하지
-# 못한다는 사실 자체가 그 관문을 지웠을 때 되살아나는 지뢰라서 지금 고쳐 둔다.
-
-
-def _episode_path(work_id: int, chapter: int) -> Path:
-    return DATA_DIR / f"work{work_id}_episode{chapter}.txt"
-
-
-def _write_episode_files(work_id: int, episodes: list[tuple[int, str]]) -> None:
-    """원고 전문을 화마다 한 파일씩 쓴다(동기 I/O — 호출자가 스레드로 뺀다)."""
-    for chapter, text in episodes:
-        _episode_path(work_id, chapter).write_text(text, encoding="utf-8")
-
-
 class IndexEpisode(CamelModel):
     # episodeId는 Spring의 식별자다 — 이 서버는 해석하지 않고 상태 조회에서 그대로 돌려주기만 한다.
     # episodeNo가 실제 인덱싱 단위(lorekeeper의 Chapter.number)다.
@@ -518,17 +486,6 @@ async def index_episodes(req: IndexRequest):
     # 뒤 요청이 그 틈에 끼어들어 먼저 큐에 들어갈 수 있고, 그러면 워터마크로 막으려던 역순
     # 실행이 그대로 일어난다. 큐에 상한이 없어 put_nowait은 절대 막히지 않는다(= await 불필요).
     _index_queue.put_nowait(job_id)
-
-    # lorekeeper는 Chunk 단위로만 원문을 보관하므로, "원고 목록" 뷰어에서 보여줄 원문 전체는
-    # 우리 쪽에서 별도로 파일에 저장해 둔다. 화 하나가 5만 자까지 가고 한 요청에 여러 화가
-    # 실리므로, 이벤트 루프에서 직접 쓰면 그동안 서버 전체가 멈춘다 — 스레드로 뺀다.
-    # 큐잉 뒤에 쓰는 건 순서 보장이 우선이기 때문이다. 워커는 이 파일을 읽지 않고 job에 실린
-    # 원고로 인덱싱하므로, 파일이 조금 늦게 생겨도 인덱싱에는 영향이 없다(뷰어만 잠깐 늦는다).
-    await asyncio.to_thread(
-        _write_episode_files,
-        req.work_id,
-        [(e.episode_no, e.text or "") for e in req.episodes],
-    )
 
     return IndexAccepted(
         job_id=job_id,
@@ -810,69 +767,3 @@ async def chat(req: ChatRequest) -> ChatResponse:
         context=req.context.model_dump(),
     )
     return ChatResponse(**result)
-
-
-# ---------- 원고 목록/뷰어 API ----------
-
-
-class EpisodeSummary(BaseModel):
-    chapter: int
-    summary: str
-    chars: int
-
-
-class EpisodeDetail(BaseModel):
-    chapter: int
-    summary: str
-    raw_text: str
-    chars: int
-
-
-def _episode_chars(chapter: int) -> int:
-    # 뷰어는 작품을 인자로 받지 않는다 — 그래프가 작품 하나뿐이라 여기서 보여줄 수 있는 원고도
-    # 그 작품(KG_INDEXED_WORK_ID)의 것뿐이다. 격리가 생기면 이 두 API도 workId를 받아야 한다.
-    path = _episode_path(KG_INDEXED_WORK_ID, chapter)
-    return len(path.read_text(encoding="utf-8")) if path.exists() else 0
-
-
-@app.get("/api/episodes", response_model=list[EpisodeSummary])
-def list_episodes() -> list[EpisodeSummary]:
-    driver = get_driver()
-    try:
-        records, _, _ = driver.execute_query(
-            "MATCH (c:Chapter) RETURN c.number AS chapter, c.summary AS summary ORDER BY c.number",
-            database_=LOREKEEPER_DATABASE,
-        )
-    finally:
-        driver.close()
-    return [
-        EpisodeSummary(
-            chapter=r["chapter"],
-            summary=r["summary"] or "",
-            chars=_episode_chars(r["chapter"]),
-        )
-        for r in records
-    ]
-
-
-@app.get("/api/episodes/{chapter}", response_model=EpisodeDetail)
-def get_episode(chapter: int) -> EpisodeDetail:
-    driver = get_driver()
-    try:
-        records, _, _ = driver.execute_query(
-            "MATCH (c:Chapter {number: $chapter}) RETURN c.summary AS summary",
-            {"chapter": chapter},
-            database_=LOREKEEPER_DATABASE,
-        )
-    finally:
-        driver.close()
-    if not records:
-        raise HTTPException(status_code=404, detail=f"{chapter}화는 아직 접수되지 않았습니다.")
-    path = _episode_path(KG_INDEXED_WORK_ID, chapter)
-    raw_text = path.read_text(encoding="utf-8") if path.exists() else ""
-    return EpisodeDetail(
-        chapter=chapter,
-        summary=records[0]["summary"] or "",
-        raw_text=raw_text,
-        chars=len(raw_text),
-    )

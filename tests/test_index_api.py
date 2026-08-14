@@ -53,20 +53,16 @@ def client(monkeypatch, tmp_path):
     _index_queue를 새로 만드는 건 asyncio.Queue가 처음 쓰인 이벤트 루프에 묶이기 때문이다 —
     TestClient는 인스턴스마다 새 루프를 만들어서, 모듈 전역 큐를 그대로 쓰면 두 번째
     테스트에서 "다른 루프에 묶인 큐" 오류가 난다.
-    DATA_DIR도 tmp_path로 돌린다(테스트가 실제 data/ 원고 파일을 덮어쓰지 않게).
     큐 오름차순 워터마크(_max_queued_episode_no)도 모듈 전역이라 매번 0으로 되돌린다.
     """
     webapp._index_jobs.clear()
     webapp._tpm_window.clear()
     monkeypatch.setattr(webapp, "_index_queue", asyncio.Queue())
-    monkeypatch.setattr(webapp, "DATA_DIR", tmp_path)
     monkeypatch.setattr(webapp, "_max_queued_episode_no", 0)
     monkeypatch.setattr(kg_scope, "KG_INDEXED_WORK_ID", WORK_ID)
-    monkeypatch.setattr(webapp, "KG_INDEXED_WORK_ID", WORK_ID)
     # 기본값은 "아직 인덱싱 안 됨" — 마커가 있는 경우는 해당 테스트에서 따로 뒤집는다.
     monkeypatch.setattr(webapp, "_already_indexed", lambda episode_nos: set())
     with TestClient(webapp.app) as c:
-        c.data_dir = tmp_path
         yield c
 
 
@@ -112,10 +108,6 @@ def test_submit_returns_201_contract(client, stub_indexing):
     assert body["episodeIds"] == [101, 102]
     assert body["remainingTpm"] < webapp.INDEX_TPM_LIMIT  # 추정치만큼 창에서 깎였다
     assert re.match(RFC3339_UTC, body["requestedAt"])
-    # 원문은 뷰어용으로 "작품+화 번호" 기준 파일에 저장된다. 화 번호만 쓰면 다른 작품의 같은
-    # 화가 서로를 덮어쓴다.
-    path = client.data_dir / f"work{WORK_ID}_episode6.txt"
-    assert path.read_text(encoding="utf-8") == "6화 원고"
 
 
 # ---------- 검증(400) ----------
@@ -167,9 +159,8 @@ def test_other_work_is_400(client, stub_indexing):
     assert res.status_code == 400
     detail = res.json()["detail"]
     assert str(OTHER_WORK_ID) in detail and str(WORK_ID) in detail
-    # 거절된 요청은 어디에도 남지 않는다 — 작업 기록도, 원고 파일도.
+    # 거절된 요청은 작업 기록에 남지 않는다.
     assert _index_job_count() == 0
-    assert not list(client.data_dir.iterdir())
     assert stub_indexing == []
 
 
@@ -284,9 +275,8 @@ def test_tpm_exhausted_returns_429_and_stores_nothing(client, stub_indexing, mon
     body = res.json()
     assert body["detail"] == "TPM limit exceeded. Retry after the Retry-After period."
     assert body["remainingTpm"] == 1000
-    # 거절된 요청은 어디에도 남지 않는다 — 작업 기록도, 원고 파일도.
+    # 거절된 요청은 작업 기록에 남지 않는다.
     assert _index_job_count() == 0
-    assert not list(client.data_dir.iterdir())
     assert stub_indexing == []
 
 
@@ -306,7 +296,6 @@ def test_bundle_larger_than_the_whole_limit_is_400_not_429(client, stub_indexing
     assert "never be accepted" in detail and "Split" in detail
     assert "Retry-After" not in res.headers
     assert _index_job_count() == 0
-    assert not list(client.data_dir.iterdir())
 
 
 def test_many_small_episodes_are_400_too(client, stub_indexing):
