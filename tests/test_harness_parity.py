@@ -92,3 +92,36 @@ def test_판정_system_전체가_하네스와_같다():
     assert judge_service.build_system(service_store) == eval_claims.build_judge_system(
         harness_store
     )
+
+
+def test_확정_구성값이_하네스와_같다():
+    """조각 크기·상한·top_k·임계값이 하네스가 잰 그 구성인지 본다.
+
+    이 다섯 숫자가 성능 수치(검출 22/25, 오탐 0)의 조건이다. 하나라도 다르면 서비스는
+    측정한 적 없는 구성으로 도는 것이고, 그 사실이 어디에도 드러나지 않는다.
+    """
+    from src.service.detect import judge_service, retrieve_service
+    from src.service.detect.extract_service import CHUNK_SIZE, _cap_for
+
+    # 하네스가 확정한 변형: line-3000 = (조각 3000자, 원고 미주입)
+    harness_chunk, harness_include_draft = eval_claims.VARIANTS["line-3000"]
+    assert CHUNK_SIZE == harness_chunk
+    assert harness_include_draft is False, "원고를 판정에 넣는 구성은 검출이 21→16으로 떨어졌다"
+
+    assert _cap_for(CHUNK_SIZE) == eval_claims.cap_for(harness_chunk)
+    assert retrieve_service.TOP_K == 3
+    assert judge_service.ERROR_THRESHOLD == 7
+
+
+def test_라우팅이_하네스와_같은_채널을_연다():
+    """어떤 질의를 어느 채널에 던지는지가 검색 도달률을 정한다."""
+    from src.service.detect.routing import route_qav
+
+    for claim in (
+        {"axis": "축", "value": "값", "quote": "인용"},
+        {"axis": "축", "value": "", "quote": "인용"},
+        {"axis": "", "value": "", "quote": "인용"},
+        {},
+    ):
+        assert route_qav(claim) == eval_claims.route_qav(claim), claim
+        assert route_qav(claim, with_quote=True) == eval_claims.route_qav(claim, with_quote=True)
