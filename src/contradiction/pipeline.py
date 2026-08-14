@@ -27,10 +27,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from src.lorekeeper.client import get_driver
-from src.lorekeeper.context import build_context, dump_graph_text, load_summaries
-from src.lorekeeper.indexing import DATABASE as LOREKEEPER_DATABASE
-from src.lorekeeper.splitters import KSSSentenceSplitter
+from src.repository.neo4j.client import get_driver
+from src.service.index.context_service import build_context, dump_graph_text, load_summaries
+from src.service.index.indexing_service import DATABASE as LOREKEEPER_DATABASE
+from src.service.index.splitters import KSSSentenceSplitter
 from openai import AsyncOpenAI
 
 from src.config import OPENAI_API_KEY, OPENAI_MODEL, ROOT_DIR

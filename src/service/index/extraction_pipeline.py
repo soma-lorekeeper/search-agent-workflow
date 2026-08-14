@@ -17,8 +17,6 @@ import os
 
 import neo4j
 
-from neo4j_graphrag.embeddings import OpenAIEmbeddings
-from neo4j_graphrag.experimental.components.embedder import TextChunkEmbedder
 from neo4j_graphrag.experimental.components.entity_relation_extractor import (
     OnError,
 )
@@ -30,14 +28,9 @@ from neo4j_graphrag.experimental.components.text_splitters.base import TextSplit
 from neo4j_graphrag.experimental.pipeline import Pipeline
 from neo4j_graphrag.llm import OpenAILLM
 
-from .extractor import KoreanWebNovelERTemplate, NovelContextExtractor
+from src.config import EMBEDDING_MODEL, EXTRACTION_MODEL
+from src.service.index.extractor import KoreanWebNovelERTemplate, NovelContextExtractor
 
-# 추출(스키마·그래프)에 쓸 OpenAI 모델. 기본값 gpt-5.6-luna. GPT-5 계열이므로 temperature/top_p 등
-# 샘플링 파라미터는 전달하지 않고 모델 기본값을 쓴다(비기본 temperature는 400으로 거부됨).
-# 필요 시 LOREKEEPER_MODEL 환경변수로 덮어쓸 수 있다.
-EXTRACTION_MODEL = os.environ.get("LOREKEEPER_MODEL") or "gpt-5.6-luna"
-# 청크 임베딩 모델. retrieval을 아직 안 쓰므로 저비용 모델로 통일.
-EMBEDDING_MODEL = "text-embedding-3-small"
 # 반복 전달되는 프리픽스(스키마+few-shot)의 프롬프트 캐시 라우팅 안정화용 키.
 PROMPT_CACHE_KEY = "lorekeeper-extract"
 
@@ -80,11 +73,6 @@ def build_llm(reasoning_effort: str | None = None) -> TokenCountingLLM:
         model_name=EXTRACTION_MODEL,
         model_params=params,
     )
-
-
-def build_embedder() -> TextChunkEmbedder:
-    """청크 임베딩 컴포넌트."""
-    return TextChunkEmbedder(embedder=OpenAIEmbeddings(model=EMBEDDING_MODEL))
 
 
 def build_pipeline(

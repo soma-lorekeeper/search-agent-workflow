@@ -393,7 +393,7 @@ async def collapse_merged_descriptions(driver: neo4j.Driver, database: str) -> N
     evidence_chunk에 앵커되지 않은 참고용 서술이라 원문 없이 서술만으로 합쳐도 된다. 다만 합치는
     과정에서 지어내지 않도록 프롬프트에 '입력에 있는 내용만·모순 병기' 제약을 건다.
     """
-    from .pipeline import build_llm  # 지연 import: 순환 방지 + collapse 시에만 필요
+    from src.service.index.extraction_pipeline import build_llm  # 지연 import: 순환 방지 + collapse 시에만 필요
 
     # description이 STRING이 아닌(= 배열로 combine된) 노드만 고른다.
     records, _, _ = driver.execute_query(

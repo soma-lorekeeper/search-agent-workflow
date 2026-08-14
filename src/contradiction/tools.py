@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.lorekeeper import build_retrieval_tools
+from src.repository.neo4j.retrieval import build_retrieval_tools
 from neo4j_graphrag.tool import Tool
 from neo4j_graphrag.types import RetrieverResult
 

@@ -42,13 +42,10 @@ from fastapi.responses import JSONResponse
 from openai import RateLimitError
 
 from src.dto.index_dto import IndexAccepted, IndexEpisodeStatus, IndexJobStatus, IndexRequest
-from src.lorekeeper.client import get_driver
+from src.repository.neo4j.client import get_driver
 
-# lorekeeper/__init__.py가 `indexing`이라는 이름을 함수(async def indexing(...))로 재노출해서
-# `from src.lorekeeper import indexing`은 함수를 가리킨다. DATABASE 상수는 서브모듈 경로로
-# 직접 가져와야 한다(패키지 네임스페이스의 재바인딩을 건너뛴다).
-from src.lorekeeper.indexing import DATABASE as LOREKEEPER_DATABASE
-from src.lorekeeper.indexing import indexing as run_indexing
+from src.service.index.indexing_service import DATABASE as LOREKEEPER_DATABASE
+from src.service.index.indexing_service import indexing as run_indexing
 from src.service.kg_scope import kg_scope, require_indexed_work
 
 logger = logging.getLogger("index")

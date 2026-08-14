@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import logging
 
-from src.lorekeeper.client import get_driver
-from src.lorekeeper.indexing import DATABASE as LOREKEEPER_DATABASE
+from src.repository.neo4j.client import get_driver
+from src.service.index.indexing_service import DATABASE as LOREKEEPER_DATABASE
 
 from src.service.kg_scope import kg_scope
 

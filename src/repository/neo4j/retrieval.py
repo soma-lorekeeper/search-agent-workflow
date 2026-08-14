@@ -46,17 +46,15 @@ from neo4j_graphrag.retrievers.base import Retriever
 from neo4j_graphrag.types import RawSearchResult, RetrieverResultItem
 
 # 패키지 내부 모듈 — 곧 lorekeeper 패키지로 묶이므로 상대 import로 작성한다.
-from .chunks import CHUNK_FULLTEXT_INDEX, CHUNK_VECTOR_INDEX
-from .client import get_driver
-from .facts import FACT_FULLTEXT_INDEX, FACT_VECTOR_INDEX
-from .pipeline import EMBEDDING_MODEL
+from src.repository.neo4j.chunk import CHUNK_FULLTEXT_INDEX, CHUNK_VECTOR_INDEX
+from src.repository.neo4j.client import DATABASE, get_driver
+from src.repository.neo4j.fact import FACT_FULLTEXT_INDEX, FACT_VECTOR_INDEX
+from src.config import EMBEDDING_MODEL
 
 # ---------------------------------------------------------------------------
 # 0) 내부 헬퍼 (드라이버·DB 이름·임베더)
 # ---------------------------------------------------------------------------
 
-# neo4j database 이름. indexing.py와 동일하게 NEO4J_DATABASE(기본 'neo4j')를 쓴다.
-DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
 
 # 모듈 레벨 lazy singleton 캐시. retriever/인덱스 헬퍼가 매번 새 드라이버를 만들지 않도록
 # 최초 호출 시 한 번만 만들어 재사용한다.
@@ -76,7 +74,7 @@ def _embedder() -> OpenAIEmbeddings:
     """
     질의 텍스트를 임베딩할 embedder(lazy singleton).
 
-    ⚠️ pipeline.build_embedder()는 청킹용 TextChunkEmbedder를 반환하므로 retriever에는
+    ⚠️ chunk.py의 TextChunkEmbedder는 청킹 전용이라 retriever에는
     쓸 수 없다(embed_query 인터페이스가 아님). retriever가 요구하는 embed_query를 가진
     OpenAIEmbeddings를 직접 만들어야 한다. 임베딩 모델은 인덱싱 때 Chunk를 임베딩한 모델과
     같아야(EMBEDDING_MODEL) 벡터 공간이 일치한다.

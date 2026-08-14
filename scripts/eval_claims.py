@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
-from src.lorekeeper.splitters import KSSSentenceSplitter
+from src.service.index.splitters import KSSSentenceSplitter
 from openai import AsyncOpenAI, RateLimitError
 
 from src.config import DATA_DIR, OPENAI_API_KEY
@@ -910,7 +910,7 @@ def entity_node_text() -> str:
     if _entity_node_cache is not None:
         return _entity_node_cache
 
-    from src.lorekeeper.client import get_driver
+    from src.repository.neo4j.client import get_driver
 
     driver = get_driver()
     with driver.session() as session:

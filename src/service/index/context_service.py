@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from .pipeline import build_llm
+from src.service.index.extraction_pipeline import build_llm
 
 # 그래프 덤프에서 제외할 라벨. 메타 라벨(writer 부여)과 lexical/provenance/요약 레이어
 # (Chunk/Chapter/Story), 검색용 보조 라벨(Fact — facts.ensure_fact_layer가 Event/

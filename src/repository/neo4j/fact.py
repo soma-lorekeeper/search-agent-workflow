@@ -22,8 +22,8 @@ from __future__ import annotations
 from neo4j_graphrag.embeddings import OpenAIEmbeddings
 from neo4j_graphrag.indexes import create_vector_index
 
-from .chunks import EMBEDDING_DIMENSIONS
-from .pipeline import EMBEDDING_MODEL
+from src.repository.neo4j.chunk import EMBEDDING_DIMENSIONS
+from src.config import EMBEDDING_MODEL
 
 # 사실 계층 보조 라벨과 인덱스 이름. retrieval.py가 이 상수들을 단일 출처로 import한다.
 FACT_LABEL = "Fact"

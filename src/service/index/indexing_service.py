@@ -27,25 +27,23 @@ from __future__ import annotations
 import asyncio
 import os
 
-from .chunks import write_chunk_layer
-from .client import get_driver
-from .context import (
+from src.repository.neo4j.chunk import write_chunk_layer
+from src.repository.neo4j.client import DATABASE, get_driver
+from src.service.index.context_service import (
     build_context,
     dump_graph_text,
     load_summaries,
     summarize_episode,
     update_global_summary,
 )
-from .evidence import link_evidence
-from .extraction_examples import EXTRACTION_FEW_SHOT
-from .facts import ensure_fact_layer
-from .pipeline import build_pipeline
-from .resolver import PerLabelResolver, collapse_merged_descriptions
-from .schema import NODE_TYPES, PATTERNS, RELATIONSHIP_TYPES
-from .splitters import KSSSentenceSplitter, WholeTextSplitter
+from src.repository.neo4j.evidence import link_evidence
+from src.service.index.extraction_examples import EXTRACTION_FEW_SHOT
+from src.repository.neo4j.fact import ensure_fact_layer
+from src.service.index.extraction_pipeline import build_pipeline
+from src.service.index.resolver import PerLabelResolver, collapse_merged_descriptions
+from src.service.index.graph_schema import NODE_TYPES, PATTERNS, RELATIONSHIP_TYPES
+from src.service.index.splitters import KSSSentenceSplitter, WholeTextSplitter
 
-# 단일 DB 이름(Community). NEO4J_DATABASE가 없으면 기본 'neo4j'.
-DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
 
 # 경로: 이 파일 기준 상대 경로로 입력 위치를 잡는다.
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
