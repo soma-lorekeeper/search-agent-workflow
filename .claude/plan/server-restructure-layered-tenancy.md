@@ -80,8 +80,12 @@ src/
 ## 2. KG 멀티테넌시
 
 - **키**: `tenant_id = f"{user_id}:{work_id}"` 단일 property. int 검증 후 조합이라 resolver의 raw WHERE 절(filter_query)에도 안전. `common/tenant.py`의 `Tenant.of(user_id, work_id)` → `.id` / `.params()` / `.filter_literal()`이 유일한 해소 지점.
-- **Neo4j를 latest(2026.x 달력 버저닝, community)로 업그레이드**(사용자 확정 — docker-compose `neo4j:5.26-community` → `neo4j:2026-community` 계열, 프로덕션 EC2 Neo4j도 동반 업그레이드 필요. 5.26 LTS→2026.x는 공식 지원 경로이고, 어차피 테넌시 전환 때 그래프를 비우므로 스토어 마이그레이션 부담 없음). **community는 2026.x에서도 표준 DB 1개만 지원** → 멀티 DB 분리는 불가, property 분리 확정. 라벨 방식은 동적 라벨 관리 부담 대비 이점 없음.
-- **2026.02부터 벡터 검색 인-인덱스 필터가 GA**(community 포함): `SEARCH n IN (VECTOR INDEX idx FOR $vec WHERE n.tenant_id = $t AND n.chapter < $max LIMIT k)` — 인덱스 스캔 단계에서 필터가 적용돼 **벡터 축의 오버샘플 보정과 리콜 손실이 사라진다**. 읽기 지점 설계에 반영(아래).
+- **Neo4j를 `neo4j:2026.07-community`로 업그레이드**(조사·실측 완료). community는 2026.x에서도 표준 DB 1개만 지원 → 멀티 DB 분리 불가, property 분리 확정.
+- **2026.02부터 벡터 인-인덱스 필터(SEARCH 절)가 GA이고 Community도 지원**. 게다가 **neo4j-graphrag 1.18.0이 서버가 2026.01+면 자동으로 SEARCH 절 쿼리로 전환**한다 — 우리가 라이브러리를 쓰는 한 벡터 축은 알아서 인-인덱스 필터를 탄다.
+- **★ 함정 두 개(둘 다 조용히 깨진다)**:
+  1. **Cypher 언어 버전.** SEARCH 절은 Cypher 25 전용이다. 2026.x 이미지는 *빈 볼륨*에 새로 뜨면 25가 기본이지만 *기존 볼륨을 살려 올리면* 그 DB가 Cypher 5를 유지한다 → `42I67: parsable in CYPHER 25, but run in CYPHER 5`. 게다가 라이브러리는 `CYPHER 25` 프리픽스를 붙이지 않아 **기존에 잘 돌던 검색까지 문법 에러로 죽는다.** compose에 `NEO4J_db_query_default__language: CYPHER_25`로 못박는다(반영 완료).
+  2. `db.index.vector.queryNodes`는 2026.04 deprecated(제거는 아님). 풀텍스트 프로시저는 deprecated 아님.
+- Cypher 25에서 깨지는 구문 중 우리 코드에 해당하는 것은 **없다**(실측: `SET n = r` 하나만 깨지고 우리는 안 씀. 구형 `CALL { WITH n ... }`도 그대로 동작).
 
 ### 쓰기 지점 (전수)
 
@@ -100,7 +104,7 @@ src/
 ### 읽기 지점 (전수)
 
 - retrieval.py hybrid/fact — **두 축을 다르게 필터**한다:
-  - **벡터 축**: 2026.02 GA된 인-인덱스 필터(`SEARCH ... WHERE n.tenant_id=$t AND chapter < $max LIMIT k`)를 쓴다. neo4j-graphrag는 아직 이 신문법을 안 쓰지만, 우리는 이미 `_EscapedHybridCypherRetriever.get_search_results`로 검색 경로를 감싸고 있으므로 그 자리에서 자체 Cypher로 대체 — 오버샘플 불필요, 리콜 손실 없음.
+  - **벡터 축**: retrieval_query의 `WHERE node.tenant_id = $tenant_id` 후필터 + `effective_search_ratio=4` 오버샘플. 라이브러리가 2026.x 서버에서 SEARCH 절로 자동 전환하므로 앵커 단계의 이득은 얹혀 받되, 우리 코드는 서버 버전에 의존하지 않는 형태로 둔다(5.26에서도 그대로 동작).
   - **풀텍스트 축**: Lucene **필드 한정 쿼리로 인-인덱스 필터**. 근거 — 풀텍스트 인덱스는 property마다 **별개 Lucene 필드**를 만들고 `<property>:<term>` 한정 검색이 공식 지원된다(Neo4j 문서 예: `queryNodes('MovieIndex', 'title:dream')`). 즉 tenant 토큰이 본문 토큰과 한 자루에 섞이지 않는다. 구현 3점 세트:
     1. 인덱스에 tenant 필드 포함: `CREATE FULLTEXT INDEX ... FOR (n:Chunk) ON EACH [n.text, n.tenant_ft]`
     2. **tenant 토큰은 analyzer-safe 형태 `u{user}w{work}`**(예: `u1w1`). cjk analyzer의 StandardTokenizer가 `"1:1"`은 `:`에서 쪼개 `["1","1"]`로 만들어 `12:34`와 `34:12`가 구분 불가가 된다. 영숫자 연속은 한 토큰으로 남고 CJKBigramFilter도 라틴을 건드리지 않는다. 인덱싱·쿼리 양쪽에 같은 analyzer가 걸리므로 형태만 맞으면 정확 매칭. Cypher/벡터용 `tenant_id`(`"{u}:{w}"`)와 별개 property `tenant_ft`로 저장(같은 값을 두 형태로 — 하나로 합치면 어느 한쪽이 깨진다).
@@ -295,3 +299,40 @@ lorekeeper-poc는 gitignore된 별도 clone이라 반입은 신규 add(히스토
 3. 커밋 5 후: 로컬 docker Neo4j(2026.x)에 테넌트 2개 인덱싱 → 교차 병합 0건, B의 검색에 A 노드 0건(integration 마크).
 4. 커밋 6 후: 하네스 초고 5편+클린 6화를 새 API로 검사 → 검출 GT 집합·클린 오탐 0 재현(확률적이라 완전 일치는 기대하지 않음), 폴백 3종 인위 발동 시 500이 아니라 정상 응답, `(episodeNo, chunkIndex)`로 Neo4j에서 청크 실조회.
 5. `PYTHONPATH=. .venv/bin/python scripts/eval_claims.py --stage score ...`로 하네스가 새 import 경로에서 여전히 도는지.
+
+---
+
+# 실행 기록 (2026-08-15 완료)
+
+계획과 달라진 점과 실행 중 확인한 사실을 남긴다.
+
+## 계획과 달라진 것
+
+| 계획 | 실제 | 이유 |
+|---|---|---|
+| 커밋 5a/5b 분리 | **한 커밋으로 합침** | `kg_scope` 시그니처가 쓰기·읽기의 경첩이라, 반쪽만 바꾸면 서버가 아예 안 뜬다 |
+| 벡터 축 SEARCH 절 직접 조립 | **후필터 + 오버샘플 유지** | neo4j-graphrag 1.18이 서버가 2026.01+면 **자동으로** SEARCH 절로 전환한다. 우리가 직접 조립하면 서버 버전에 코드가 묶인다 |
+| 커밋 7 문서·CI 별도 | 커밋 6에 포함 | 분량이 작고 같은 계약을 설명하는 것이라 나누는 이득이 없었다 |
+
+## 실측으로 확인한 것 (neo4j:2026.07.1-community, 임시 컨테이너)
+
+- 풀텍스트 필드 한정 쿼리 `+tenant_ft:u1w1 +(김독자)`가 cjk analyzer에서 **테넌트를 정확히 거른다** — 다른 테넌트 0건, 없는 테넌트 0건
+- `SEARCH n IN (VECTOR INDEX ... WHERE n.tenant_id='1:1' LIMIT 10)`가 **Community에서 동작한다**
+- `apoc.refactor.mergeNodes` 동작, 기본 언어가 `CYPHER 25`(빈 볼륨 + 환경변수 명시 시)
+
+## 실행 중 잡은 버그
+
+1. `retrieval.py`의 entity facts 쿼리가 `$tenant_id`를 참조하는데 파라미터를 안 넘김 — 정적 대조 스크립트로 발견
+2. `check_new_episode`가 인자를 밀어 넣어 `up_to_chapter`가 tenant 자리로 들어감
+3. `_FUTURE_NODES_CYPHER`가 전 테넌트를 스캔
+4. 판정기가 범위 밖 claim 번호를 지어내면 `claims[idx]`에서 IndexError로 **판정 전체가 죽음**
+5. **사실 별칭(F###)을 근거 청크로 펼치는 코드가 evidence 구조를 잘못 읽음** — 오류를 찾아낸 검사일수록 실패하는 모양이었다. 테스트가 잡았다
+6. 추출 시작 시 Neo4j 조회가 이벤트 루프를 막음
+
+## 남은 일 (사용자 확인 필요)
+
+- **로컬 Neo4j 업그레이드와 재인덱싱** — 기존 5.26 컨테이너에 인덱싱된 그래프가 있어 건드리지 않았다. compose는 2026.07.1로 바뀌어 있으므로, 볼륨을 비우고 다시 올린 뒤 재인덱싱해야 새 코드가 그 그래프를 찾는다.
+- **`detection_findings` 마이그레이션** — `docs/detect-api-spec.md` 5절의 SQL. 배포 전에 적용돼야 한다.
+- **Spring 계약 변경 조율** — detect·chat에 userId 추가, detect camelCase 전환, 조회 경로 `/api/detect/jobs/{jobId}`, status 대문자.
+- **배포 스크립트** — 기동 진입점이 `src.webapp:app`에서 `src.app:app`으로 바뀌었다. 원격 배포 스크립트가 이 레포 밖(S3/mvp-infra-iac)에 있어 함께 고쳐야 한다.
+- **인덱싱 경로의 이벤트 루프 블로킹**(이전부터 있던 문제) — `indexing()`이 async인데 내부는 동기 드라이버라, 한 화 인덱싱 2분 동안 서버 전체가 멈춘다.
