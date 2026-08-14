@@ -63,6 +63,7 @@ def _retrieve_one(claim: dict, tools: dict, up_to_chapter: int | None) -> dict:
     for tool_name, args in route_qav(claim):
         args = {**args, "top_k": TOP_K}
         items: list[dict] = []
+        failed = False
         try:
             result = tools[tool_name].execute(**args)
             fresh = [
@@ -86,10 +87,14 @@ def _retrieve_one(claim: dict, tools: dict, up_to_chapter: int | None) -> dict:
             content = "\n\n".join(f"[결과 {i}]\n{c}" for i, c in enumerate(kept, 1)) or (
                 "(모든 결과가 이 claim의 앞 채널과 중복이라 생략)"
             )
-        except Exception as exc:  # noqa: BLE001 — 실패도 "근거 없음"으로 기록하고 계속한다
+            failed = False
+        except Exception as exc:  # noqa: BLE001 — 한 채널의 실패로 검사 전체를 멈추지 않는다
             logger.warning("검색 실패 | tool=%s | %s", tool_name, exc)
             content = f"(도구 실행 오류: {exc})"
-        channels.append({"tool": tool_name, "args": args, "content": content, "items": items})
+            failed = True
+        channels.append(
+            {"tool": tool_name, "args": args, "content": content, "items": items, "failed": failed}
+        )
 
     return {"claim": claim, "channels": channels}
 
@@ -112,4 +117,19 @@ async def retrieve(
 
     # retriever가 동기 API(Neo4j 드라이버)라 이벤트 루프를 막지 않도록 스레드로 뺀다.
     records = await asyncio.to_thread(run)
+
+    # 채널 하나가 실패하는 건 흔하다(그 질의로 걸리는 게 없거나 일시적 오류) — 근거가
+    # 조금 얇아질 뿐이라 계속 간다. 그런데 **전부** 실패했다면 그건 근거가 없는 게 아니라
+    # 그래프에 닿지 못한 것이다. 그대로 두면 판정기가 빈 문서고를 보고 "대조할 설정이
+    # 없다"며 전부 낮은 점수를 매기고, 검사는 "오류 0건"으로 완료된다 — 작가는 검사가
+    # 돌지도 않았다는 걸 모른 채 초록불을 본다. 조용한 성공보다 시끄러운 실패가 낫다.
+    total = sum(len(r["channels"]) for r in records)
+    failed = sum(1 for r in records for c in r["channels"] if c["failed"])
+    if total and failed == total:
+        raise RuntimeError(
+            f"검색이 전부 실패했다({total}건) — 그래프에 닿지 못한 것으로 보고 검사를 중단한다."
+        )
+    if failed:
+        logger.warning("검색 채널 일부 실패 | %d/%d", failed, total)
+
     return {"records": records}

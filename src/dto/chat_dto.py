@@ -28,7 +28,7 @@ class ChatContext(BaseModel):
       - viewing_episode_number : 화면에 열어 둔 회차. 프론트만 알 수 있다.
     셋째인 "인덱싱된 회차"는 **일부러 요청에 없다.** 그건 Neo4j 그래프의 사실이고, 요청이
     들고 온 값은 인덱싱이 진행되는 동안 곧바로 낡는다. 에이전트가 매 턴 직접 조회한다
-    (src/chat/indexed.py).
+    (src/service/chat/indexed.py).
 
     셋 다 없어도 대화는 성립한다 — 편집기를 열지 않고 질문만 하는 경우가 있다.
     """

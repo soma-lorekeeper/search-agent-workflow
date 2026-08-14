@@ -5,6 +5,6 @@
 대화가 목적이라 응답 형식이 자유롭고, 원고를 절대 고치지 않는다(읽기 전용).
 """
 
-from src.chat.agent import run_chat
+from src.service.chat.agent import run_chat
 
 __all__ = ["run_chat"]

@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from src import app as app_module
 from src.controller import chat_controller
-from src.chat import agent as chat_agent
+from src.service.chat import agent as chat_agent
 
 # ---------- /api/chat 요청 계약 ----------
 # 이 API만 와이어 포맷이 snake_case다(인덱싱·검사는 camelCase).

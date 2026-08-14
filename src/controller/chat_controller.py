@@ -8,7 +8,7 @@
 
 from fastapi import APIRouter
 
-from src.chat import run_chat
+from src.service.chat import run_chat
 from src.dto.chat_dto import ChatRequest, ChatResponse
 
 router = APIRouter()

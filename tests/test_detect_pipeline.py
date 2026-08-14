@@ -16,6 +16,8 @@ import asyncio
 import json
 import re
 
+import pytest
+
 from src.common.tenant import Tenant
 from src.service.detect import (
     entity_nodes,
@@ -626,3 +628,57 @@ def test_judge_without_claims_calls_no_llm(monkeypatch):
 def test_retrieve_without_claims_touches_no_graph():
     """같은 이유로 검색도 건너뛴다 — 도구를 조립하는 것만으로 Neo4j 드라이버가 열린다."""
     assert asyncio.run(retrieve_service.retrieve([], TENANT, up_to_chapter=5)) == {"records": []}
+
+
+# ---------------------------------------------------------------------------
+# 9. 검색이 전부 실패하면 "오류 0건"이 아니라 실패다
+# ---------------------------------------------------------------------------
+
+
+class _BrokenTool:
+    """호출할 때마다 터지는 검색 도구(그래프에 못 닿는 상황을 흉내낸다)."""
+
+    def execute(self, **kwargs):
+        raise RuntimeError("Neo4j 연결 실패")
+
+
+def test_all_channels_failing_raises_instead_of_reporting_zero_errors(monkeypatch):
+    """모든 검색이 실패하면 검사를 실패로 끝낸다.
+
+    한 채널이 실패하는 건 흔하다 — 그 질의로 걸리는 게 없거나 일시적 오류라 근거가 조금
+    얇아질 뿐이다. 그런데 **전부** 실패했다면 근거가 없는 게 아니라 그래프에 못 닿은 것이다.
+
+    그대로 두면 판정기가 빈 문서고를 보고 "대조할 설정이 없다"며 전부 낮은 점수를 매기고,
+    검사는 status=DONE, 오류 0건으로 끝난다. 작가는 검사가 돌지도 않았다는 걸 모른 채
+    초록불을 본다 — 이 저장소가 예전에 한 번 겪은 "조용한 성공"이다.
+    """
+    monkeypatch.setattr(
+        retrieve_service,
+        "build_retrieval_tools",
+        lambda tenant: [
+            type("_T", (), {"get_name": lambda self: "hybrid_search", "execute": _BrokenTool.execute})(),
+            type("_T", (), {"get_name": lambda self: "fact_search", "execute": _BrokenTool.execute})(),
+        ],
+    )
+    claims = [{"id": "P1", "axis": "카엘의 검 상태", "value": "부러짐", "quote": "q", "lines": [1]}]
+
+    with pytest.raises(RuntimeError, match="검색이 전부 실패"):
+        asyncio.run(retrieve_service.retrieve(claims, TENANT, up_to_chapter=5))
+
+
+def test_partial_channel_failure_keeps_going():
+    """일부만 실패하면 계속 간다 — 근거가 얇아질 뿐 검사 자체는 성립한다."""
+    ok = _FakeTool([_FakeItem("근거 원문", _chunk_meta("e1", 3, 0, "근거 원문"))])
+    broken = _BrokenTool()
+    tools = {"hybrid_search": ok, "fact_search": broken}
+
+    record = _retrieve_one(
+        {"axis": "카엘의 검 상태", "value": "부러짐"}, tools, up_to_chapter=5
+    )
+    failed = [c for c in record["channels"] if c["failed"]]
+    alive = [c for c in record["channels"] if not c["failed"]]
+    assert failed and alive, "일부 실패 상황을 만들지 못했다"
+    # 살아남은 채널의 근거는 그대로 실린다.
+    assert any("근거 원문" in c["content"] for c in alive)
+    # 실패한 채널은 사유를 남긴다(빈 결과와 구분되게).
+    assert all("도구 실행 오류" in c["content"] for c in failed)

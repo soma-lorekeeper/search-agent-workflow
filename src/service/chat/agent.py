@@ -18,14 +18,14 @@ from typing import Any
 
 from openai import AsyncOpenAI, RateLimitError
 
-from src.chat.indexed import fetch_indexed_episodes
-from src.chat.prompts import (
+from src.service.chat.indexed import fetch_indexed_episodes
+from src.service.chat.prompts import (
     CHAT_CACHE_KEY,
     CHAT_SYSTEM_PROMPT,
     TITLE_CACHE_KEY,
     TITLE_SYSTEM_PROMPT,
 )
-from src.chat.tools import TOOL_GUIDE, build_chat_tools
+from src.service.chat.tools import TOOL_GUIDE, build_chat_tools
 from src.config import OPENAI_API_KEY, OPENAI_MODEL
 
 logger = logging.getLogger("chat.agent")
