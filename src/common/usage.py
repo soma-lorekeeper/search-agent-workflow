@@ -1,11 +1,11 @@
-"""OpenAI 응답의 토큰 사용량을 뽑아 합산하는 헬퍼.
+"""OpenAI 응답의 토큰 사용량을 모으고 합산한다.
 
-추출(pipeline)과 검증(agent) 두 곳이 LLM을 부르는데, agent를 pipeline이 import하므로
-공용 헬퍼를 둘 중 한쪽에 두면 순환 import가 된다. 그래서 별도 모듈로 뺐다.
+reasoning_tokens를 따로 잡는 게 이 모듈의 값어치다. 총 토큰만 보면 "출력은 줄었는데
+비용은 그대로"인 상황의 원인을 못 찾는다 — 실제로 추출 프롬프트를 바꿨을 때 출력이
+줄어든 만큼 추론이 늘어 비용이 그대로였던 적이 있다.
 
-**reasoning_tokens를 따로 잡는 게 핵심이다.** P2에서 추출 effort(medium/high)를,
-P4에서 검증 effort를 확정하는데, effort가 바꾸는 건 사실상 이 값이다 — 총 토큰만 보면
-"프롬프트가 길어서인지 추론을 많이 해서인지"를 구분할 수 없다.
+cached_tokens는 prompt_tokens에 **포함된** 값이다. 따로 더하면 이중 계산이 된다 —
+분리해 두는 건 캐시 적중분에 다른 단가를 매기기 위해서다.
 """
 
 from __future__ import annotations

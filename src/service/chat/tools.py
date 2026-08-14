@@ -1,4 +1,4 @@
-"""채팅 에이전트가 쓰는 도구 6종.
+"""채팅 에이전트가 쓰는 도구 5종.
 
 KG 3종은 lorekeeper의 retriever를 그대로 실행기로 쓰고(src/service/retrieval_tools.py와 같은
 방식으로 OpenAI function-calling 스키마만 우리가 직접 명시한다), 나머지 2종은 PostgreSQL의
@@ -137,7 +137,7 @@ def _kg_entity_search(
 
 def _connect() -> psycopg.Connection:
     """원고 DB 커넥션. 채팅 도구 호출은 드물고 짧아서 풀 없이 매번 새로 연다 — 대신
-    connect_timeout을 둬서 DB가 죽었을 때 대화 전체가 멈추지 않게 한다(src/health.py와 동일)."""
+    connect_timeout을 둬서 DB가 죽었을 때 대화 전체가 멈추지 않게 한다(health_service와 동일)."""
     url = os.environ.get("DATABASE_URL", "")
     if not url:
         raise RuntimeError("DATABASE_URL이 설정되지 않아 원고 DB를 읽을 수 없다.")
@@ -145,6 +145,17 @@ def _connect() -> psycopg.Connection:
 
 
 def _episode_manuscript(user_id: int, work_id: int, episode_number: int) -> tuple[str, str]:
+    """회차 원고를 원본 DB에서 읽는다.
+
+    user_id를 받지만 조회에는 쓰지 않는다. episodes·works는 Spring 소유 테이블이고
+    소유권 검사는 그쪽이 요청 전에 끝내기 때문이다.
+
+    다만 **KG는 (user, work)로 격리하는데 이쪽은 work만으로 읽는다** — 같은 요청 안에
+    격리 기준이 둘이다. workId가 지금은 전역 유니크지만 그건 Spring 구현의 사실이지
+    계약이 아니라서(common/tenant.py 참고), 그쪽이 workId를 사용자 스코프로 바꾸면
+    KG는 버티고 이 조회만 뚫린다. 인자를 받아 두는 건 그때 SQL에 조건을 더하는 것이
+    시그니처 변경 없이 되게 하려는 것이다.
+    """
     with _connect() as conn, conn.cursor() as cur:
         cur.execute(
             "select episode_number, title, content from episodes "
@@ -170,6 +181,17 @@ def _episode_manuscript(user_id: int, work_id: int, episode_number: int) -> tupl
 
 
 def _work_settings(user_id: int, work_id: int) -> tuple[str, str]:
+    """작품 기본 정보를 원본 DB에서 읽는다.
+
+    user_id를 받지만 조회에는 쓰지 않는다. episodes·works는 Spring 소유 테이블이고
+    소유권 검사는 그쪽이 요청 전에 끝내기 때문이다.
+
+    다만 **KG는 (user, work)로 격리하는데 이쪽은 work만으로 읽는다** — 같은 요청 안에
+    격리 기준이 둘이다. workId가 지금은 전역 유니크지만 그건 Spring 구현의 사실이지
+    계약이 아니라서(common/tenant.py 참고), 그쪽이 workId를 사용자 스코프로 바꾸면
+    KG는 버티고 이 조회만 뚫린다. 인자를 받아 두는 건 그때 SQL에 조건을 더하는 것이
+    시그니처 변경 없이 되게 하려는 것이다.
+    """
     with _connect() as conn, conn.cursor() as cur:
         cur.execute("select title from works where id=%s", (work_id,))
         row = cur.fetchone()
@@ -285,7 +307,7 @@ _TOOLS: tuple[ChatTool, ...] = (
 
 
 def build_chat_tools() -> tuple[list[dict[str, Any]], dict[str, ChatTool]]:
-    """채팅 도구 6종을 (OpenAI tools 스키마 리스트, 이름→ChatTool dict)로 반환한다."""
+    """채팅 도구 5종을 (OpenAI tools 스키마 리스트, 이름→ChatTool dict)로 반환한다."""
     schemas = [
         {
             "type": "function",

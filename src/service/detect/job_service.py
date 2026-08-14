@@ -29,6 +29,11 @@ logger = logging.getLogger("detect")
 # job_id -> {"status", "phase", "claim_count", "contradiction_count", "findings", "detail"}
 _detect_jobs: dict[str, dict] = {}
 
+# 진행 중인 검사 task. 이벤트 루프가 task를 약한 참조로만 들고 있어서, 여기 담아두지
+# 않으면 GC가 실행 도중에 가져갈 수 있다 — 그러면 그 job은 예외 한 줄 없이 QUEUED에
+# 영원히 머문다. 끝나면 콜백이 스스로 빼낸다.
+_running: set[asyncio.Task] = set()
+
 
 async def _run_detect(
     job_id: str, user_id: int, work_id: int, episode_number: int, text: str
@@ -88,9 +93,11 @@ async def submit(req: DetectRequest) -> JobAck:
         "findings": None,
         "detail": None,
     }
-    asyncio.create_task(
+    task = asyncio.create_task(
         _run_detect(req.job_id, req.user_id, req.work_id, req.episode_number, req.text)
     )
+    _running.add(task)
+    task.add_done_callback(_running.discard)
     return JobAck(job_id=req.job_id, status="QUEUED")
 
 

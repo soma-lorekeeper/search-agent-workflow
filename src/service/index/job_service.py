@@ -143,6 +143,10 @@ async def _run_index_job(job_id: str) -> None:
                 episode["episode_no"],
             )
             await _run_indexing_with_retry(tenant, episode["episode_no"], episode["text"])
+            # 원고를 놓아준다. 워커가 꺼내 쓰려고 상태에 담아 둔 것인데 다 썼고, 작업
+            # 기록은 재시작 전까지 지워지지 않는다 — 회차당 수만 자가 프로세스가 뜬 내내
+            # 남아 쌓인다. 조회 응답에는 애초에 나가지 않는 필드다.
+            episode["text"] = ""
             episode["status"] = "DONE"
         except Exception as exc:  # noqa: BLE001 — 실패 사유를 상태로 노출해야 호출자가 보여줄 수 있다
             logger.exception(
@@ -152,7 +156,8 @@ async def _run_index_job(job_id: str) -> None:
                 episode["episode_no"],
             )
             # 위와 같은 이유로 사유와 상태를 한 번에 쓴다(터진 읽기 방지).
-            episode.update({"error": str(exc), "status": "ERROR"})
+            # 실패한 화도 마찬가지다 — 뒤 화들은 어차피 건너뛰므로 다시 읽을 일이 없다.
+            episode.update({"error": str(exc), "status": "ERROR", "text": ""})
             failed_no = episode["episode_no"]
 
 

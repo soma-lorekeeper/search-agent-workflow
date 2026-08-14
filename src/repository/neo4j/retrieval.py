@@ -117,7 +117,19 @@ class _EscapedHybridCypherRetriever(HybridCypherRetriever):
       - 풀텍스트: Lucene 필드 한정 검색(`+tenant_ft:u42w7 +(검색어)`). 인덱스 안에서
         걸러지므로 top_k가 남의 소설로 채워지지 않는다.
       - 벡터: 벡터 인덱스에는 필드 개념이 없어 인덱스 단계에서 못 거른다. retrieval_query의
-        WHERE로 후필터하고, 그만큼 후보가 줄어드는 것을 effective_search_ratio로 벌충한다.
+        WHERE로 후필터한다.
+
+    **후필터는 라이브러리의 LIMIT보다 뒤에 온다.** 라이브러리가 만드는 쿼리는
+    `… UNION … WITH node, max(score) AS score ORDER BY score DESC LIMIT $top_k` 다음에
+    우리 retrieval_query를 이어 붙인다. 즉 테넌트 구분 없이 top_k개로 자른 **뒤에야**
+    우리 필터가 돈다 — 남의 소설 결과가 상위 점수를 차지하면 그대로 버려지고 최종
+    결과가 top_k보다 적어진다(0개가 될 수도 있다).
+
+    `effective_search_ratio`로는 이걸 못 고친다. 그건 벡터 인덱스의 후보 풀만 넓힐 뿐
+    그 뒤의 LIMIT을 바꾸지 않는다. 그래서 **top_k 자체를 부풀려 요청하고, 테넌트로 거른
+    뒤 원래 개수로 잘라낸다**(retrieval_query 끝의 `LIMIT $final_k`).
+
+    격리 자체는 어느 쪽이든 안전하다 — 새는 게 아니라 **재현율**이 걸린 문제다.
 
     **이스케이프와 필터의 순서가 중요하다.** `_LUCENE_SPECIAL`은 `+`, `(`, `)`, `:`를 전부
     이스케이프한다 — 필터 문법이 쓰는 문자 그대로다. 필터를 먼저 붙이고 이스케이프하면
@@ -135,11 +147,17 @@ class _EscapedHybridCypherRetriever(HybridCypherRetriever):
         if query_vector is None and query_text:
             # 임베딩은 이스케이프하지 않은 원문으로 계산한다.
             query_vector = self.embedder.embed_query(query_text)
-        # 후필터로 줄어드는 벡터 후보를 벌충한다. 테넌트가 늘수록 키워야 하는 값이라
-        # 상수로 박아두고, 필터 탈락률이 문제가 되면 설정으로 뺀다.
+
+        # 라이브러리의 LIMIT이 테넌트 필터보다 앞에 있으므로 top_k를 부풀려 요청한다.
+        # 요청한 개수는 retrieval_query가 $final_k로 다시 잘라낸다.
+        wanted = kwargs.pop("top_k", 5)
+        kwargs["top_k"] = wanted * _TENANT_OVERSAMPLE
+        # 벡터 인덱스의 후보 풀도 함께 넓힌다(HNSW가 더 넓게 탐색한다).
         kwargs.setdefault("effective_search_ratio", _TENANT_OVERSAMPLE)
+
         params = dict(kwargs.pop("query_params", None) or {})
         params.update(self._tenant.params())
+        params["final_k"] = wanted
         return super().get_search_results(
             query_text=self._tenant_scoped_query(query_text),
             query_vector=query_vector,
@@ -211,7 +229,9 @@ WITH node, score
 // 다시 만들면 그쪽 필터도 조용히 무효가 된다 — 어느 쪽이 깨져도 남의 소설이 새지 않게
 // 여기서 한 번 더 막는다.
 WHERE node.tenant_id = $tenant_id
-WITH node, score
+// 부풀려 요청한 후보를 원래 개수로 되돌린다(래퍼의 docstring 참고). 이 자리가 아니라
+// 그래프 확장 뒤에 자르면 버릴 행까지 확장하느라 쿼리가 몇 배로 무거워진다.
+WITH node, score ORDER BY score DESC LIMIT $final_k
 OPTIONAL MATCH (node)-[:IN_CHAPTER]->(ch:Chapter){_CHUNK_GRAPH if include_graph else ""}
 RETURN
   elementId(node) AS eid,
@@ -415,7 +435,8 @@ def _build_fact_query() -> str:
     """
     return f"""
 WITH node AS f, score
-WHERE f.tenant_id = $tenant_id   // 테넌트 후필터(방어선) — 청크 쿼리의 같은 자리 주석 참고
+WHERE f.tenant_id = $tenant_id   // 테넌트 후필터 — 청크 쿼리의 같은 자리 주석 참고
+WITH f, score ORDER BY score DESC LIMIT $final_k
 {_FACT_CHAPTER_EVIDENCE}
 WITH f, score,
      coalesce(f.chapter, min(est.chapter), min(ck.chapter)) AS chapter,

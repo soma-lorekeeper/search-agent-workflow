@@ -25,8 +25,16 @@ from src.service.index import job_service as index_job_service
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 인덱싱 워커는 프로세스당 하나만 돈다. 여러 개를 띄우면 회차 순차 처리 전제가 깨진다.
-    asyncio.create_task(index_job_service.worker())
-    yield
+    #
+    # 반환된 task를 반드시 붙들어야 한다. 이벤트 루프는 task를 약한 참조로만 들고 있어서,
+    # 지역 변수조차 없으면 GC가 실행 도중에 가져갈 수 있다. 그러면 큐가 영원히 처리되지
+    # 않는데 접수 API는 계속 201을 돌려주므로, 아무 예외 없이 인덱싱만 멈춘다.
+    worker = asyncio.create_task(index_job_service.worker())
+    try:
+        yield
+    finally:
+        # 종료 시 워커를 정리한다. 남겨두면 테스트가 앱을 여러 번 띄울 때 워커가 쌓인다.
+        worker.cancel()
 
 
 app = FastAPI(lifespan=lifespan)

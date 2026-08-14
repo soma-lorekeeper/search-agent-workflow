@@ -16,15 +16,12 @@
 이 모듈은 그 컴포넌트들을 순서대로 엮는 오케스트레이터다. '새 회차 우선' 지침으로 anchoring을
 막는다(extractor.py).
 
-실행(CLI):
-    cd poc && LOREKEEPER_CHAPTER=1 LOREKEEPER_INPUT=data/input_ch1.txt uv run python src/indexing.py
-프로그램적 호출:
-    await indexing(1, text)
+호출:
+    await indexing(tenant, chapter, text)
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
 
 from src.common.tenant import Tenant
@@ -46,9 +43,6 @@ from src.service.index.graph_schema import NODE_TYPES, PATTERNS, RELATIONSHIP_TY
 from src.repository.neo4j.tenant_bootstrap import ensure_tenant_indexes
 from src.service.index.splitters import KSSSentenceSplitter, WholeTextSplitter
 
-
-# 경로: 이 파일 기준 상대 경로로 입력 위치를 잡는다.
-_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 추출 LLM의 reasoning effort. 기본값 'high'(luna 기본 세팅).
 # LOREKEEPER_REASONING 환경변수로 덮어쓸 수 있다.
@@ -204,18 +198,3 @@ async def indexing(tenant: Tenant, chapter: int, text: str) -> dict:
         }
     finally:
         driver.close()
-
-
-if __name__ == "__main__":
-    # 얇은 CLI 래퍼: LOREKEEPER_CHAPTER로 회차, LOREKEEPER_INPUT으로 원고 파일을 받아 진입점 호출.
-    chapter_env = os.environ.get("LOREKEEPER_CHAPTER")
-    if not chapter_env:
-        raise SystemExit("LOREKEEPER_CHAPTER 환경변수로 회차 번호를 지정하세요(예: LOREKEEPER_CHAPTER=1).")
-    input_path = os.environ.get("LOREKEEPER_INPUT") or os.path.join(
-        _SRC_DIR, "..", "data", "input.txt"
-    )
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"입력 텍스트가 없습니다: {input_path}")
-    with open(input_path, encoding="utf-8") as f:
-        episode_text = f.read()
-    asyncio.run(indexing(int(chapter_env), episode_text))

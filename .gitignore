@@ -6,10 +6,6 @@
 !requirements.txt
 !requirements-dev.txt
 
-# 예전에 라이브러리로 쓰던 별도 레포의 클론. 코드는 src/ 로 들여왔으므로 더 이상 쓰지
-# 않지만, 작업 트리에 남아 있는 사본이 실수로 커밋되지 않도록 무시 목록에 둔다.
-lorekeeper-poc/
-
 # 가상환경
 .venv/
 

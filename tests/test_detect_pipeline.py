@@ -682,3 +682,55 @@ def test_partial_channel_failure_keeps_going():
     assert any("근거 원문" in c["content"] for c in alive)
     # 실패한 채널은 사유를 남긴다(빈 결과와 구분되게).
     assert all("도구 실행 오류" in c["content"] for c in failed)
+
+
+# ---------------------------------------------------------------------------
+# 10. 테넌트 후필터가 라이브러리 LIMIT보다 뒤에 온다는 사실에 대한 보정
+# ---------------------------------------------------------------------------
+
+
+def test_tenant_filter_requires_oversampled_top_k(monkeypatch):
+    """검색은 top_k를 부풀려 요청하고 final_k로 되돌린다.
+
+    라이브러리가 만드는 쿼리는 `… LIMIT $top_k` **다음에** 우리 retrieval_query를 이어
+    붙인다. 즉 테넌트 구분 없이 top_k개로 자른 뒤에야 우리 필터가 돈다 — 남의 소설
+    결과가 상위 점수를 차지하면 그대로 버려지고 내 결과가 top_k보다 적어진다.
+
+    `effective_search_ratio`로는 못 고친다(벡터 인덱스의 후보 풀만 넓힐 뿐 그 뒤의
+    LIMIT을 안 바꾼다). top_k 자체를 부풀려야 한다.
+
+    실패해도 예외가 아니라 "결과가 좀 적음"으로 나타나는 종류라, 이 테스트가 없으면
+    누가 부풀리기를 걷어내도 아무 신호가 없다.
+    """
+    from src.common.tenant import Tenant
+    import src.repository.neo4j.retrieval as retrieval
+
+    captured: dict = {}
+
+    def _fake_super(self, **kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(retrieval.HybridCypherRetriever, "get_search_results", _fake_super)
+
+    r = retrieval._EscapedHybridCypherRetriever.__new__(retrieval._EscapedHybridCypherRetriever)
+    r._tenant = Tenant.of(42, 7)
+    r.get_search_results(query_text="검색어", query_vector=[0.1], top_k=3)
+
+    assert captured["top_k"] == 3 * retrieval._TENANT_OVERSAMPLE, "부풀려 요청해야 한다"
+    assert captured["query_params"]["final_k"] == 3, "원래 개수로 되돌릴 값을 넘겨야 한다"
+    # 두 채널 모두 테넌트로 좁는다 — 풀텍스트는 인덱스 안에서, 벡터는 retrieval_query에서.
+    assert captured["query_params"]["tenant_id"] == "42:7"
+    assert captured["query_text"].startswith("+tenant_ft:u42w7 +(")
+
+
+def test_retrieval_queries_truncate_with_final_k():
+    """두 retrieval_query 모두 테넌트로 거른 뒤 $final_k로 잘라야 한다."""
+    import src.repository.neo4j.retrieval as retrieval
+
+    for build in (lambda: retrieval._build_chunk_query(False), retrieval._build_fact_query):
+        q = build()
+        assert "$tenant_id" in q
+        assert "LIMIT $final_k" in q
+        # 절단은 필터 **뒤**에 와야 한다 — 앞에 오면 자르고 나서 거르는 꼴이라 의미가 없다.
+        assert q.index("$tenant_id") < q.index("LIMIT $final_k")
