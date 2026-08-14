@@ -85,6 +85,21 @@ _index_queue: asyncio.Queue = asyncio.Queue()  # 접수된 job_id의 FIFO
 _max_queued_episode_no = 0
 
 
+def _active_episode_nos() -> set[int]:
+    """아직 끝나지 않은(waiting·running) 화 번호. 워터마크 판정에서 제외할 대상이다.
+
+    완료 마커는 인덱싱이 **끝나야** 찍히므로, 큐에 들어가 처리 중인 화는 마커가 없다.
+    그 상태에서 계약대로 재제출이 오면 마커로 걸러지지 않아 워터마크에 걸리고, 정상적인
+    재제출이 영구 실패가 된다. 마커와 이 집합을 함께 봐야 "이미 알고 있는 화"가 온전해진다.
+    """
+    return {
+        episode["episode_no"]
+        for job in _index_jobs.values()
+        for episode in job["episodes"]
+        if episode["status"] in ("waiting", "running")
+    }
+
+
 async def _index_worker() -> None:
     """서버가 떠 있는 동안 계속 도는 단일 워커. 큐에서 작업을 하나씩 꺼내 그 작업의 화들을
     순서대로 인덱싱한다. 동시에 여러 화를 처리하지 않는다(lorekeeper의 누적 컨텍스트가
@@ -421,11 +436,24 @@ async def index_episodes(req: IndexRequest):
     # 여기부터 큐에 넣기까지는 await가 없다 — 그래야 동시에 들어온 두 요청이 같은 워터마크를
     # 읽고 둘 다 통과하는 일이 없다(같은 화가 두 번 인덱싱되는 경로).
     global _max_queued_episode_no
-    if pending and pending[0].episode_no <= _max_queued_episode_no:
+
+    # 워터마크는 **처음 보는 화**에만 적용한다.
+    #
+    # 재제출은 이 API의 계약이다 — 429·404·타임아웃이면 호출자가 같은 묶음을 그대로 다시
+    # 보낸다. 그런데 완료 마커는 인덱싱이 **끝나야** 찍히므로, 큐에 들어갔지만 아직 처리 중인
+    # 화는 마커가 없다. 그 상태에서 재제출이 오면 위의 pending 에 그대로 남고, 자기가 올려둔
+    # 워터마크에 자기가 걸려 400을 받는다. 계약대로 재제출했을 뿐인데 영구 실패가 된다
+    # (실제로 이 경로로 이미 인덱싱이 끝난 회차가 화면에 "반영 실패"로 표시된 적이 있다).
+    #
+    # 그래서 지금 큐/처리 중인 화 번호도 마커와 똑같이 취급해 워터마크 판정에서 뺀다.
+    # 막으려던 것은 "이미 지나간 화를 뒤늦게 새로 넣는 것"이지 "같은 화를 다시 보내는 것"이
+    # 아니다.
+    fresh = [e for e in pending if e.episode_no not in _active_episode_nos()]
+    if fresh and fresh[0].episode_no <= _max_queued_episode_no:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"episodeNo {pending[0].episode_no} was already queued behind "
+                f"episodeNo {fresh[0].episode_no} was already queued behind "
                 f"{_max_queued_episode_no}; episodes must be submitted in ascending order "
                 f"across requests, not just within one"
             ),

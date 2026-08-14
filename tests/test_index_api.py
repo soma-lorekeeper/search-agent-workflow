@@ -461,3 +461,36 @@ def test_fully_indexed_resubmit_costs_no_tpm(client, stub_indexing, monkeypatch)
     body = _wait_until(client, res.json()["jobId"], _terminal)
     assert body["episodes"][0]["status"] == "done"
     assert stub_indexing == []
+
+
+def test_inflight_resubmit_is_not_blocked_by_watermark(client, monkeypatch):
+    """아직 처리 중인 화의 재제출은 워터마크에 걸리지 않는다.
+
+    완료 마커는 인덱싱이 끝나야 찍힌다. 그래서 큐에 들어가 처리 중인 화는 마커가 없고,
+    계약대로(타임아웃·404) 재제출하면 마커로 걸러지지 않는다. 이걸 워터마크가 막으면
+    정상 재제출이 영구 실패가 된다 — 실제로 이미 인덱싱이 끝난 회차가 화면에 "반영 실패"로
+    표시된 회귀가 있었다.
+    """
+    started = threading.Event()
+    release = threading.Event()
+
+    async def blocking_indexing(chapter: int, text: str) -> dict:
+        started.set()
+        await asyncio.to_thread(release.wait, 5)
+        return {"chapter": chapter}
+
+    monkeypatch.setattr(webapp, "run_indexing", blocking_indexing)
+    monkeypatch.setattr(webapp, "_already_indexed", lambda episode_nos: set())
+
+    episodes = [
+        {"episodeId": 102, "episodeNo": 2, "text": "2화"},
+        {"episodeId": 103, "episodeNo": 3, "text": "3화"},
+    ]
+    assert _submit(client, episodes).status_code == 201
+    assert started.wait(5), "워커가 첫 화를 시작하지 못했다"
+
+    # 마커는 아직 없고 2·3화는 waiting/running 이다. 여기서 같은 묶음을 다시 보낸다.
+    try:
+        assert _submit(client, episodes).status_code == 201
+    finally:
+        release.set()
