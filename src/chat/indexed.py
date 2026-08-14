@@ -30,25 +30,25 @@ logger = logging.getLogger("chat.indexed")
 # 한 번에 다 읽어도 부담이 없고, "몇 화부터 몇 화까지"가 아니라 "어떤 화들이" 있는지를
 # 알아야 중간에 빈 화(3, 4화만 인덱싱 실패)를 정확히 말해줄 수 있다.
 INDEXED_EPISODES_CYPHER = """
-MATCH (c:Chapter)-[:IN_STORY]->(s:Story)
+MATCH (c:Chapter {tenant_id: $tenant_id})-[:IN_STORY]->(s:Story {tenant_id: $tenant_id})
 RETURN c.number AS number
 ORDER BY c.number
 """
 
 
-def fetch_indexed_episodes(work_id: int) -> list[int]:
+def fetch_indexed_episodes(user_id: int, work_id: int) -> list[int]:
     """KG에 인덱싱이 끝난 화 번호를 오름차순으로 돌려준다.
 
     조회가 실패하면 빈 리스트다 — 그래프에 못 닿았는데 "전부 인덱싱돼 있다"고 가정하면
     모델이 없는 자료를 찾아 헤매다 지어낸 답을 내놓는다. 반대로 빈 리스트면 모델은
     "조회할 수 있는 회차가 없다"고 솔직히 말하게 되고, 그게 안전한 실패다.
     """
-    kg_scope(work_id)
+    tenant = kg_scope(user_id, work_id)
     try:
         driver = get_driver()
         try:
             records, _, _ = driver.execute_query(
-                INDEXED_EPISODES_CYPHER, {}, database_=LOREKEEPER_DATABASE
+                INDEXED_EPISODES_CYPHER, tenant.params(), database_=LOREKEEPER_DATABASE
             )
         finally:
             driver.close()

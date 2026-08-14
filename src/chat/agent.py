@@ -201,6 +201,7 @@ async def _suggest_title(user_text: str, answer: str) -> str | None:
 
 
 async def run_chat(
+    user_id: int,
     work_id: int,
     session_id: int,
     messages: list[dict],
@@ -224,7 +225,7 @@ async def run_chat(
 
     # 요청마다(프로세스마다가 아니라) 새로 읽는다. 인덱싱이 방금 끝난 회차를 "없다"고
     # 답하지 않으려면 캐시하면 안 된다. 드라이버 왕복 한 번이라 한 턴에 한 번은 감당된다.
-    indexed_episodes = await asyncio.to_thread(fetch_indexed_episodes, work_id)
+    indexed_episodes = await asyncio.to_thread(fetch_indexed_episodes, user_id, work_id)
 
     convo: list[dict] = [
         {"role": "system", "content": _system_prompt(context, indexed_episodes)},
@@ -286,8 +287,12 @@ async def run_chat(
 
             try:
                 args = json.loads(tool_call.function.arguments or "{}")
-                # work_id는 스키마에 없어 모델이 채우지 않는다 — 요청에서 받은 값을 여기서 주입한다.
-                result_text, summary = await asyncio.to_thread(tool.run, work_id, **args)
+                # user_id·work_id는 스키마에 없어 모델이 채우지 않는다 — 요청에서 받은
+                # 값을 여기서 주입한다. 모델이 남의 작품을 조회하도록 값을 지어낼 여지를
+                # 없애는 것이 이 설계의 요점이다.
+                result_text, summary = await asyncio.to_thread(
+                    tool.run, user_id, work_id, **args
+                )
                 tool_records.append({"name": name, "summary": summary, "status": "DONE"})
             except Exception as exc:  # noqa: BLE001 — 도구 실패는 "근거 부족"으로 두고 대화를 계속한다
                 logger.warning(

@@ -19,13 +19,9 @@ from fastapi.testclient import TestClient
 from src import app as app_module
 from src.controller import chat_controller
 from src.chat import agent as chat_agent
-from src.service import kg_scope
-
-# KG에 인덱싱돼 있다고 보는 작품. 실제 값은 환경변수라서 테스트에서 고정한다.
-WORK_ID = 1
-OTHER_WORK_ID = WORK_ID + 1
 
 # ---------- /api/chat 요청 계약 ----------
+# 이 API만 와이어 포맷이 snake_case다(인덱싱·검사는 camelCase).
 
 
 @pytest.fixture
@@ -38,39 +34,19 @@ def captured_chat(monkeypatch):
         return {"content": "답", "tool_calls": [], "suggested_title": None}
 
     monkeypatch.setattr(chat_controller, "run_chat", _stub)
-    monkeypatch.setattr(kg_scope, "KG_INDEXED_WORK_ID", WORK_ID)
     with TestClient(app_module.app) as client:
         yield client, captured
 
 
-def test_chat_다른_작품의_질문은_400이다(captured_chat):
-    """KG에 작품 격리가 없어서, 다른 작품으로 물으면 남의 작품 그래프로 답하게 된다.
-
-    답이 그럴듯해 보이는 게 특히 나쁘다 — 작가는 자기 작품 설정으로 알고 그걸 근거로 글을 쓴다.
-    """
-    client, captured = captured_chat
-
-    response = client.post(
-        "/api/chat",
-        json={
-            "work_id": OTHER_WORK_ID,
-            "session_id": 7,
-            "messages": [{"role": "user", "content": "주인공이 누구야?"}],
-        },
-    )
-
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert str(OTHER_WORK_ID) in detail and str(WORK_ID) in detail
-    assert captured == {}  # 에이전트를 부르지도 않는다(LLM 비용 0)
-
-
 def test_chat_받은_회차_컨텍스트를_그대로_에이전트에_넘긴다(captured_chat):
+    """user_id × work_id는 KG 테넌트라 반드시 함께 에이전트로 내려가야 한다 —
+    둘 중 하나만 가면 남의 작품 그래프를 읽는다."""
     client, captured = captured_chat
 
     response = client.post(
         "/api/chat",
         json={
+            "user_id": 42,
             "work_id": 1,
             "session_id": 7,
             "messages": [{"role": "user", "content": "이번 화 어때?"}],
@@ -82,6 +58,7 @@ def test_chat_받은_회차_컨텍스트를_그대로_에이전트에_넘긴다(
     )
 
     assert response.status_code == 200
+    assert captured["user_id"] == 42
     assert captured["work_id"] == 1
     assert captured["session_id"] == 7
     assert captured["context"] == {
@@ -96,7 +73,12 @@ def test_chat_컨텍스트가_없어도_받는다(captured_chat):
 
     response = client.post(
         "/api/chat",
-        json={"work_id": 1, "session_id": 7, "messages": [{"role": "user", "content": "안녕"}]},
+        json={
+            "user_id": 42,
+            "work_id": 1,
+            "session_id": 7,
+            "messages": [{"role": "user", "content": "안녕"}],
+        },
     )
 
     assert response.status_code == 200
@@ -110,6 +92,7 @@ def test_chat_집필_중인_회차의_화수는_없을_수_있다(captured_chat)
     response = client.post(
         "/api/chat",
         json={
+            "user_id": 42,
             "work_id": 1,
             "session_id": 7,
             "messages": [{"role": "user", "content": "안녕"}],
@@ -129,6 +112,7 @@ def test_chat_인덱싱된_회차는_요청으로_받지_않는다(captured_chat
     response = client.post(
         "/api/chat",
         json={
+            "user_id": 42,
             "work_id": 1,
             "session_id": 7,
             "messages": [{"role": "user", "content": "안녕"}],
@@ -183,7 +167,7 @@ def test_프롬프트_원고에_중괄호가_있어도_치환이_깨지지_않�
     )
 
     assert "그는 {tool_guide}라고 적었다." in prompt
-    assert "kg_vector_search" in prompt  # 진짜 도구 가이드는 제대로 채워졌다
+    assert "kg_hybrid_search" in prompt  # 진짜 도구 가이드는 제대로 채워졌다
 
 
 def test_프롬프트_인덱싱_안_된_회차는_조회_불가라고_못_박는다():
@@ -253,16 +237,17 @@ def stub_llm(monkeypatch):
 
 
 def test_run_chat_인덱싱된_회차를_요청이_아니라_그래프에서_읽는다(monkeypatch, stub_llm):
-    calls: list[int] = []
+    calls: list[tuple[int, int]] = []
 
-    def _fake_fetch(work_id: int) -> list[int]:
-        calls.append(work_id)
+    def _fake_fetch(user_id: int, work_id: int) -> list[int]:
+        calls.append((user_id, work_id))
         return [1, 2]
 
     monkeypatch.setattr(chat_agent, "fetch_indexed_episodes", _fake_fetch)
 
     result = asyncio.run(
         chat_agent.run_chat(
+            user_id=4,
             work_id=9,
             session_id=1,
             messages=[
@@ -278,8 +263,8 @@ def test_run_chat_인덱싱된_회차를_요청이_아니라_그래프에서_읽
     )
 
     assert result["content"] == "답변"
-    # 요청이 아니라 그래프에 물었고, 그 대상은 요청의 work_id다.
-    assert calls == [9]
+    # 요청이 아니라 그래프에 물었고, 그 대상은 요청의 테넌트(user_id × work_id)다.
+    assert calls == [(4, 9)]
 
     system_prompt = stub_llm[0][0]["content"]
     assert "1화, 2화" in system_prompt
@@ -289,10 +274,11 @@ def test_run_chat_인덱싱된_회차를_요청이_아니라_그래프에서_읽
 
 def test_run_chat_그래프_조회가_실패해도_대화는_계속된다(monkeypatch, stub_llm):
     """fetch가 빈 리스트를 돌려주는 상황(그래프 다운) — 죽지 않고 "조회 불가"로 답하게 만든다."""
-    monkeypatch.setattr(chat_agent, "fetch_indexed_episodes", lambda work_id: [])
+    monkeypatch.setattr(chat_agent, "fetch_indexed_episodes", lambda user_id, work_id: [])
 
     result = asyncio.run(
         chat_agent.run_chat(
+            user_id=42,
             work_id=1,
             session_id=1,
             messages=[

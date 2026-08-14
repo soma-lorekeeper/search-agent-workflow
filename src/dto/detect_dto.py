@@ -1,27 +1,30 @@
-"""설정 오류 탐지 API의 요청·응답 모델.
+"""설정 오류 탐지 API의 요청·응답 모델. 와이어 포맷은 camelCase다.
 
-지금은 기존 계약 그대로 snake_case다. 엔진을 새 파이프라인으로 교체하면서
-camelCase로 전환하고 userId를 받게 된다(그때 Spring 배포와 함께 움직인다).
+status는 DB(detection_jobs.status)와 같은 대문자 어휘를 쓴다 — 이 서비스가 그 테이블에
+직접 쓰기 때문에, 대문자와 소문자 두 표현이 한 시스템에 공존할 이유가 없다.
 """
 
-from pydantic import BaseModel
+from src.dto.common import CamelModel
 
 
-class DetectRequest(BaseModel):
+class DetectRequest(CamelModel):
+    # userId × workId가 KG 테넌트(소설 한 편)를 가리킨다. 인덱싱과 같은 키여야
+    # 인덱싱한 그래프를 검사가 찾을 수 있다.
     job_id: str
+    user_id: int
     work_id: int
     episode_number: int
     text: str
 
 
-class JobAck(BaseModel):
+class JobAck(CamelModel):
     # 인덱싱과 달리 여기서는 job_id를 Spring이 발급한다 — 검사 요청 하나가 회차 하나라
     # 호출자가 부여한 id를 그대로 쓰는 편이 단순하다.
     job_id: str
     status: str
 
 
-class DetectClaimProgress(BaseModel):
+class DetectClaimProgress(CamelModel):
     """검사 중인 claim 하나의 진행 상황. 프론트가 검사가 끝나기 전에 목록을 그리기 위한 것이다.
 
     claim 추출이 끝나는 순간 전부 status="running"으로 한꺼번에 나타나고, 검증이 끝난 것부터
@@ -32,7 +35,7 @@ class DetectClaimProgress(BaseModel):
     index: int  # 0부터. 검사가 끝날 때까지 이 claim의 고정 식별자다.
     quote: str  # 신규 회차 원문에서 뽑은 서술 그대로
     category: str  # 생사/소유물/능력/관계/소속/시점 등. 추출기가 정하고 미지정이면 "기타"
-    status: str  # "running" | "done"
+    status: str  # "RUNNING" | "DONE"
     # 아래 넷은 status="done"이 되기 전까지 전부 null이다(판정 전에는 알 수 없는 값이라서).
     label: str | None = None  # "contradiction" | "consistent" | "unknown"
     established_fact: str | None = None
@@ -42,7 +45,7 @@ class DetectClaimProgress(BaseModel):
     explanation: str | None = None
 
 
-class DetectStatus(BaseModel):
+class DetectStatus(CamelModel):
     job_id: str
     status: str
     detail: str | None = None

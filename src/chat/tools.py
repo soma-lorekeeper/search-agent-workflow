@@ -6,7 +6,10 @@ KG 4종은 lorekeeper의 retriever를 그대로 실행기로 쓰고(src/contradi
 답할 수 없으므로, 원고 조회는 그래프가 아니라 원본 DB에서 가져와야 한다.
 
 contradiction 쪽 도구와 두 가지가 다르다.
-  1. 모든 도구가 work_id를 첫 인자로 받는다 — 작품 격리 전제를 인터페이스에 박아둔다(kg_scope 참고).
+  1. 모든 도구가 (user_id, work_id)를 앞 두 인자로 받는다 — KG 도구는 그 둘로 테넌트를
+     해소해 그래프를 좁히고, PostgreSQL 도구는 work_id로 조회한다(그쪽 테이블의 소유권
+     검사는 Spring이 요청 전에 끝낸다). 인자 모양을 통일해 두면 에이전트의 주입 코드가
+     도구마다 갈라지지 않는다.
   2. 실행 결과와 함께 "화면에 보여줄 한 줄 요약"을 돌려준다 — 채팅 UI가 답변 위에
      "무엇을 찾아봤는지"를 표시해야 작가가 근거의 출처를 납득할 수 있다.
 """
@@ -19,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import psycopg
+from src.common.tenant import Tenant
 from src.repository.neo4j.retrieval import build_retrieval_tools
 from neo4j_graphrag.tool import Tool
 
@@ -39,29 +43,26 @@ _SUMMARY_QUERY_CHARS = 24
 # 채팅 에이전트의 시스템 프롬프트에 그대로 삽입되는 도구 가이드. 도구 자체의 description과
 # 별개로, "작가와의 대화"라는 용도에서 어떤 질문에 어떤 도구를 먼저 골라야 하는지를 적는다.
 TOOL_GUIDE = """\
-1. kg_vector_search(query_text, top_k=5)
-   - 무엇: 질문과 의미가 가까운 원문 조각을 벡터 검색으로 찾고, 근거가 된 사건·상태와 주변
-     그래프까지 함께 반환한다.
-   - 언제: "이런 일이 있었나?", "이 인물은 어떤 상황이었지?"처럼 고유명사가 흐릿한 일반 질문.
-     무엇부터 부를지 애매하면 이걸 먼저 부른다.
+1. kg_hybrid_search(query_text, top_k=5)
+   - 무엇: 질문과 의미가 가까운 원문 조각을 벡터+키워드로 찾고, 근거가 된 사건·상태와
+     주변 그래프까지 함께 반환한다.
+   - 언제: "이런 일이 있었나?", "이 인물은 어떤 상황이었지?" 같은 일반 질문. 무엇부터
+     부를지 애매하면 이걸 먼저 부른다. 고유명사가 또렷하면 질의에 반드시 넣어라.
 
-2. kg_hybrid_search(query_text, top_k=5)
-   - 무엇: 벡터 검색에 풀텍스트(키워드) 검색을 더한다.
-   - 언제: 질문에 인물명·아이템명·장소명이 또렷하게 들어 있을 때. kg_vector_search 결과가
-     빈약했을 때의 재시도용으로도 좋다(같은 질의를 그대로 반복하지 말고 고유명사를 넣어라).
+2. kg_fact_search(query_text, top_k=5)
+   - 무엇: 원문이 아니라 **정제된 사실**(사건·인물 상태)을 검색한다. 각 사실에는 참가자와
+     근거 원문이 함께 딸려온다.
+   - 언제: "누가 무엇을 했나", "그때 상태가 어땠나"처럼 사건·상태 자체가 답인 질문.
+     원문 조각보다 신호가 정제돼 있어 설정 확인에 유리하다.
 
-3. kg_entity_state_history(entity_name, up_to_chapter=null)
-   - 무엇: 인물 한 명의 상태(신분·소속·능력·부상·생사·소유·역할) 변화를 성립 회차 순으로 전부
-     조회한다. 자연어 문장이 아니라 "인물 이름" 하나만 받는다.
-   - 언제: "이 인물 지금 어떤 상태지?", "언제 이렇게 됐지?", "설정 정리해줘"처럼 인물 중심
-     질문. 검색이 아니라 정형 조회라 가장 정확하고 빠르다 — 인물이 특정되면 이걸 먼저 부른다.
+3. kg_entity_search(entity_name, up_to_chapter=null)
+   - 무엇: 인물·아이템·조직·장소 하나를 이름/별칭으로 정확 조회해 프로필과 관련 사실을
+     성립 회차 순으로 낸다. 자연어 문장이 아니라 "이름" 하나만 받는다.
+   - 언제: "이 인물 지금 어떤 상태지?", "언제 이렇게 됐지?", "설정 정리해줘"처럼 대상이
+     특정된 질문. 검색이 아니라 정형 조회라 가장 정확하고, 닫힌 집합을 돌려주므로
+     "그 목록에 없다"는 부재 증명도 된다.
 
-4. kg_text2cypher(query_text)
-   - 무엇: 자연어 질문을 Cypher로 번역해 그래프에서 직접 답을 계산한다.
-   - 언제: "몇 명이야?", "OO 소속 인물 전부", "5화 이후 사건 목록"처럼 집계·정렬·조건이 필요한
-     질문. 넷 중 가장 불안정하니 다른 도구로 풀리면 그걸 쓴다.
-
-5. episode_manuscript(episode_number)
+4. episode_manuscript(episode_number)
    - 무엇: 해당 회차의 제목과 원고 본문(앞부분)을 원본 DB에서 그대로 가져온다.
    - 언제: "16화에서 그 장면 어떻게 썼더라?", "직전 화 마지막이 어땠지?"처럼 요약이 아니라
      실제 문장이 필요할 때. KG는 사실만 갖고 있어 원문 표현·문체는 여기서만 확인된다.
@@ -69,7 +70,7 @@ TOOL_GUIDE = """\
    - 주의: **집필 중인 회차에는 쓰지 마라.** 그 회차의 원고 전문은 [회차 컨텍스트]에 이미
      들어 있고, 이 도구는 앞부분만 잘라서 준다.
 
-6. work_settings()
+5. work_settings()
    - 무엇: 작품의 기본 정보(제목)를 가져온다.
    - 언제: 작품 자체를 확인해야 할 때. 세계관 설정 문서는 아직 저장되는 곳이 없으니, 세계관을
      물으면 이 도구가 아니라 KG 검색으로 답해야 한다.
@@ -81,14 +82,22 @@ TOOL_GUIDE = """\
 # build_retrieval_tools()는 Neo4j 드라이버·임베더·text2cypher용 스키마 조회까지 준비해서
 # 수백 ms가 든다. 채팅은 요청마다 도구 목록이 필요하므로 프로세스당 한 번만 만들어 재사용한다
 # (lorekeeper 내부도 드라이버·임베더를 모듈 싱글턴으로 캐시하므로 중복 생성이 없다).
-_LOREKEEPER_TOOLS: dict[str, Tool] | None = None
+# 테넌트 id → (도구 이름 → Tool). retriever가 테넌트를 생성 시점에 굳혀 들고 있어
+# 캐시도 테넌트별이어야 한다.
+_LOREKEEPER_TOOLS: dict[str, dict[str, Tool]] = {}
 
 
-def _lorekeeper_tool(name: str) -> Tool:
-    global _LOREKEEPER_TOOLS
-    if _LOREKEEPER_TOOLS is None:
-        _LOREKEEPER_TOOLS = {tool.get_name(): tool for tool in build_retrieval_tools()}
-    return _LOREKEEPER_TOOLS[name]
+def _lorekeeper_tool(tenant: Tenant, name: str) -> Tool:
+    """테넌트별 retriever 묶음을 만들어 캐시한다.
+
+    retriever는 테넌트를 생성 시점에 굳혀 들고 있으므로(검색 쿼리에 그 값이 박힌다)
+    프로세스 하나가 여러 소설을 다루려면 캐시도 테넌트별이어야 한다.
+    """
+    tools = _LOREKEEPER_TOOLS.get(tenant.id)
+    if tools is None:
+        tools = {tool.get_name(): tool for tool in build_retrieval_tools(tenant)}
+        _LOREKEEPER_TOOLS[tenant.id] = tools
+    return tools[name]
 
 
 def _short(text: str) -> str:
@@ -96,33 +105,31 @@ def _short(text: str) -> str:
     return text if len(text) <= _SUMMARY_QUERY_CHARS else text[:_SUMMARY_QUERY_CHARS] + "…"
 
 
-def _kg_vector_search(work_id: int, query_text: str, top_k: int = 5) -> tuple[str, str]:
-    kg_scope(work_id)
-    result = _lorekeeper_tool("vector_cypher_search").execute(query_text=query_text, top_k=top_k)
+def _kg_hybrid_search(
+    user_id: int, work_id: int, query_text: str, top_k: int = 5
+) -> tuple[str, str]:
+    tenant = kg_scope(user_id, work_id)
+    result = _lorekeeper_tool(tenant, "hybrid_search").execute(query_text=query_text, top_k=top_k)
     return format_tool_result(result), f"KG 검색 · «{_short(query_text)}»"
 
 
-def _kg_hybrid_search(work_id: int, query_text: str, top_k: int = 5) -> tuple[str, str]:
-    kg_scope(work_id)
-    result = _lorekeeper_tool("hybrid_search").execute(query_text=query_text, top_k=top_k)
-    return format_tool_result(result), f"KG 키워드 검색 · «{_short(query_text)}»"
-
-
-def _kg_entity_state_history(
-    work_id: int, entity_name: str, up_to_chapter: int | None = None
+def _kg_fact_search(
+    user_id: int, work_id: int, query_text: str, top_k: int = 5
 ) -> tuple[str, str]:
-    kg_scope(work_id)
-    result = _lorekeeper_tool("entity_state_history").execute(
+    tenant = kg_scope(user_id, work_id)
+    result = _lorekeeper_tool(tenant, "fact_search").execute(query_text=query_text, top_k=top_k)
+    return format_tool_result(result), f"KG 사실 검색 · «{_short(query_text)}»"
+
+
+def _kg_entity_search(
+    user_id: int, work_id: int, entity_name: str, up_to_chapter: int | None = None
+) -> tuple[str, str]:
+    tenant = kg_scope(user_id, work_id)
+    result = _lorekeeper_tool(tenant, "entity_search").execute(
         entity_name=entity_name, up_to_chapter=up_to_chapter
     )
     upto = f" (EP.{up_to_chapter:03d}까지)" if up_to_chapter else ""
-    return format_tool_result(result), f"KG 조회 · 인물 «{_short(entity_name)}»{upto}"
-
-
-def _kg_text2cypher(work_id: int, query_text: str) -> tuple[str, str]:
-    kg_scope(work_id)
-    result = _lorekeeper_tool("text2cypher_search").execute(query_text=query_text)
-    return format_tool_result(result), f"KG 질의 · «{_short(query_text)}»"
+    return format_tool_result(result), f"KG 조회 · «{_short(entity_name)}»{upto}"
 
 
 # ---------- PostgreSQL 원고/작품 도구 ----------
@@ -137,7 +144,7 @@ def _connect() -> psycopg.Connection:
     return psycopg.connect(url, connect_timeout=5)
 
 
-def _episode_manuscript(work_id: int, episode_number: int) -> tuple[str, str]:
+def _episode_manuscript(user_id: int, work_id: int, episode_number: int) -> tuple[str, str]:
     with _connect() as conn, conn.cursor() as cur:
         cur.execute(
             "select episode_number, title, content from episodes "
@@ -162,7 +169,7 @@ def _episode_manuscript(work_id: int, episode_number: int) -> tuple[str, str]:
     return f"[{number}화] {title or '(제목 없음)'}\n\n{body}{cut}", summary
 
 
-def _work_settings(work_id: int) -> tuple[str, str]:
+def _work_settings(user_id: int, work_id: int) -> tuple[str, str]:
     with _connect() as conn, conn.cursor() as cur:
         cur.execute("select title from works where id=%s", (work_id,))
         row = cur.fetchone()
@@ -200,22 +207,6 @@ class ChatTool:
 # 읽으려 드는 경로가 열린다. 에이전트가 실행 시점에 직접 주입한다(agent.py).
 _TOOLS: tuple[ChatTool, ...] = (
     ChatTool(
-        name="kg_vector_search",
-        description=(
-            "질문과 의미가 가까운 원문 조각을 벡터 검색으로 찾고, 그 근거가 되는 사건·상태의 "
-            "관련 그래프까지 함께 반환한다. 일반적인 자연어 질문에 쓴다."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query_text": {"type": "string", "description": "검색할 자연어 질의."},
-                "top_k": {"type": "integer", "description": "반환할 상위 결과 개수(기본 5)."},
-            },
-            "required": ["query_text"],
-        },
-        run=_kg_vector_search,
-    ),
-    ChatTool(
         name="kg_hybrid_search",
         description=(
             "벡터 검색과 풀텍스트 검색을 결합해 원문 조각과 관련 그래프를 반환한다. "
@@ -235,38 +226,39 @@ _TOOLS: tuple[ChatTool, ...] = (
         run=_kg_hybrid_search,
     ),
     ChatTool(
-        name="kg_entity_state_history",
+        name="kg_fact_search",
         description=(
-            "특정 인물의 상태(신분·소속·능력·부상·생사·소유·역할) 변화를 성립 회차 순으로 "
-            "조회한다. 인물 이름 하나만 받는다."
+            "원문이 아니라 정제된 사실(사건·인물 상태)을 검색한다. 각 사실에 참가자와 근거 "
+            "원문이 함께 딸려온다. 사건·상태 자체가 답인 질문에 쓴다."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "entity_name": {"type": "string", "description": "조회할 인물의 이름 또는 별칭."},
+                "query_text": {"type": "string", "description": "검색할 자연어 질의."},
+                "top_k": {"type": "integer", "description": "반환할 상위 결과 개수(기본 5)."},
+            },
+            "required": ["query_text"],
+        },
+        run=_kg_fact_search,
+    ),
+    ChatTool(
+        name="kg_entity_search",
+        description=(
+            "인물·아이템·조직·장소 하나를 이름/별칭으로 정확 조회해 프로필과 관련 사실을 "
+            "성립 회차 순으로 낸다. 이름 하나만 받는다."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "entity_name": {"type": "string", "description": "조회할 대상의 이름 또는 별칭."},
                 "up_to_chapter": {
                     "type": "integer",
-                    "description": "이 회차까지 성립한 상태만 조회한다(생략 시 전체 이력).",
+                    "description": "이 회차까지 성립한 사실만 조회한다(생략 시 전체 이력).",
                 },
             },
             "required": ["entity_name"],
         },
-        run=_kg_entity_state_history,
-    ),
-    ChatTool(
-        name="kg_text2cypher",
-        description=(
-            "자연어 질문을 Cypher로 번역해 그래프에서 직접 답을 계산한다. 개수·목록·조건 같은 "
-            "집계형 질문에 쓴다."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query_text": {"type": "string", "description": "그래프에서 답을 찾을 자연어 질의."},
-            },
-            "required": ["query_text"],
-        },
-        run=_kg_text2cypher,
+        run=_kg_entity_search,
     ),
     ChatTool(
         name="episode_manuscript",

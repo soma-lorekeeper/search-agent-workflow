@@ -2,9 +2,9 @@
 
 실제 인덱싱(run_indexing)과 Neo4j 완료 마커 조회(_already_indexed)를 전부 스텁으로 갈아끼워
 LLM·DB 비용 없이 계약만 검증한다. 확인하는 것: 201 응답 모양, 400 검증, 429(TPM) 경로,
-화별 상태 전이(waiting→running→done), 실패 시 뒤 화 연쇄 스킵, 모르는 jobId의 404,
-이미 인덱싱된 화의 빠른 경로, 인덱싱된 작품 외의 요청 거절, 요청을 가로지르는 오름차순 강제,
-그리고 한도 자체를 넘는 묶음의 400.
+화별 상태 전이(QUEUED→RUNNING→DONE), 실패 시 뒤 화 연쇄 스킵, 모르는 jobId의 404,
+이미 인덱싱된 화의 빠른 경로, 요청을 가로지르는 오름차순 강제, 그 오름차순이 테넌트를
+넘나들지 않는다는 것, 그리고 한도 자체를 넘는 묶음의 400.
 
 TestClient는 앱을 별도 스레드의 이벤트 루프에서 돌리므로, 백그라운드 워커가 진행하는 동안
 테스트 스레드가 조회 API를 폴링할 수 있다(_wait_until).
@@ -22,24 +22,26 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import app as app_module
+from src.common.tenant import Tenant
 from src.service.index import job_service as index_job_service
-from src.service import kg_scope
 from conftest import RecordingDict  # tests/에 __init__.py가 없어 pytest가 경로에 넣어준다
 
 RFC3339_UTC = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
 
-# KG에 인덱싱돼 있다고 보는 작품. 실제 값은 환경변수(KG_INDEXED_WORK_ID)라서 테스트에서
-# 고정한다 — 테스트가 배포 환경 설정에 따라 통과했다 말았다 하면 안 된다.
+# 기본 요청이 쓰는 테넌트. userId × workId 조합이 소설 한 편(KG 테넌트)을 가리킨다.
+USER_ID = 42
 WORK_ID = 1
-OTHER_WORK_ID = WORK_ID + 1
 
 
 @pytest.fixture
 def stub_indexing(monkeypatch):
-    """run_indexing을 "바로 성공하고 호출 기록만 남기는" 스텁으로 바꾼다."""
+    """run_indexing을 "바로 성공하고 호출 기록만 남기는" 스텁으로 바꾼다.
+
+    첫 인자로 Tenant를 받는다 — 인덱싱은 어느 소설의 그래프에 쓸지를 이 값으로만 안다.
+    """
     calls: list[int] = []
 
-    async def _stub(episode_no: int, text: str) -> dict:
+    async def _stub(tenant: Tenant, episode_no: int, text: str) -> dict:
         calls.append(episode_no)
         return {"chapter": episode_no}
 
@@ -54,20 +56,21 @@ def client(monkeypatch, tmp_path):
     _index_queue를 새로 만드는 건 asyncio.Queue가 처음 쓰인 이벤트 루프에 묶이기 때문이다 —
     TestClient는 인스턴스마다 새 루프를 만들어서, 모듈 전역 큐를 그대로 쓰면 두 번째
     테스트에서 "다른 루프에 묶인 큐" 오류가 난다.
-    큐 오름차순 워터마크(_max_queued_episode_no)도 모듈 전역이라 매번 0으로 되돌린다.
+    큐 오름차순 워터마크(_max_queued_episode_no)도 모듈 전역이라 매번 비운다 — 테넌트 id를
+    키로 하는 dict이므로 빈 dict가 "아무 화도 큐에 넣은 적 없음"이다.
     """
     index_job_service._index_jobs.clear()
     index_job_service._tpm_window.clear()
     monkeypatch.setattr(index_job_service, "_index_queue", asyncio.Queue())
-    monkeypatch.setattr(index_job_service, "_max_queued_episode_no", 0)
-    monkeypatch.setattr(kg_scope, "KG_INDEXED_WORK_ID", WORK_ID)
+    monkeypatch.setattr(index_job_service, "_max_queued_episode_no", {})
     # 기본값은 "아직 인덱싱 안 됨" — 마커가 있는 경우는 해당 테스트에서 따로 뒤집는다.
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: set())
+    # 완료 마커 조회는 테넌트 안에서만 유효하므로 첫 인자로 Tenant를 받는다.
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda tenant, episode_nos: set())
     with TestClient(app_module.app) as c:
         yield c
 
 
-def _submit(client, episodes, user_id=42, work_id=WORK_ID):
+def _submit(client, episodes, user_id=USER_ID, work_id=WORK_ID):
     return client.post(
         "/api/index",
         json={"userId": user_id, "workId": work_id, "episodes": episodes},
@@ -87,7 +90,7 @@ def _wait_until(client, job_id, predicate, timeout=5.0):
 
 
 def _terminal(body):
-    return all(e["status"] in ("done", "error") for e in body["episodes"])
+    return all(e["status"] in ("DONE", "ERROR") for e in body["episodes"])
 
 
 # ---------- 접수(201) ----------
@@ -104,7 +107,7 @@ def test_submit_returns_201_contract(client, stub_indexing):
     assert res.status_code == 201
     body = res.json()
     assert uuid.UUID(body["jobId"])  # jobId는 이 서버가 발급한 UUID다
-    assert body["userId"] == 42
+    assert body["userId"] == USER_ID
     assert body["workId"] == WORK_ID
     assert body["episodeIds"] == [101, 102]
     assert body["remainingTpm"] < index_job_service.INDEX_TPM_LIMIT  # 추정치만큼 창에서 깎였다
@@ -144,41 +147,6 @@ def _index_job_count() -> int:
     return len(index_job_service._index_jobs)
 
 
-# ---------- 인덱싱된 작품 외의 요청(400) ----------
-
-
-def test_other_work_is_400(client, stub_indexing):
-    """KG에 작품 격리가 없어서, 다른 작품의 화를 받으면 인덱싱된 작품 위에 덮어쓴다.
-
-    특히 위험한 건 완료 마커다: 작품 A에 6화가 이미 있으면 작품 B의 6화가 마커에 걸려
-    **아무 일도 하지 않은 채 done**으로 보고되고, 호출자는 성공으로 알고 다시 보내지 않는다.
-    그래서 조용한 성공 대신 시끄러운 실패를 준다.
-    """
-    res = _submit(
-        client, [{"episodeId": 101, "episodeNo": 6, "text": "다른 작품 6화"}], work_id=OTHER_WORK_ID
-    )
-    assert res.status_code == 400
-    detail = res.json()["detail"]
-    assert str(OTHER_WORK_ID) in detail and str(WORK_ID) in detail
-    # 거절된 요청은 작업 기록에 남지 않는다.
-    assert _index_job_count() == 0
-    assert stub_indexing == []
-
-
-def test_other_work_is_400_even_when_marker_says_done(client, stub_indexing, monkeypatch):
-    """마커 조회는 화 번호만 보므로 다른 작품의 6화도 "이미 인덱싱됨"으로 답한다.
-
-    이게 이 버그의 심장이다 — 관문이 없으면 여기서 201 + 전부 done이 나가고, 그 화는 영영
-    인덱싱되지 않는다. 관문은 마커를 보기도 전에 막아야 한다.
-    """
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: set(episode_nos))
-    res = _submit(
-        client, [{"episodeId": 101, "episodeNo": 6, "text": "다른 작품 6화"}], work_id=OTHER_WORK_ID
-    )
-    assert res.status_code == 400
-    assert _index_job_count() == 0
-
-
 # ---------- 요청을 가로지르는 오름차순(400) ----------
 
 
@@ -209,6 +177,35 @@ def test_lower_episode_after_higher_request_is_400(client, stub_indexing):
     assert _index_job_count() == 1  # 첫 요청만 남았다
 
 
+def test_watermark_does_not_cross_tenants(client, stub_indexing):
+    """워터마크는 테넌트(userId × workId)마다 따로 센다.
+
+    전역 워터마크 하나였다면 작품 1의 7화가 올려둔 값에 작품 2의 3화가 걸려 400을 받는다 —
+    서로 아무 상관 없는 두 소설이 서로의 진도에 발이 묶인다. 오름차순이 필요한 이유는
+    "누적 컨텍스트가 오염된다"이고, 그 누적은 테넌트 안에서만 일어난다.
+    """
+    assert (
+        _submit(
+            client,
+            [{"episodeId": 107, "episodeNo": 7, "text": "1번 작품 7화"}],
+            user_id=1,
+            work_id=1,
+        ).status_code
+        == 201
+    )
+
+    res = _submit(
+        client,
+        [{"episodeId": 203, "episodeNo": 3, "text": "2번 작품 3화"}],
+        user_id=1,
+        work_id=2,
+    )
+    assert res.status_code == 201
+    body = _wait_until(client, res.json()["jobId"], _terminal)
+    assert body["episodes"][0]["status"] == "DONE"
+    assert stub_indexing == [7, 3]  # 3화가 실제로 인덱싱까지 갔다
+
+
 def test_same_episode_in_two_requests_is_400(client, stub_indexing):
     """같은 화가 두 요청에 겹쳐 들어오면 400 — 안 막으면 같은 화를 두 번 인덱싱한다(LLM 비용 2배)."""
     assert _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화"}]).status_code == 201
@@ -226,7 +223,7 @@ def test_ascending_across_requests_is_accepted(client, stub_indexing):
         _submit(client, [{"episodeId": 108, "episodeNo": 8, "text": "8화"}]).json()["jobId"],
         _terminal,
     )
-    assert body["episodes"][0]["status"] == "done"
+    assert body["episodes"][0]["status"] == "DONE"
     assert stub_indexing == [6, 7, 8]
 
 
@@ -237,7 +234,7 @@ def test_already_indexed_resubmit_is_not_blocked_by_watermark(client, stub_index
     보면 다시 POST한다"는 스펙의 복구 경로가 막힌다.
     """
     assert _submit(client, [{"episodeId": 107, "episodeNo": 7, "text": "7화"}]).status_code == 201
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: {3, 4})
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda tenant, episode_nos: {3, 4})
     res = _submit(
         client,
         [
@@ -247,7 +244,7 @@ def test_already_indexed_resubmit_is_not_blocked_by_watermark(client, stub_index
     )
     assert res.status_code == 201
     body = _wait_until(client, res.json()["jobId"], _terminal)
-    assert [e["status"] for e in body["episodes"]] == ["done", "done"]
+    assert [e["status"] for e in body["episodes"]] == ["DONE", "DONE"]
     assert stub_indexing == [7]  # 3·4화는 실제로 인덱싱되지 않았다
 
 
@@ -313,11 +310,11 @@ def test_many_small_episodes_are_400_too(client, stub_indexing):
 
 
 def test_episode_status_transitions(client, monkeypatch):
-    """앞 화가 도는 동안 뒤 화는 waiting이고, 풀어주면 순서대로 done이 된다."""
+    """앞 화가 도는 동안 뒤 화는 QUEUED이고, 풀어주면 순서대로 DONE이 된다."""
     gate = threading.Event()
     started: list[int] = []
 
-    async def _blocking(episode_no: int, text: str) -> dict:
+    async def _blocking(tenant: Tenant, episode_no: int, text: str) -> dict:
         started.append(episode_no)
         while not gate.is_set():
             await asyncio.sleep(0.01)
@@ -333,17 +330,17 @@ def test_episode_status_transitions(client, monkeypatch):
     ).json()["jobId"]
 
     try:
-        body = _wait_until(client, job_id, lambda b: b["episodes"][0]["status"] == "running")
+        body = _wait_until(client, job_id, lambda b: b["episodes"][0]["status"] == "RUNNING")
         assert body["jobId"] == job_id
-        assert body["userId"] == 42 and body["workId"] == WORK_ID
+        assert body["userId"] == USER_ID and body["workId"] == WORK_ID
         # 워커가 하나뿐이라 뒤 화는 아직 시작조차 안 한다(누적 컨텍스트 때문에 순차 처리 필수).
-        assert body["episodes"][1] == {"episodeId": 102, "status": "waiting", "error": None}
+        assert body["episodes"][1] == {"episodeId": 102, "status": "QUEUED", "error": None}
         assert started == [6]
     finally:
         gate.set()
 
     body = _wait_until(client, job_id, _terminal)
-    assert [e["status"] for e in body["episodes"]] == ["done", "done"]
+    assert [e["status"] for e in body["episodes"]] == ["DONE", "DONE"]
     assert started == [6, 7]
 
 
@@ -351,7 +348,7 @@ def test_episode_status_transitions(client, monkeypatch):
 
 
 def test_failure_skips_following_episodes(client, monkeypatch):
-    async def _fail_on_seven(episode_no: int, text: str) -> dict:
+    async def _fail_on_seven(tenant: Tenant, episode_no: int, text: str) -> dict:
         if episode_no == 7:
             raise RuntimeError("추출 실패")
         return {}
@@ -367,7 +364,7 @@ def test_failure_skips_following_episodes(client, monkeypatch):
     ).json()["jobId"]
 
     body = _wait_until(client, job_id, _terminal)
-    assert [e["status"] for e in body["episodes"]] == ["done", "error", "error"]
+    assert [e["status"] for e in body["episodes"]] == ["DONE", "ERROR", "ERROR"]
     assert body["episodes"][1]["error"] == "추출 실패"
     # 뒤 화는 시도조차 하지 않았다는 사실이 error 문구에 드러나야 한다.
     assert body["episodes"][2]["error"] == "Skipped due to preceding episode (7) failure"
@@ -386,24 +383,26 @@ def test_unknown_job_is_404(client, stub_indexing):
 
 
 def test_error_status_never_appears_without_its_reason(monkeypatch):
-    """조회는 스레드풀에서, 워커는 이벤트 루프에서 돈다 — status="error"인데 error=None인
+    """조회는 스레드풀에서, 워커는 이벤트 루프에서 돈다 — status="ERROR"인데 error=None인
     순간이 있으면 그 순간의 폴링이 사유 없는 실패를 확정 저장한다."""
 
-    async def _fail(episode_no: int, text: str) -> dict:
+    async def _fail(tenant: Tenant, episode_no: int, text: str) -> dict:
         raise RuntimeError("추출 실패")
 
     monkeypatch.setattr(index_job_service, "run_indexing", _fail)
     episodes = [
         RecordingDict(
-            {"episode_id": 101, "episode_no": 6, "text": "6화", "status": "waiting", "error": None}
+            {"episode_id": 101, "episode_no": 6, "text": "6화", "status": "QUEUED", "error": None}
         ),
         RecordingDict(
-            {"episode_id": 102, "episode_no": 7, "text": "7화", "status": "waiting", "error": None}
+            {"episode_id": 102, "episode_no": 7, "text": "7화", "status": "QUEUED", "error": None}
         ),
     ]
+    # 워커가 실제로 만드는 작업과 같은 모양으로 넣는다(tenant_id 포함 — 워터마크 판정이 읽는다).
     index_job_service._index_jobs["job-torn"] = {
-        "user_id": 42,
+        "user_id": USER_ID,
         "work_id": WORK_ID,
+        "tenant_id": Tenant.of(USER_ID, WORK_ID).id,
         "requested_at": "2026-08-14T00:00:00Z",
         "episodes": episodes,
     }
@@ -412,18 +411,18 @@ def test_error_status_never_appears_without_its_reason(monkeypatch):
     finally:
         index_job_service._index_jobs.pop("job-torn", None)
 
-    # 첫 화는 실패, 둘째 화는 연쇄 스킵 — 둘 다 error다.
-    assert [e["status"] for e in episodes] == ["error", "error"]
+    # 첫 화는 실패, 둘째 화는 연쇄 스킵 — 둘 다 ERROR다.
+    assert [e["status"] for e in episodes] == ["ERROR", "ERROR"]
     for episode in episodes:
-        assert [s for s in episode.snapshots if s["status"] == "error" and not s["error"]] == []
+        assert [s for s in episode.snapshots if s["status"] == "ERROR" and not s["error"]] == []
 
 
 # ---------- 이미 인덱싱된 화 ----------
 
 
 def test_already_indexed_episodes_skip_work(client, stub_indexing, monkeypatch):
-    """완료 마커가 있는 화는 즉시 done이고, 인덱싱도 TPM 소비도 하지 않는다."""
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: {6})
+    """완료 마커가 있는 화는 즉시 DONE이고, 인덱싱도 TPM 소비도 하지 않는다."""
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda tenant, episode_nos: {6})
     res = _submit(
         client,
         [
@@ -434,22 +433,49 @@ def test_already_indexed_episodes_skip_work(client, stub_indexing, monkeypatch):
     assert res.status_code == 201
     job_id = res.json()["jobId"]
 
-    # 접수 직후부터 6화는 done이다(워커가 손도 대기 전에).
-    assert client.get(f"/api/index/jobs/{job_id}").json()["episodes"][0]["status"] == "done"
+    # 접수 직후부터 6화는 DONE이다(워커가 손도 대기 전에).
+    assert client.get(f"/api/index/jobs/{job_id}").json()["episodes"][0]["status"] == "DONE"
     body = _wait_until(client, job_id, _terminal)
-    assert [e["status"] for e in body["episodes"]] == ["done", "done"]
+    assert [e["status"] for e in body["episodes"]] == ["DONE", "DONE"]
     assert stub_indexing == [7]  # 6화는 실제로 인덱싱되지 않았다
+
+
+def test_marker_is_looked_up_within_the_requesting_tenant(client, stub_indexing, monkeypatch):
+    """완료 마커 조회는 요청의 테넌트로 좁혀서 물어봐야 한다.
+
+    화 번호만 보고 판정하면 작품 B의 6화가 작품 A의 6화 마커에 걸려 **아무 일도 하지 않은 채**
+    DONE으로 보고된다 — 호출자는 성공으로 알고 다시 보내지 않고, 그 화는 영영 인덱싱되지 않는다.
+    """
+    seen: list[str] = []
+
+    def _fake_marker(tenant: Tenant, episode_nos: list[int]) -> set[int]:
+        seen.append(tenant.id)
+        return set()
+
+    monkeypatch.setattr(index_job_service, "_already_indexed", _fake_marker)
+    assert (
+        _submit(
+            client,
+            [{"episodeId": 101, "episodeNo": 6, "text": "6화"}],
+            user_id=7,
+            work_id=3,
+        ).status_code
+        == 201
+    )
+    assert seen == ["7:3"]
 
 
 def test_fully_indexed_resubmit_costs_no_tpm(client, stub_indexing, monkeypatch):
     """전부 이미 인덱싱된 재제출은 TPM을 전혀 쓰지 않는다 — 안 그러면 재제출이 429로 막힌다."""
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: set(episode_nos))
+    monkeypatch.setattr(
+        index_job_service, "_already_indexed", lambda tenant, episode_nos: set(episode_nos)
+    )
     monkeypatch.setattr(index_job_service, "INDEX_TPM_LIMIT", 1000)
     res = _submit(client, [{"episodeId": 101, "episodeNo": 6, "text": "6화" * 5000}])
     assert res.status_code == 201
     assert res.json()["remainingTpm"] == 1000
     body = _wait_until(client, res.json()["jobId"], _terminal)
-    assert body["episodes"][0]["status"] == "done"
+    assert body["episodes"][0]["status"] == "DONE"
     assert stub_indexing == []
 
 
@@ -464,13 +490,13 @@ def test_inflight_resubmit_is_not_blocked_by_watermark(client, monkeypatch):
     started = threading.Event()
     release = threading.Event()
 
-    async def blocking_indexing(chapter: int, text: str) -> dict:
+    async def blocking_indexing(tenant: Tenant, chapter: int, text: str) -> dict:
         started.set()
         await asyncio.to_thread(release.wait, 5)
         return {"chapter": chapter}
 
     monkeypatch.setattr(index_job_service, "run_indexing", blocking_indexing)
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: set())
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda tenant, episode_nos: set())
 
     episodes = [
         {"episodeId": 102, "episodeNo": 2, "text": "2화"},
@@ -479,7 +505,7 @@ def test_inflight_resubmit_is_not_blocked_by_watermark(client, monkeypatch):
     assert _submit(client, episodes).status_code == 201
     assert started.wait(5), "워커가 첫 화를 시작하지 못했다"
 
-    # 마커는 아직 없고 2·3화는 waiting/running 이다. 여기서 같은 묶음을 다시 보낸다.
+    # 마커는 아직 없고 2·3화는 QUEUED/RUNNING 이다. 여기서 같은 묶음을 다시 보낸다.
     try:
         assert _submit(client, episodes).status_code == 201
     finally:

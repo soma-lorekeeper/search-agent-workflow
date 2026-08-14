@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -31,10 +32,19 @@ from functools import lru_cache
 from pathlib import Path
 
 from src.service.index.splitters import KSSSentenceSplitter
+
+
+def _eval_tenant() -> Tenant:
+    """하네스가 겨누는 테넌트. EVAL_USER_ID/EVAL_WORK_ID로 바꿀 수 있다(기본 1:1)."""
+    return Tenant.of(
+        int(os.environ.get("EVAL_USER_ID", "1")),
+        int(os.environ.get("EVAL_WORK_ID", "1")),
+    )
 from openai import AsyncOpenAI, RateLimitError
 
 from src.config import DATA_DIR, OPENAI_API_KEY
 from src.contradiction import usage
+from src.common.tenant import Tenant
 from src.contradiction.tools import build_openai_tools, format_tool_result
 
 # Neo4j가 RELATED_TO 관계 부재(알려진 갭)를 매 쿼리마다 경고로 뱉어 출력을 뒤덮는다.
@@ -1851,7 +1861,9 @@ def stage_retrieve(
     # 부록([관련 그래프])은 기본으로 안 온다 — 예전엔 받아서 텍스트에서 떼어냈지만(trim_graph)
     # 이제 retriever가 애초에 수집하지 않아 쿼리 자체가 가벼워진다. 등가성은 항목 단위로
     # 검증했다(trim(ON) == OFF, 179/179).
-    _, tools_by_name = build_openai_tools(include_graph)
+    # 하네스는 평가용 단일 소설만 다룬다. 실제 서비스는 요청의 (userId, workId)로
+    # 테넌트를 해소하지만, 여기서는 환경변수로 못박아 기존 그래프를 그대로 겨눈다.
+    _, tools_by_name = build_openai_tools(_eval_tenant(), include_graph)
 
     def retrieve_one(claim: dict) -> tuple[dict, int]:
         """claim 하나의 전 채널. 스레드에서 돌므로 바깥 상태를 건드리지 않는다."""

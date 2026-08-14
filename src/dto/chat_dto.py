@@ -38,6 +38,8 @@ class ChatContext(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    # userId × workId가 KG 테넌트다. 인덱싱·탐지와 같은 키여야 같은 그래프를 본다.
+    user_id: int
     work_id: int
     session_id: int
     messages: list[ChatMessage]

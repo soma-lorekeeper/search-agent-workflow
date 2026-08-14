@@ -10,7 +10,6 @@ from fastapi import APIRouter
 
 from src.chat import run_chat
 from src.dto.chat_dto import ChatRequest, ChatResponse
-from src.service.kg_scope import require_indexed_work
 
 router = APIRouter()
 
@@ -26,9 +25,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     suggested_title은 대화 첫 턴에만 채워진다. 세션 제목을 저장할지 말지는 API 서버가 정한다.
     """
-    require_indexed_work(req.work_id)
-
     result = await run_chat(
+        user_id=req.user_id,
         work_id=req.work_id,
         session_id=req.session_id,
         messages=[m.model_dump() for m in req.messages],

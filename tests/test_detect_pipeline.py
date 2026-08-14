@@ -15,7 +15,11 @@ import asyncio
 
 import pytest
 
+from src.common.tenant import Tenant
 from src.contradiction import pipeline
+
+# 배경 컨텍스트를 만들 소설 한 편. 그래프를 읽는 모든 쿼리가 이 키로 좁혀진다.
+TENANT = Tenant.of(42, 1)
 
 # --- 가짜 그래프: 3화의 사건 하나와 7화의 사건·상태 하나, 그리고 둘 다에 등장하는 인물 하나 ---
 NODE_RECORDS = [
@@ -85,7 +89,7 @@ def fake_driver(monkeypatch):
 
 
 def test_bounded_context_drops_future_chapters(fake_driver):
-    context = pipeline.background_context(up_to_chapter=5)
+    context = pipeline.background_context(TENANT, up_to_chapter=5)
 
     # 그래프: 3화 사건은 남고, 7화 사건과 거기서 성립한 상태는 사라진다.
     assert "카엘이 부상당한다" in context
@@ -104,17 +108,22 @@ def test_bounded_context_drops_future_chapters(fake_driver):
 
 
 def test_bound_reaches_the_queries(fake_driver):
-    pipeline.background_context(up_to_chapter=5)
+    pipeline.background_context(TENANT, up_to_chapter=5)
     params = [p for q, p in fake_driver.calls if "coalesce(n.chapter" in q]
     assert params == [{"up_to_chapter": 5}]
+    # 회차 요약 쿼리는 상한과 테넌트를 함께 받는다 — 상한만 걸고 테넌트를 빠뜨리면 남의
+    # 작품 줄거리가 "기존 설정"으로 섞여 들어온다.
     params = [p for q, p in fake_driver.calls if "c.summary IS NOT NULL" in q]
-    assert params == [{"up_to_chapter": 5}]
+    assert params == [{"up_to_chapter": 5, **TENANT.params()}]
+    # 그래프 덤프(노드 조회)도 같은 테넌트로 좁혀졌다.
+    params = [p for q, p in fake_driver.calls if "labels(n) AS labels" in q]
+    assert params == [TENANT.params()]
     assert fake_driver.closed
 
 
 def test_unbounded_context_is_unchanged(fake_driver):
     """회차 번호를 모르는 호출(CLI)은 예전 그대로 그래프 전체를 배경으로 쓴다."""
-    context = pipeline.background_context()
+    context = pipeline.background_context(TENANT)
 
     assert "카엘이 죽는다" in context
     assert "전역 요약(7화까지 반영됨)" in context
@@ -155,8 +164,8 @@ def test_bounded_driver_passes_other_queries_through(fake_driver):
 def test_streaming_passes_the_bound_to_the_context(monkeypatch):
     captured: list = []
 
-    def _fake_context(up_to_chapter=None):
-        captured.append(up_to_chapter)
+    def _fake_context(tenant, up_to_chapter=None):
+        captured.append((tenant, up_to_chapter))
         return "배경"
 
     async def _no_claims(text, background_context):
@@ -165,9 +174,10 @@ def test_streaming_passes_the_bound_to_the_context(monkeypatch):
     monkeypatch.setattr(pipeline, "background_context", _fake_context)
     monkeypatch.setattr(pipeline, "extract_claims", _no_claims)
 
-    assert asyncio.run(pipeline.check_new_episode_streaming("5화 원고", 5)) == []
-    assert captured == [5]
+    # 테넌트와 회차 상한이 둘 다 배경 컨텍스트까지 내려가야 한다.
+    assert asyncio.run(pipeline.check_new_episode_streaming("5화 원고", TENANT, 5)) == []
+    assert captured == [(TENANT, 5)]
 
-    # 회차를 모르면 상한 없이(=예전 동작) 돈다.
-    assert asyncio.run(pipeline.check_new_episode("원고")) == []
-    assert captured == [5, None]
+    # 회차를 모르면 상한 없이(=예전 동작) 돈다. 테넌트는 그래도 반드시 따라간다.
+    assert asyncio.run(pipeline.check_new_episode_streaming("원고", TENANT)) == []
+    assert captured == [(TENANT, 5), (TENANT, None)]

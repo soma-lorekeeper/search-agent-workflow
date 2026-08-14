@@ -14,8 +14,8 @@ class IndexEpisode(CamelModel):
 
 
 class IndexRequest(CamelModel):
-    # userId × workId가 작품 하나를 가리킨다. 둘 다 지금 KG에서 실제 필터로 쓰이지 않지만
-    # (kg_scope 참고) 인터페이스에는 처음부터 둔다 — 격리가 생겨도 API 계약을 다시 깨지 않게.
+    # userId × workId가 KG 테넌트(소설 한 편)를 가리킨다. 그래프의 모든 노드가 이 키로
+    # 표시되고, 모든 읽기가 이 키로 좁혀진다.
     user_id: int
     work_id: int
     # 비었을 때 422가 아니라 400을 주려고 기본값을 둔다(text와 같은 이유).
@@ -33,7 +33,7 @@ class IndexAccepted(CamelModel):
 
 class IndexEpisodeStatus(CamelModel):
     episode_id: int
-    # waiting | running | done | error. 모든 화가 done 또는 error면 그 작업은 끝난 것이다
+    # QUEUED | RUNNING | DONE | ERROR. 모든 화가 DONE 또는 ERROR면 그 작업은 끝난 것이다
     # (작업 단위 status 필드는 따로 두지 않는다 — 화별 상태에서 유도되는 값이라 두 곳에
     # 같은 사실을 적어두면 어긋날 수 있다).
     status: str

@@ -1,8 +1,8 @@
 """인덱싱 작업의 접수·큐·워커·상태를 관리한다.
 
 작업 id(jobId)는 이 서버가 UUID로 발급한다. 예전에는 Spring이 발급한 id로 일했지만,
-이제 요청 하나가 여러 화를 묶어서 들어오고 그 묶음의 진행 상태(화별 waiting/running/
-done/error)를 관리하는 주체가 이 서버라서, 묶음의 이름도 여기서 짓는 게 맞다.
+이제 요청 하나가 여러 화를 묶어서 들어오고 그 묶음의 진행 상태(화별 QUEUED/RUNNING/
+DONE/ERROR)를 관리하는 주체가 이 서버라서, 묶음의 이름도 여기서 짓는 게 맞다.
 Spring은 201 응답으로 받은 jobId로 진행 상황을 조회한다.
 
 처리는 요청 커넥션과 완전히 분리된 백그라운드 워커가 한다 — 요청한 쪽이 끊겨도,
@@ -11,19 +11,20 @@ Spring은 201 응답으로 받은 jobId로 진행 상황을 조회한다.
 요청 자체가 보장해야 하는 조건이고(어기면 400) 한 요청 안의 화들은 받은 순서대로
 처리하므로, 큐가 순서를 다시 정할 이유가 없다.
 
-큐와 워커는 작품 구분 없이 전역이고 워커는 하나뿐이다. 지금 KG에는 작품 격리가 아예
-없어서(kg_scope 참고) 그래프 전체가 "인덱싱된 작품 하나"이고, 여러 작품을 동시에
-인덱싱하는 상황 자체가 없다. 여기서 workId별로 큐를 쪼개면 없는 격리를 있는 척하게 될
-뿐이다 — KG가 workId를 갖게 되는 시점에 큐/워커를 작품별로 나눈다.
+큐와 워커는 테넌트 구분 없이 전역이고 워커는 하나뿐이다. 순차 처리는 **테넌트 안에서만**
+필요한 규칙이지만(누적 컨텍스트가 이전 회차 완료를 전제한다), 테넌트별로 워커를 쪼개면
+동시에 도는 인덱싱 수만큼 LLM 호출이 겹쳐 TPM 한도를 쉽게 넘긴다. 지금은 전역 단일 워커로
+두고, 처리량이 문제가 되면 그때 테넌트별 동시성을 연다 — 순서 계약은 이미 테넌트 안에서만
+적용되므로 그 변경은 안전하다.
 
 작업 상태는 이 프로세스 메모리에만 있다. 재시작하면 상태가 사라지고 진행 중이던 인덱싱도
 함께 끊긴다 — 스펙이 인정하는 정상 시나리오다(Spring은 조회에서 404를 보면 다시 POST한다).
 그렇게 다시 보내도 안전한 근거는 _already_indexed의 완료 마커다.
 
 job 한 건의 모양:
-  {"user_id": 42, "work_id": 7, "requested_at": "2026-08-11T03:11:00Z",
+  {"user_id": 42, "work_id": 7, "tenant_id": "42:7", "requested_at": "2026-08-11T03:11:00Z",
    "episodes": [{"episode_id": 101, "episode_no": 6, "text": "...",
-                 "status": "waiting", "error": None}, ...]}
+                 "status": "QUEUED", "error": None}, ...]}
 text를 상태에 함께 들고 있는 건 워커가 나중에 꺼내 쓰기 때문이고, 조회 응답에는 나가지
 않는다(응답 모델이 episodeId/status/error만 뽑는다).
 """
@@ -46,7 +47,8 @@ from src.repository.neo4j.client import get_driver
 
 from src.service.index.indexing_service import DATABASE as LOREKEEPER_DATABASE
 from src.service.index.indexing_service import indexing as run_indexing
-from src.service.kg_scope import kg_scope, require_indexed_work
+from src.common.tenant import Tenant
+from src.service.kg_scope import kg_scope
 
 logger = logging.getLogger("index")
 
@@ -65,14 +67,17 @@ _index_queue: asyncio.Queue = asyncio.Queue()  # 접수된 job_id의 FIFO
 # 그래서 요청 하나의 루프가 강제하는 규칙(episodeNo는 반드시 증가)을 큐 범위로 끌어올린다.
 # 이미 완료 마커가 있는 화는 비교에서 뺀다 — 재제출은 일하지 않으므로 순서를 깨지 않는다.
 #
-# 프로세스 메모리라서 재시작하면 0으로 돌아간다. 그때는 마커가 있는 화만 걸러질 뿐 "그래프에는
+# 프로세스 메모리라서 재시작하면 비워진다. 그때는 마커가 있는 화만 걸러질 뿐 "그래프에는
 # 6화까지 있는데 3화를 새로 넣는" 요청을 막지 못한다 — 워터마크를 그래프에서 복원하려면
 # _already_indexed와 다른 쿼리(요청에 없는 화까지 보는)가 필요해서 지금은 하지 않는다.
-_max_queued_episode_no = 0
+#
+# 테넌트별로 따로 센다. 전역 하나면 소설 A의 7화를 넣은 뒤 소설 B의 3화를 넣을 수 없다 —
+# 서로 아무 상관 없는 두 소설이 서로의 진도에 발이 묶인다.
+_max_queued_episode_no: dict[str, int] = {}
 
 
-def _active_episode_nos() -> set[int]:
-    """아직 끝나지 않은(waiting·running) 화 번호. 워터마크 판정에서 제외할 대상이다.
+def _active_episode_nos(tenant: Tenant) -> set[int]:
+    """아직 끝나지 않은(QUEUED·RUNNING) 화 번호. 워터마크 판정에서 제외할 대상이다.
 
     완료 마커는 인덱싱이 **끝나야** 찍히므로, 큐에 들어가 처리 중인 화는 마커가 없다.
     그 상태에서 계약대로 재제출이 오면 마커로 걸러지지 않아 워터마크에 걸리고, 정상적인
@@ -81,8 +86,9 @@ def _active_episode_nos() -> set[int]:
     return {
         episode["episode_no"]
         for job in _index_jobs.values()
+        if job["tenant_id"] == tenant.id
         for episode in job["episodes"]
-        if episode["status"] in ("waiting", "running")
+        if episode["status"] in ("QUEUED", "RUNNING")
     }
 
 
@@ -111,7 +117,7 @@ async def _run_index_job(job_id: str) -> None:
     failed_no: int | None = None
 
     for episode in job["episodes"]:
-        if episode["status"] == "done":
+        if episode["status"] == "DONE":
             # 접수 시점에 완료 마커가 확인된 화 — 다시 인덱싱하지 않는다.
             continue
         if failed_no is not None:
@@ -120,19 +126,14 @@ async def _run_index_job(job_id: str) -> None:
             episode.update(
                 {
                     "error": f"Skipped due to preceding episode ({failed_no}) failure",
-                    "status": "error",
+                    "status": "ERROR",
                 }
             )
             continue
 
-        episode["status"] = "running"
+        episode["status"] = "RUNNING"
         try:
-            # KG의 작품 범위를 아는 유일한 지점. 지금은 격리가 없어 빈 필터를 돌려주고 경고만
-            # 남기지만, workId를 여기서 반드시 통과시켜야 격리가 생겼을 때 고칠 곳이 하나로 남는다.
-            # userId는 kg_scope에도 넘기지 않는다 — 그래프에는 workId조차 없어서 사용자 단위
-            # 격리는 더더욱 불가능하고, 지금 넘겨봐야 무시되는 인자가 하나 늘 뿐이다. 사용자는
-            # 로그로만 남겨 "누가 넣은 그래프인지" 추적할 수 있게 한다.
-            kg_scope(job["work_id"])
+            tenant = kg_scope(job["user_id"], job["work_id"])
             logger.info(
                 "인덱싱 시작 | jobId=%s userId=%s workId=%s episodeId=%s episodeNo=%s",
                 job_id,
@@ -141,8 +142,8 @@ async def _run_index_job(job_id: str) -> None:
                 episode["episode_id"],
                 episode["episode_no"],
             )
-            await _run_indexing_with_retry(episode["episode_no"], episode["text"])
-            episode["status"] = "done"
+            await _run_indexing_with_retry(tenant, episode["episode_no"], episode["text"])
+            episode["status"] = "DONE"
         except Exception as exc:  # noqa: BLE001 — 실패 사유를 상태로 노출해야 호출자가 보여줄 수 있다
             logger.exception(
                 "인덱싱 실패 | jobId=%s episodeId=%s episodeNo=%s",
@@ -151,7 +152,7 @@ async def _run_index_job(job_id: str) -> None:
                 episode["episode_no"],
             )
             # 위와 같은 이유로 사유와 상태를 한 번에 쓴다(터진 읽기 방지).
-            episode.update({"error": str(exc), "status": "error"})
+            episode.update({"error": str(exc), "status": "ERROR"})
             failed_no = episode["episode_no"]
 
 
@@ -162,7 +163,7 @@ _RATE_LIMIT_RETRIES = 3
 _RATE_LIMIT_BACKOFF_SECONDS = 20  # 20초 → 40초 → 80초. TPM 창이 60초라 한 번 쉬면 대개 회복된다.
 
 
-async def _run_indexing_with_retry(episode_no: int, text: str) -> dict:
+async def _run_indexing_with_retry(tenant: Tenant, episode_no: int, text: str) -> dict:
     """lorekeeper 인덱싱을 부르되, OpenAI의 rate limit(429)만 백오프 재시도한다.
 
     다른 예외는 재시도해도 결과가 달라지지 않으므로(원고 파싱 실패, DB 연결 끊김 등)
@@ -170,7 +171,7 @@ async def _run_indexing_with_retry(episode_no: int, text: str) -> dict:
     """
     for attempt in range(_RATE_LIMIT_RETRIES + 1):
         try:
-            return await run_indexing(episode_no, text)
+            return await run_indexing(tenant, episode_no, text)
         except RateLimitError:
             if attempt == _RATE_LIMIT_RETRIES:
                 raise
@@ -198,18 +199,18 @@ async def _run_indexing_with_retry(episode_no: int, text: str) -> dict:
 #     전부 upsert라 같은 값으로 수렴한다)
 # 재시작으로 진행 상태가 날아가 Spring이 같은 화를 다시 보내도 안전한 이유가 이것이다.
 #
-# 이 마커는 화 번호만으로 판정하고 작품을 구분하지 못한다 — 그래프에 workId가 아예 없기
-# 때문이다(kg_scope 참고). 그래서 작품 B의 6화가 작품 A의 6화 마커에 걸려 "이미 인덱싱됨"으로
-# 보고되는 사고가 성립하는데, 그 구멍은 여기가 아니라 접수 관문(require_indexed_work)에서
-# 막는다: 애초에 인덱싱된 작품 외의 요청을 받지 않으면 이 쿼리는 항상 같은 작품 안에서만 답한다.
+# 마커는 테넌트 안에서만 유효하다. 예전에는 화 번호만 보고 판정해서 소설 B의 6화가 소설 A의
+# 6화 마커에 걸려 "이미 인덱싱됨"으로 보고됐다(아무 일도 안 하고 done — 조용한 데이터 유실).
+# 그 구멍을 접수 관문에서 다른 작품을 통째로 거절하는 방식으로 막고 있었는데, 이제 쿼리 자체가
+# 테넌트로 좁으므로 그 관문이 필요 없어졌다.
 _INDEXED_MARKER_CYPHER = """
-MATCH (c:Chapter)-[:IN_STORY]->(:Story {id: 'main'})
+MATCH (c:Chapter {tenant_id: $tenant_id})-[:IN_STORY]->(:Story {id: 'main', tenant_id: $tenant_id})
 WHERE c.number IN $chapters
 RETURN c.number AS chapter
 """
 
 
-def _already_indexed(episode_nos: list[int]) -> set[int]:
+def _already_indexed(tenant: Tenant, episode_nos: list[int]) -> set[int]:
     """완료 마커가 있는 화 번호 집합을 Neo4j에 한 번에 물어본다(요청당 쿼리 1회).
 
     조회 자체가 실패하면(그래프가 죽었거나 접속 불가) "모른다"가 아니라 "안 됐다"로 본다.
@@ -221,7 +222,7 @@ def _already_indexed(episode_nos: list[int]) -> set[int]:
         try:
             records, _, _ = driver.execute_query(
                 _INDEXED_MARKER_CYPHER,
-                {"chapters": episode_nos},
+                {"chapters": episode_nos, **tenant.params()},
                 database_=LOREKEEPER_DATABASE,
             )
         finally:
@@ -297,7 +298,7 @@ async def submit(req: IndexRequest):
     TPM에서 거절(429)당한 요청은 어디에도 남지 않아야 하므로, 상태 등록은 그 확인을
     통과한 뒤에 한다.
     """
-    require_indexed_work(req.work_id)
+    tenant = kg_scope(req.user_id, req.work_id)
 
     if not req.episodes:
         raise HTTPException(status_code=400, detail="episodes must not be empty")
@@ -322,13 +323,13 @@ async def submit(req: IndexRequest):
     # Neo4j 왕복이라 스레드로 뺀다. async 함수 안에서 그냥 부르면 그동안 이벤트 루프가 통째로
     # 멈춰 인덱싱 워커·채팅·헬스체크가 다 같이 선다(그래프가 죽어 있으면 드라이버에 접속
     # 타임아웃이 없어 30초쯤 멈춘다).
-    indexed = await asyncio.to_thread(_already_indexed, [e.episode_no for e in req.episodes])
+    indexed = await asyncio.to_thread(
+        _already_indexed, tenant, [e.episode_no for e in req.episodes]
+    )
     pending = [e for e in req.episodes if e.episode_no not in indexed]
 
     # 여기부터 큐에 넣기까지는 await가 없다 — 그래야 동시에 들어온 두 요청이 같은 워터마크를
     # 읽고 둘 다 통과하는 일이 없다(같은 화가 두 번 인덱싱되는 경로).
-    global _max_queued_episode_no
-
     # 워터마크는 **처음 보는 화**에만 적용한다.
     #
     # 재제출은 이 API의 계약이다 — 429·404·타임아웃이면 호출자가 같은 묶음을 그대로 다시
@@ -340,13 +341,14 @@ async def submit(req: IndexRequest):
     # 그래서 지금 큐/처리 중인 화 번호도 마커와 똑같이 취급해 워터마크 판정에서 뺀다.
     # 막으려던 것은 "이미 지나간 화를 뒤늦게 새로 넣는 것"이지 "같은 화를 다시 보내는 것"이
     # 아니다.
-    fresh = [e for e in pending if e.episode_no not in _active_episode_nos()]
-    if fresh and fresh[0].episode_no <= _max_queued_episode_no:
+    watermark = _max_queued_episode_no.get(tenant.id, 0)
+    fresh = [e for e in pending if e.episode_no not in _active_episode_nos(tenant)]
+    if fresh and fresh[0].episode_no <= watermark:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"episodeNo {fresh[0].episode_no} was already queued behind "
-                f"{_max_queued_episode_no}; episodes must be submitted in ascending order "
+                f"{watermark}; episodes must be submitted in ascending order "
                 f"across requests, not just within one"
             ),
         )
@@ -391,21 +393,22 @@ async def submit(req: IndexRequest):
     _index_jobs[job_id] = {
         "user_id": req.user_id,
         "work_id": req.work_id,
+        "tenant_id": tenant.id,
         "requested_at": requested_at,
         "episodes": [
             {
                 "episode_id": e.episode_id,
                 "episode_no": e.episode_no,
                 "text": e.text or "",
-                # 마커가 이미 있는 화는 큐에 들어가기 전부터 done이다.
-                "status": "done" if e.episode_no in indexed else "waiting",
+                # 마커가 이미 있는 화는 큐에 들어가기 전부터 DONE이다.
+                "status": "DONE" if e.episode_no in indexed else "QUEUED",
                 "error": None,
             }
             for e in req.episodes
         ],
     }
     # 워터마크는 실제로 큐에 넣는 요청만 올린다(429/400으로 거절한 요청은 없던 일이어야 하므로).
-    _max_queued_episode_no = max(_max_queued_episode_no, req.episodes[-1].episode_no)
+    _max_queued_episode_no[tenant.id] = max(watermark, req.episodes[-1].episode_no)
     # 워터마크를 올린 요청은 같은 블록에서 큐에 들어가야 한다. 사이에 await를 하나라도 두면
     # 뒤 요청이 그 틈에 끼어들어 먼저 큐에 들어갈 수 있고, 그러면 워터마크로 막으려던 역순
     # 실행이 그대로 일어난다. 큐에 상한이 없어 put_nowait은 절대 막히지 않는다(= await 불필요).

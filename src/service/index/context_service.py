@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from src.common.tenant import Tenant
 from src.service.index.extraction_pipeline import build_llm
 
 # 그래프 덤프에서 제외할 라벨. 메타 라벨(writer 부여)과 lexical/provenance/요약 레이어
@@ -58,7 +59,7 @@ def _extras_str(props: dict) -> str:
     return ", ".join(f"{k}={v}" for k, v in extras.items())
 
 
-def dump_graph_text(driver, database: str) -> str:
+def dump_graph_text(driver, database: str, tenant: Tenant) -> str:
     """
     현재 DB의 도메인 노드/관계를 엔티티 중심 중첩 텍스트로 직렬화한다.
 
@@ -79,8 +80,10 @@ def dump_graph_text(driver, database: str) -> str:
         """
         MATCH (n)
         WHERE NOT n:Chunk AND NOT n:Chapter AND NOT n:Story
+          AND n.tenant_id = $tenant_id
         RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props
         """,
+        tenant.params(),
         database_=database,
     )
     if not node_records:
@@ -92,9 +95,11 @@ def dump_graph_text(driver, database: str) -> str:
         MATCH (a)-[rel]->(b)
         WHERE NOT a:Chunk AND NOT b:Chunk AND NOT a:Chapter AND NOT b:Chapter
           AND NOT a:Story AND NOT b:Story
+          AND a.tenant_id = $tenant_id AND b.tenant_id = $tenant_id
         RETURN elementId(a) AS s, type(rel) AS t, elementId(b) AS e,
                properties(rel) AS props
         """,
+        tenant.params(),
         database_=database,
     )
 
@@ -103,10 +108,12 @@ def dump_graph_text(driver, database: str) -> str:
     state_ch_records, _, _ = driver.execute_query(
         """
         MATCH (s:CharacterState)
+        WHERE s.tenant_id = $tenant_id
         OPTIONAL MATCH (s)-[:ESTABLISHED_IN]->(ev:Event)
         OPTIONAL MATCH (s)-[:EVIDENCED_BY]->(ck:Chunk)
         RETURN elementId(s) AS id, coalesce(min(ev.chapter), min(ck.chapter)) AS chapter
         """,
+        tenant.params(),
         database_=database,
     )
     state_chapter = {r["id"]: r["chapter"] for r in state_ch_records}
@@ -258,7 +265,7 @@ def dump_graph_text(driver, database: str) -> str:
     return "\n".join(lines)
 
 
-def load_summaries(driver, database: str) -> tuple[str, str]:
+def load_summaries(driver, database: str, tenant: Tenant) -> tuple[str, str]:
     """
     (전역 줄거리 요약, 최근 회차 요약 텍스트)를 로드한다.
 
@@ -266,7 +273,9 @@ def load_summaries(driver, database: str) -> tuple[str, str]:
     최근: 최근 _RECENT_WINDOW화의 Chapter.summary를 회차 오름차순으로 이어붙인 텍스트.
     """
     global_records, _, _ = driver.execute_query(
-        "MATCH (s:Story {id:'main'}) WHERE s.summary IS NOT NULL RETURN s.summary AS summary",
+        "MATCH (s:Story {id:'main', tenant_id: $tenant_id}) "
+        "WHERE s.summary IS NOT NULL RETURN s.summary AS summary",
+        tenant.params(),
         database_=database,
     )
     global_summary = global_records[0]["summary"] if global_records else ""
@@ -274,12 +283,12 @@ def load_summaries(driver, database: str) -> tuple[str, str]:
     recent_records, _, _ = driver.execute_query(
         """
         MATCH (c:Chapter)
-        WHERE c.summary IS NOT NULL
+        WHERE c.summary IS NOT NULL AND c.tenant_id = $tenant_id
         RETURN c.number AS number, c.summary AS summary
         ORDER BY c.number DESC
         LIMIT $window
         """,
-        {"window": _RECENT_WINDOW},
+        {"window": _RECENT_WINDOW, **tenant.params()},
         database_=database,
     )
     recent = "\n".join(
@@ -328,7 +337,7 @@ async def summarize_episode(text: str) -> str:
 
 
 async def update_global_summary(
-    driver, database: str, chapter: int, chapter_summary: str
+    driver, database: str, tenant: Tenant, chapter: int, chapter_summary: str
 ) -> str:
     """
     전역 줄거리 요약(Story.summary)을 이번 회차 요약으로 갱신한다.
@@ -340,7 +349,9 @@ async def update_global_summary(
     Chunk-[:IN_CHAPTER]->Chapter와 같은 자식→부모 방향 관례).
     """
     records, _, _ = driver.execute_query(
-        "MATCH (s:Story {id:'main'}) WHERE s.summary IS NOT NULL RETURN s.summary AS summary",
+        "MATCH (s:Story {id:'main', tenant_id: $tenant_id}) "
+        "WHERE s.summary IS NOT NULL RETURN s.summary AS summary",
+        tenant.params(),
         database_=database,
     )
     previous = records[0]["summary"] if records else ""
@@ -370,15 +381,21 @@ async def update_global_summary(
     resp = await llm.ainvoke(user, system_instruction=system)
     merged = resp.content.strip()
 
+    # Story의 병합 키에 테넌트가 들어간다 — 예전에는 {id:'main'} 하나뿐이라 모든 소설이
+    # 같은 Story 노드를 공유하며 서로의 전역 요약을 덮어썼다.
+    #
+    # 이 MERGE가 인덱싱의 **마지막 쓰기**라는 점이 계약이다: Chapter-[:IN_STORY]->Story가
+    # 곧 "이 회차는 끝까지 처리됐다"는 완료 마커이고, 접수 단계의 빠른 경로와 채팅의
+    # "인덱싱된 회차" 조회가 모두 이 관계를 본다. 순서를 바꾸면 안 된다.
     driver.execute_query(
         """
-        MERGE (s:Story {id:'main'})
-        SET s.summary = $summary
+        MERGE (s:Story {id:'main', tenant_id: $tenant_id})
+        SET s.summary = $summary, s.tenant_ft = $tenant_ft
         WITH s
-        MATCH (c:Chapter {number: $chapter})
+        MATCH (c:Chapter {number: $chapter, tenant_id: $tenant_id})
         MERGE (c)-[:IN_STORY]->(s)
         """,
-        {"summary": merged, "chapter": chapter},
+        {"summary": merged, "chapter": chapter, **tenant.params()},
         database_=database,
     )
     return merged

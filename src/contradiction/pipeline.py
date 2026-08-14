@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Callable
 
 from src.repository.neo4j.client import get_driver
+from src.common.tenant import Tenant
 from src.service.index.context_service import build_context, dump_graph_text, load_summaries
 from src.service.index.indexing_service import DATABASE as LOREKEEPER_DATABASE
 from src.service.index.splitters import KSSSentenceSplitter
@@ -50,7 +51,9 @@ REPORTS_DIR = ROOT_DIR / "reports"
 _client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
-def _all_chapter_summaries(driver, database: str, up_to_chapter: int | None) -> str:
+def _all_chapter_summaries(
+    driver, database: str, up_to_chapter: int | None, tenant: Tenant
+) -> str:
     """회차 요약을 회차 오름차순으로 이어붙인다(윈도우 없음).
 
     lorekeeper.context.load_summaries()의 "최근 회차" 부분과 같은 모양의 쿼리이되
@@ -63,11 +66,12 @@ def _all_chapter_summaries(driver, database: str, up_to_chapter: int | None) -> 
         """
         MATCH (c:Chapter)
         WHERE c.summary IS NOT NULL
+          AND c.tenant_id = $tenant_id
           AND ($up_to_chapter IS NULL OR c.number < $up_to_chapter)
         RETURN c.number AS number, c.summary AS summary
         ORDER BY c.number ASC
         """,
-        {"up_to_chapter": up_to_chapter},
+        {"up_to_chapter": up_to_chapter, **tenant.params()},
         database_=database,
     )
     return "\n".join(f"[{r['number']}화] {r['summary']}" for r in records)
@@ -133,7 +137,7 @@ class _ChapterBoundedDriver:
         return records, summary, keys
 
 
-def background_context(up_to_chapter: int | None = None) -> str:
+def background_context(tenant: Tenant, up_to_chapter: int | None = None) -> str:
     """0단계: 그래프 덤프 + 전역 요약(lorekeeper 재사용) + 전체 회차 요약(자체 쿼리).
 
     up_to_chapter=N이면 "N화 직전까지의 세계관"을 만든다. 이 인자가 검사의 의미를 좌우한다 —
@@ -147,13 +151,15 @@ def background_context(up_to_chapter: int | None = None) -> str:
     driver = get_driver()
     try:
         if up_to_chapter is None:
-            graph_dump = dump_graph_text(driver, LOREKEEPER_DATABASE)
-            global_summary, _recent_unused = load_summaries(driver, LOREKEEPER_DATABASE)
+            graph_dump = dump_graph_text(driver, LOREKEEPER_DATABASE, tenant)
+            global_summary, _recent_unused = load_summaries(driver, LOREKEEPER_DATABASE, tenant)
         else:
             bounded = _ChapterBoundedDriver(driver, LOREKEEPER_DATABASE, up_to_chapter)
-            graph_dump = dump_graph_text(bounded, LOREKEEPER_DATABASE)
+            graph_dump = dump_graph_text(bounded, LOREKEEPER_DATABASE, tenant)
             global_summary = ""
-        all_summaries = _all_chapter_summaries(driver, LOREKEEPER_DATABASE, up_to_chapter)
+        all_summaries = _all_chapter_summaries(
+            driver, LOREKEEPER_DATABASE, up_to_chapter, tenant
+        )
     finally:
         driver.close()
     return build_context(graph_dump, global_summary, all_summaries)
@@ -208,6 +214,7 @@ async def check_new_episode(text: str, up_to_chapter: int | None = None) -> list
 
 async def check_new_episode_streaming(
     text: str,
+    tenant: Tenant,
     up_to_chapter: int | None = None,
     on_claims_extracted: Callable[[list[dict]], None] | None = None,
     on_claim_done: Callable[[int, dict], None] | None = None,
@@ -224,7 +231,7 @@ async def check_new_episode_streaming(
     """
     # Neo4j 왕복 세 번(그래프 덤프 포함)이라 그래프가 커질수록 길어진다. 이벤트 루프에서 직접
     # 부르면 그동안 인덱싱 워커·채팅·헬스체크가 전부 멈춘다.
-    context = await asyncio.to_thread(background_context, up_to_chapter)
+    context = await asyncio.to_thread(background_context, tenant, up_to_chapter)
     claims = await extract_claims(text, context)
     logger.info("설정오류 검사 시작 | claim %d개 추출", len(claims))
     if on_claims_extracted:
@@ -232,7 +239,7 @@ async def check_new_episode_streaming(
     if not claims:
         return []
 
-    tool_schemas, tools_by_name = build_openai_tools()
+    tool_schemas, tools_by_name = build_openai_tools(tenant)
     semaphore = asyncio.Semaphore(VERIFY_CONCURRENCY)
 
     async def _verify(index: int, claim: dict) -> dict:

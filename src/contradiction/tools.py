@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.common.tenant import Tenant
 from src.repository.neo4j.retrieval import build_retrieval_tools
 from neo4j_graphrag.tool import Tool
 from neo4j_graphrag.types import RetrieverResult
@@ -112,6 +113,7 @@ def _to_openai_schema(tool: Tool) -> dict[str, Any]:
 
 
 def build_openai_tools(
+    tenant: Tenant,
     include_graph: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Tool]]:
     """lorekeeper 도구 3종을 (OpenAI tools 스키마 리스트, 이름→Tool dict)로 반환한다.
@@ -120,7 +122,7 @@ def build_openai_tools(
     판정에 필요한 관계는 이미 본문에 흡수돼 있는데(참가자 목록·근거 원문·[관련인물]/[상위])
     부록은 같은 인물 설명이 결과마다 반복돼 근거 토큰의 2/3를 차지했다. 도달률은 불변이었다.
     """
-    tools = build_retrieval_tools(include_graph)
+    tools = build_retrieval_tools(tenant, include_graph)
     schemas = [_to_openai_schema(tool) for tool in tools]
     by_name = {tool.get_name(): tool for tool in tools}
     return schemas, by_name

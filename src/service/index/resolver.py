@@ -35,6 +35,8 @@ from neo4j_graphrag.experimental.components.resolver import (
 )
 from neo4j_graphrag.experimental.components.types import ResolutionStats
 
+from src.common.tenant import Tenant
+
 # 병합 시 속성 처리 전략(APOC apoc.refactor.mergeNodes의 properties 옵션).
 # 라이브러리 기본값은 'discard'라 충돌 속성이 조용히 유실된다. 여기서는 속성별 맵으로
 # 바꿔 description·aliases는 값이 다르면 배열로 '합치고'(combine → 유실 방지), 나머지 속성은
@@ -342,25 +344,39 @@ class PerLabelResolver(EntityResolver):
 
     각 sub-resolver는 filter_query(Cypher WHERE)로 자기 라벨만 대상으로 좁힌다. 라벨이 상호
     배타적이라 실행 순서는 무관하다.
+
+    **테넌트 스코프가 여기서 가장 중요하다.** 병합은 "이름이 비슷한 두 노드를 하나로
+    합치는" 일이라, 스코프가 없으면 소설 A의 '김철수'와 소설 B의 '김철수'가 한 노드가 된다.
+    두 소설의 인물이 뒤섞이고 apoc.refactor.mergeNodes는 되돌릴 수 없다. 그래서 tenant는
+    기본값 없는 필수 인자다 — 빠뜨리면 조용히 전역 병합이 도는 대신 TypeError로 즉사한다.
     """
 
     def __init__(
         self,
         driver: neo4j.Driver,
+        tenant: Tenant,
         neo4j_database: Optional[str] = None,
     ) -> None:
-        # 베이스는 driver/filter_query만 받는다. 라벨 스코핑은 각 sub-resolver의 filter_query가 한다.
+        # 베이스는 driver/filter_query만 받는다. 라벨·테넌트 스코핑은 각 sub-resolver의
+        # filter_query가 한다. 라벨 조건과 테넌트 조건을 AND로 잇는다.
         super().__init__(driver=driver)
         self.neo4j_database = neo4j_database
+        # filter_query는 파라미터 바인딩이 없는 raw WHERE 절이라 값이 그대로 박힌다.
+        # Tenant.of()가 user_id/work_id를 int로 강제하므로 여기 들어오는 문자열은
+        # 숫자와 콜론뿐이다(주입 불가).
+        tenant_cond = f"entity.tenant_id = '{tenant.id}'"
         self._resolvers = [
             CombiningFuzzyResolver(
                 driver=driver,
-                filter_query="WHERE entity:Character",
+                filter_query=f"WHERE entity:Character AND {tenant_cond}",
                 neo4j_database=neo4j_database,
             ),
             NormalizedExactMatchResolver(
                 driver=driver,
-                filter_query="WHERE entity:Item OR entity:Location OR entity:Organization",
+                filter_query=(
+                    "WHERE (entity:Item OR entity:Location OR entity:Organization) "
+                    f"AND {tenant_cond}"
+                ),
                 neo4j_database=neo4j_database,
             ),
         ]
@@ -380,7 +396,9 @@ class PerLabelResolver(EntityResolver):
         )
 
 
-async def collapse_merged_descriptions(driver: neo4j.Driver, database: str) -> None:
+async def collapse_merged_descriptions(
+    driver: neo4j.Driver, database: str, tenant: Tenant
+) -> None:
     """
     병합으로 배열이 된 description을 LLM으로 한 문자열로 합쳐 되돌린다.
 
@@ -396,12 +414,17 @@ async def collapse_merged_descriptions(driver: neo4j.Driver, database: str) -> N
     from src.service.index.extraction_pipeline import build_llm  # 지연 import: 순환 방지 + collapse 시에만 필요
 
     # description이 STRING이 아닌(= 배열로 combine된) 노드만 고른다.
+    # 테넌트로 좁히지 않으면 다른 소설의 병합 잔여물까지 LLM으로 합치게 된다 — 결과가
+    # 틀리진 않지만 남의 소설 때문에 내 인덱싱 비용이 늘고 시간이 길어진다.
     records, _, _ = driver.execute_query(
         """
         MATCH (n)
-        WHERE n.description IS NOT NULL AND NOT n.description IS :: STRING
+        WHERE n.description IS NOT NULL
+          AND NOT n.description IS :: STRING
+          AND n.tenant_id = $tenant_id
         RETURN elementId(n) AS id, n.name AS name, n.description AS descs
         """,
+        tenant.params(),
         database_=database,
     )
     if not records:

@@ -21,14 +21,15 @@ from neo4j_graphrag.experimental.components.entity_relation_extractor import (
     OnError,
 )
 from neo4j_graphrag.experimental.components.graph_pruning import GraphPruning
-from neo4j_graphrag.experimental.components.kg_writer import Neo4jWriter
 from neo4j_graphrag.experimental.components.resolver import EntityResolver
 from neo4j_graphrag.experimental.components.schema import SchemaBuilder
 from neo4j_graphrag.experimental.components.text_splitters.base import TextSplitter
 from neo4j_graphrag.experimental.pipeline import Pipeline
 from neo4j_graphrag.llm import OpenAILLM
 
+from src.common.tenant import Tenant
 from src.config import EMBEDDING_MODEL, EXTRACTION_MODEL
+from src.repository.neo4j.kg_writer import TenantTaggingWriter
 from src.service.index.extractor import KoreanWebNovelERTemplate, NovelContextExtractor
 
 # 반복 전달되는 프리픽스(스키마+few-shot)의 프롬프트 캐시 라우팅 안정화용 키.
@@ -80,6 +81,7 @@ def build_pipeline(
     resolver: EntityResolver,
     driver: neo4j.Driver,
     database: str,
+    tenant: Tenant,
     reasoning_effort: str | None = None,
     novel_context: str = "",
     clean_db: bool = True,
@@ -129,7 +131,13 @@ def build_pipeline(
     # Event/CharacterState도 name을 가져 resolver 매칭 대상에 들어온다) evidence.py는
     # evidence_chunk만 쓰므로, 이 시점에 지워도 이후 단계에 영향이 없다.
     pipe.add_component(
-        Neo4jWriter(driver=driver, neo4j_database=database, clean_db=clean_db), "writer"
+        # 기본 Neo4jWriter가 아니라 테넌트를 새겨 넣는 writer를 쓴다. 노드 생성과 테넌트
+        # 기록이 같은 upsert에 들어가야 "테넌트 없는 고아 노드"가 생기는 창이 없다
+        # (kg_writer.py의 모듈 주석 참고).
+        TenantTaggingWriter(
+            driver=driver, neo4j_database=database, clean_db=clean_db, tenant=tenant
+        ),
+        "writer",
     )
     pipe.add_component(resolver, "resolver")
 

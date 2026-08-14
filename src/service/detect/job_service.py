@@ -14,14 +14,16 @@ from fastapi import HTTPException
 from src.contradiction import save_report_files
 from src.contradiction.pipeline import check_new_episode_streaming
 from src.dto.detect_dto import DetectRequest, DetectStatus, JobAck
-from src.service.kg_scope import kg_scope, require_indexed_work
+from src.service.kg_scope import kg_scope
 
 logger = logging.getLogger("detect")
 
 _detect_jobs: dict[str, dict] = {}  # job_id -> {"status": ..., "claims": [...], "findings": [...]}
 
 
-async def _run_detect(job_id: str, work_id: int, episode_number: int, text: str) -> None:
+async def _run_detect(
+    job_id: str, user_id: int, work_id: int, episode_number: int, text: str
+) -> None:
     def on_claims_extracted(claims: list[dict]) -> None:
         # claim 추출 직후 시점 — 호출자가 이 시점부터 claim별 진행 목록을 그릴 수 있게 한다.
         # claim은 LLM이 만든 JSON이라 키가 있어도 값이 null일 수 있다. 기본값을 or로 씌워
@@ -31,7 +33,7 @@ async def _run_detect(job_id: str, work_id: int, episode_number: int, text: str)
                 "index": i,
                 "quote": c.get("quote") or "",
                 "category": c.get("category") or "기타",
-                "status": "running",
+                "status": "RUNNING",
                 "label": None,
                 "established_fact": None,
                 "source_episode": None,
@@ -44,7 +46,7 @@ async def _run_detect(job_id: str, work_id: int, episode_number: int, text: str)
         entry = _detect_jobs[job_id]["claims"][index]
         entry.update(
             {
-                "status": "done",
+                "status": "DONE",
                 "label": result.get("label"),
                 "established_fact": result.get("established_fact"),
                 "source_episode": result.get("source_episode"),
@@ -52,16 +54,16 @@ async def _run_detect(job_id: str, work_id: int, episode_number: int, text: str)
             }
         )
 
-    _detect_jobs[job_id]["status"] = "running"
+    _detect_jobs[job_id]["status"] = "RUNNING"
     try:
-        # 인덱싱 워커와 같은 이유로 여기서도 kg_scope를 통과시킨다 — 파이프라인이 보는 그래프의
-        # 작품 범위를 정하는 지점은 이 프로젝트에서 kg_scope 하나뿐이어야 한다.
-        kg_scope(work_id)
+        # 인덱싱 워커와 같은 이유로 여기서도 kg_scope를 통과시킨다 — 요청을 KG 테넌트로
+        # 바꾸는 지점은 이 프로젝트에서 kg_scope 하나뿐이어야 한다.
+        tenant = kg_scope(user_id, work_id)
         # episode_number를 파이프라인에 넘긴다. 이게 없으면 검사 대상 회차를 **자기 자신을 포함한
         # 그래프 전체**와 대조하게 된다 — 5화를 5화가 만든 사실과 비교해 "일치"라고 자평하고,
         # 6~10화가 나중에 밝힌 반전을 5화에 심어둔 모순으로 읽는다.
         findings = await check_new_episode_streaming(
-            text, episode_number, on_claims_extracted, on_claim_done
+            text, tenant, episode_number, on_claims_extracted, on_claim_done
         )
         # 리포트는 파일 두 개(md+json)를 쓴다 — 이벤트 루프에서 직접 쓰지 않는다.
         await asyncio.to_thread(
@@ -70,27 +72,27 @@ async def _run_detect(job_id: str, work_id: int, episode_number: int, text: str)
         # 결과와 상태를 한 번의 update로 쓴다. 조회 API(get_status)는 다른 스레드에서 도는데,
         # 두 줄로 나눠 쓰면 그 사이에 들어온 폴링이 status="done" + findings=null을 보고,
         # 호출자는 폴링을 멈춘 뒤 "오류 0건"인 빈 리포트를 확정 저장한다.
-        _detect_jobs[job_id].update({"findings": findings, "status": "done"})
+        _detect_jobs[job_id].update({"findings": findings, "status": "DONE"})
     except Exception as exc:  # noqa: BLE001 — 실패 사유를 상태로 노출해야 호출자가 보여줄 수 있다
         logger.exception("설정 오류 탐지 실패 | job_id=%s episode=%s", job_id, episode_number)
         # 같은 이유로 사유와 상태를 함께 쓴다(status="error" + detail=null을 보이지 않게).
-        _detect_jobs[job_id].update({"detail": str(exc), "status": "error"})
+        _detect_jobs[job_id].update({"detail": str(exc), "status": "ERROR"})
 
 
 async def submit(req: DetectRequest) -> JobAck:
     """설정 오류 탐지를 백그라운드로 시작하고 즉시 응답한다. 실제 검사(claim 추출 → claim별
     병렬 검증 → 판정 집계)는 이 요청의 커넥션과 무관하게 진행된다."""
-    require_indexed_work(req.work_id)
-
     known = _detect_jobs.get(req.job_id)
     if known is not None:
         # 인덱싱과 같은 이유(재시도 방어). 여기선 그래프가 더러워지진 않지만 회차 하나 검사에
         # 수십 번의 LLM 호출이 들어가므로 중복 실행 비용이 특히 크다.
         return JobAck(job_id=req.job_id, status=known["status"])
 
-    _detect_jobs[req.job_id] = {"status": "queued", "claims": []}
-    asyncio.create_task(_run_detect(req.job_id, req.work_id, req.episode_number, req.text))
-    return JobAck(job_id=req.job_id, status="queued")
+    _detect_jobs[req.job_id] = {"status": "QUEUED", "claims": []}
+    asyncio.create_task(
+        _run_detect(req.job_id, req.user_id, req.work_id, req.episode_number, req.text)
+    )
+    return JobAck(job_id=req.job_id, status="QUEUED")
 
 
 def get_status(job_id: str) -> DetectStatus:

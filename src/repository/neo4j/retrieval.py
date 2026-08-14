@@ -49,6 +49,7 @@ from neo4j_graphrag.types import RawSearchResult, RetrieverResultItem
 from src.repository.neo4j.chunk import CHUNK_FULLTEXT_INDEX, CHUNK_VECTOR_INDEX
 from src.repository.neo4j.client import DATABASE, get_driver
 from src.repository.neo4j.fact import FACT_FULLTEXT_INDEX, FACT_VECTOR_INDEX
+from src.common.tenant import Tenant
 from src.config import EMBEDDING_MODEL
 
 # ---------------------------------------------------------------------------
@@ -91,6 +92,12 @@ def _embedder() -> OpenAIEmbeddings:
 _LUCENE_SPECIAL = re.compile(r'([+\-&|!(){}\[\]^"~*?:\\/])')
 
 
+# 벡터 채널의 테넌트 후필터로 후보가 줄어드는 것을 벌충하는 배수. 인덱스는 전역이라
+# top_k개를 뽑으면 그중 남의 소설 몫이 섞여 있고, 후필터가 그만큼 깎아낸다.
+# 테넌트가 아주 많아지면 이 값으로도 부족해질 수 있다 — 필터 탈락률을 봐가며 조정한다.
+_TENANT_OVERSAMPLE = 4
+
+
 def _escape_lucene(query: str) -> str:
     """풀텍스트 인덱스에 넘길 질의의 Lucene 특수문자를 이스케이프한다."""
     return _LUCENE_SPECIAL.sub(r"\\\1", query)
@@ -98,14 +105,29 @@ def _escape_lucene(query: str) -> str:
 
 class _EscapedHybridCypherRetriever(HybridCypherRetriever):
     """
-    풀텍스트 채널에만 Lucene 이스케이프를 적용하는 HybridCypherRetriever.
+    테넌트로 좁히고 풀텍스트 채널에만 Lucene 이스케이프를 적용하는 HybridCypherRetriever.
 
-    이스케이프를 질의 문자열 전체에 미리 걸면 **임베딩까지 오염된다** — `\\[체력\\]` 같은
+    **이스케이프**: 질의 문자열 전체에 미리 걸면 **임베딩까지 오염된다** — `\\[체력\\]` 같은
     백슬래시투성이 문자열이 벡터 검색의 입력이 되어 의미가 흐려진다. 라이브러리는
     query_vector가 주어지면 그것을 벡터 검색에 쓰고 query_text는 풀텍스트에만 쓰므로
     (hybrid.py의 `if query_text and not query_vector` 분기), 임베딩을 **원문으로 먼저
     계산해 넘기고** query_text만 이스케이프하면 두 채널을 깔끔히 분리할 수 있다.
+
+    **테넌트**: 두 채널을 각각 다른 방법으로 좁힌다.
+      - 풀텍스트: Lucene 필드 한정 검색(`+tenant_ft:u42w7 +(검색어)`). 인덱스 안에서
+        걸러지므로 top_k가 남의 소설로 채워지지 않는다.
+      - 벡터: 벡터 인덱스에는 필드 개념이 없어 인덱스 단계에서 못 거른다. retrieval_query의
+        WHERE로 후필터하고, 그만큼 후보가 줄어드는 것을 effective_search_ratio로 벌충한다.
+
+    **이스케이프와 필터의 순서가 중요하다.** `_LUCENE_SPECIAL`은 `+`, `(`, `)`, `:`를 전부
+    이스케이프한다 — 필터 문법이 쓰는 문자 그대로다. 필터를 먼저 붙이고 이스케이프하면
+    `\\+tenant_ft\\:u42w7 ...`가 되어 **필터가 통째로 리터럴 검색어로 죽는다**(에러 없이
+    조용히). 그래서 사용자 질의만 이스케이프하고 필터는 그 바깥에서 조합한다.
     """
+
+    def __init__(self, *args, tenant: Tenant, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._tenant = tenant
 
     def get_search_results(
         self, query_text: str, query_vector: list[float] | None = None, **kwargs
@@ -113,11 +135,21 @@ class _EscapedHybridCypherRetriever(HybridCypherRetriever):
         if query_vector is None and query_text:
             # 임베딩은 이스케이프하지 않은 원문으로 계산한다.
             query_vector = self.embedder.embed_query(query_text)
+        # 후필터로 줄어드는 벡터 후보를 벌충한다. 테넌트가 늘수록 키워야 하는 값이라
+        # 상수로 박아두고, 필터 탈락률이 문제가 되면 설정으로 뺀다.
+        kwargs.setdefault("effective_search_ratio", _TENANT_OVERSAMPLE)
+        params = dict(kwargs.pop("query_params", None) or {})
+        params.update(self._tenant.params())
         return super().get_search_results(
-            query_text=_escape_lucene(query_text),
+            query_text=self._tenant_scoped_query(query_text),
             query_vector=query_vector,
+            query_params=params,
             **kwargs,
         )
+
+    def _tenant_scoped_query(self, query_text: str) -> str:
+        """풀텍스트 채널에 넘길 Lucene 질의. 필터는 이스케이프 **바깥**에서 조합한다."""
+        return f"+tenant_ft:{self._tenant.ft} +({_escape_lucene(query_text)})"
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +205,12 @@ def _build_chunk_query(include_graph: bool) -> str:
     같은 노드인지 확신할 수 없다(동명·동좌표 충돌 여지).
     """
     return f"""
+WITH node, score
+// 테넌트 후필터(방어선). 풀텍스트 채널은 Lucene 필드 한정으로 이미 걸러져 오지만
+// 벡터 채널은 인덱스 단계에서 못 거른다. 게다가 풀텍스트 인덱스를 tenant_ft 필드 없이
+// 다시 만들면 그쪽 필터도 조용히 무효가 된다 — 어느 쪽이 깨져도 남의 소설이 새지 않게
+// 여기서 한 번 더 막는다.
+WHERE node.tenant_id = $tenant_id
 WITH node, score
 OPTIONAL MATCH (node)-[:IN_CHAPTER]->(ch:Chapter){_CHUNK_GRAPH if include_graph else ""}
 RETURN
@@ -292,7 +330,9 @@ def _graph_result_formatter(record: neo4j.Record) -> RetrieverResultItem:
 _FT_INDEX = CHUNK_FULLTEXT_INDEX
 
 
-def build_hybrid_cypher_retriever(include_graph: bool = False) -> HybridCypherRetriever:
+def build_hybrid_cypher_retriever(
+    tenant: Tenant, include_graph: bool = False
+) -> HybridCypherRetriever:
     """
     벡터+풀텍스트 하이브리드 + 그래프 확장 retriever(청크 계층).
 
@@ -307,6 +347,7 @@ def build_hybrid_cypher_retriever(include_graph: bool = False) -> HybridCypherRe
         embedder=_embedder(),
         result_formatter=_graph_result_formatter,
         neo4j_database=DATABASE,
+        tenant=tenant,
     )
 
 
@@ -374,6 +415,7 @@ def _build_fact_query() -> str:
     """
     return f"""
 WITH node AS f, score
+WHERE f.tenant_id = $tenant_id   // 테넌트 후필터(방어선) — 청크 쿼리의 같은 자리 주석 참고
 {_FACT_CHAPTER_EVIDENCE}
 WITH f, score,
      coalesce(f.chapter, min(est.chapter), min(ck.chapter)) AS chapter,
@@ -457,7 +499,9 @@ def _fact_result_formatter(record: neo4j.Record) -> RetrieverResultItem:
     )
 
 
-def build_fact_search_retriever(include_graph: bool = False) -> HybridCypherRetriever:
+def build_fact_search_retriever(
+    tenant: Tenant, include_graph: bool = False
+) -> HybridCypherRetriever:
     """
     사실(Event/CharacterState) 계층 하이브리드 검색 retriever.
 
@@ -477,6 +521,7 @@ def build_fact_search_retriever(include_graph: bool = False) -> HybridCypherRetr
         embedder=_embedder(),
         result_formatter=_fact_result_formatter,
         neo4j_database=DATABASE,
+        tenant=tenant,
     )
 
 
@@ -490,6 +535,7 @@ def build_fact_search_retriever(include_graph: bool = False) -> HybridCypherRetr
 _ENTITY_PROFILE_QUERY = """
 MATCH (e)
 WHERE (e:Character OR e:Item OR e:Organization OR e:Location)
+  AND e.tenant_id = $tenant_id
   AND (e.name = $entity_name
        OR any(a IN split(coalesce(e.aliases, ''), ',') WHERE trim(a) = $entity_name))
 OPTIONAL MATCH (e)-[rel:RELATED_TO]-(oc:Character)
@@ -523,7 +569,7 @@ def _build_entity_facts_query(include_graph: bool) -> str:
     """
     return f"""
 MATCH (e) WHERE elementId(e) IN $eids
-MATCH (e)--(f) WHERE f:Event OR f:CharacterState
+MATCH (e)--(f) WHERE (f:Event OR f:CharacterState) AND f.tenant_id = $tenant_id
 {_FACT_CHAPTER_EVIDENCE}
 WITH e, f,
      coalesce(f.chapter, min(est.chapter), min(ck.chapter)) AS est_chapter,
@@ -558,9 +604,10 @@ class EntitySearchRetriever(Retriever):
     유사도 검색과 달리 닫힌 집합을 돌려주므로, "그 목록에 없다"는 부재 증명이 가능하다.
     """
 
-    def __init__(self, include_graph: bool = False) -> None:
+    def __init__(self, tenant: Tenant, include_graph: bool = False) -> None:
         # base Retriever가 Neo4j 버전을 검증하므로(VERIFY_NEO4J_VERSION=True) 유효한 드라이버가 필요하다.
         super().__init__(_driver(), neo4j_database=DATABASE)
+        self._tenant = tenant
         # 쿼리를 인스턴스에 굳혀 둔다 — get_search_results 시그니처에 넣으면 convert_to_tool이
         # 자동 추론해 LLM 파라미터로 노출해 버린다(base.py의 추론기엔 bool 분기가 없어
         # string으로 샌다). 켜고 끄는 건 호출자가 아니라 조립 시점의 결정이다.
@@ -582,7 +629,7 @@ class EntitySearchRetriever(Retriever):
         """
         profiles, _, _ = self.driver.execute_query(
             _ENTITY_PROFILE_QUERY,
-            {"entity_name": entity_name},
+            {"entity_name": entity_name, **self._tenant.params()},
             database_=self.neo4j_database,
             routing_=neo4j.RoutingControl.READ,
         )
@@ -593,7 +640,7 @@ class EntitySearchRetriever(Retriever):
         eids = [p["eid"] for p in profiles]
         facts, _, _ = self.driver.execute_query(
             self._facts_query,
-            {"eids": eids, "up_to_chapter": up_to_chapter},
+            {"eids": eids, "up_to_chapter": up_to_chapter, **self._tenant.params()},
             database_=self.neo4j_database,
             routing_=neo4j.RoutingControl.READ,
         )
@@ -681,9 +728,11 @@ class EntitySearchRetriever(Retriever):
         )
 
 
-def build_entity_search_retriever(include_graph: bool = False) -> "EntitySearchRetriever":
+def build_entity_search_retriever(
+    tenant: Tenant, include_graph: bool = False
+) -> "EntitySearchRetriever":
     """엔티티를 이름/별칭으로 정확 조회하는 커스텀 retriever."""
-    return EntitySearchRetriever(include_graph=include_graph)
+    return EntitySearchRetriever(tenant=tenant, include_graph=include_graph)
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +740,7 @@ def build_entity_search_retriever(include_graph: bool = False) -> "EntitySearchR
 # ---------------------------------------------------------------------------
 
 
-def build_retrievers(include_graph: bool = False) -> dict[str, Retriever]:
+def build_retrievers(tenant: Tenant, include_graph: bool = False) -> dict[str, Retriever]:
     """
     세 가지 retriever를 이름 → 인스턴스 dict로 조립해 반환한다.
 
@@ -703,13 +752,13 @@ def build_retrievers(include_graph: bool = False) -> dict[str, Retriever]:
     반복돼 실측상 근거 토큰의 2/3를 차지했다. 도달률은 부록을 떼도 불변이었다.
     """
     return {
-        "hybrid_cypher": build_hybrid_cypher_retriever(include_graph),
-        "fact_search": build_fact_search_retriever(include_graph),
-        "entity_search": build_entity_search_retriever(include_graph),
+        "hybrid_cypher": build_hybrid_cypher_retriever(tenant, include_graph),
+        "fact_search": build_fact_search_retriever(tenant, include_graph),
+        "entity_search": build_entity_search_retriever(tenant, include_graph),
     }
 
 
-def build_retrieval_tools(include_graph: bool = False) -> list:
+def build_retrieval_tools(tenant: Tenant, include_graph: bool = False) -> list:
     """
     각 retriever를 LLM 에이전트용 Tool(neo4j_graphrag.tool.Tool)로 감싼 리스트를 반환한다.
 
@@ -720,7 +769,7 @@ def build_retrieval_tools(include_graph: bool = False) -> list:
     include_graph는 여기서 소비되고 끝난다 — 도구 파라미터가 아니라 조립 시점의 결정이라
     LLM에는 보이지 않는다(build_retrievers 참고).
     """
-    retrievers = build_retrievers(include_graph)
+    retrievers = build_retrievers(tenant, include_graph)
 
     tools = []
 

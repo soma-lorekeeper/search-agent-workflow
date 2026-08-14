@@ -22,8 +22,9 @@ from __future__ import annotations
 from neo4j_graphrag.embeddings import OpenAIEmbeddings
 from neo4j_graphrag.indexes import create_vector_index
 
-from src.repository.neo4j.chunk import EMBEDDING_DIMENSIONS
+from src.common.tenant import Tenant
 from src.config import EMBEDDING_MODEL
+from src.repository.neo4j.chunk import EMBEDDING_DIMENSIONS
 
 # 사실 계층 보조 라벨과 인덱스 이름. retrieval.py가 이 상수들을 단일 출처로 import한다.
 FACT_LABEL = "Fact"
@@ -39,7 +40,7 @@ def _fact_text(name: str | None, description: str | None) -> str:
     return ": ".join(parts)
 
 
-def ensure_fact_layer(driver, database: str) -> int:
+def ensure_fact_layer(driver, database: str, tenant: Tenant) -> int:
     """
     Event/CharacterState에 `:Fact` 라벨 부여 + 임베딩 백필 + 인덱스 2종 보장.
 
@@ -53,15 +54,20 @@ def ensure_fact_layer(driver, database: str) -> int:
     반환: 이번 호출에서 새로 임베딩한 노드 수.
     """
     # 1. 보조 라벨 부여(기존 라벨은 유지되고 :Fact가 추가되기만 한다).
+    #    테넌트로 좁히는 건 정합성보다 비용 문제다 — 라벨 SET은 멱등이라 남의 노드에 다시
+    #    붙여도 해롭지 않지만, 테넌트가 늘수록 매 인덱싱이 그래프 전체를 훑게 된다.
     driver.execute_query(
-        f"MATCH (f) WHERE f:Event OR f:CharacterState SET f:{FACT_LABEL}",
+        f"MATCH (f) WHERE (f:Event OR f:CharacterState) AND f.tenant_id = $tenant_id "
+        f"SET f:{FACT_LABEL}",
+        tenant.params(),
         database_=database,
     )
 
     # 2. 임베딩 백필. 아직 벡터가 없는 노드만 골라 name+description을 임베딩한다.
     records, _, _ = driver.execute_query(
-        f"MATCH (f:{FACT_LABEL}) WHERE f.embedding IS NULL "
+        f"MATCH (f:{FACT_LABEL}) WHERE f.embedding IS NULL AND f.tenant_id = $tenant_id "
         "RETURN elementId(f) AS eid, f.name AS name, f.description AS description",
+        tenant.params(),
         database_=database,
     )
     embedder = OpenAIEmbeddings(model=EMBEDDING_MODEL)
@@ -94,10 +100,12 @@ def ensure_fact_layer(driver, database: str) -> int:
     )
 
     # 4. 풀텍스트 인덱스 보장. 라이브러리 create_fulltext_index는 analyzer를 지정할 수 없어
-    #    raw Cypher로 cjk를 준다(chunks.py와 같은 이유). name과 description 둘 다 인덱싱한다.
+    #    raw Cypher로 cjk를 준다(chunk.py와 같은 이유). name과 description 둘 다 인덱싱한다.
+    #    tenant_ft가 필드에 있어야 `+tenant_ft:u42w7 +(검색어)`로 인덱스 안에서 테넌트를
+    #    거를 수 있다(chunk.py의 같은 자리 주석 참고).
     driver.execute_query(
         f"CREATE FULLTEXT INDEX {FACT_FULLTEXT_INDEX} IF NOT EXISTS "
-        f"FOR (n:{FACT_LABEL}) ON EACH [n.name, n.description] "
+        f"FOR (n:{FACT_LABEL}) ON EACH [n.name, n.description, n.tenant_ft] "
         f"OPTIONS {{ indexConfig: {{ `fulltext.analyzer`: '{FACT_FULLTEXT_ANALYZER}' }} }}",
         database_=database,
     )
