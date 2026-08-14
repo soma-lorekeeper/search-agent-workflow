@@ -47,7 +47,7 @@ from src.common import usage
 from src.common.tenant import Tenant
 from src.service.retrieval_tools import build_openai_tools, format_tool_result
 
-# Neo4j가 RELATED_TO 관계 부재(알려진 갭)를 매 쿼리마다 경고로 뱉어 출력을 뒤덮는다.
+# Neo4j가 그래프에 아직 없는 라벨·관계를 쿼리가 언급하면 매번 경고를 뱉어 출력을 뒤덮는다.
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
 EXTRACT_MODEL = "gpt-5.6-luna"  # 기계적 형태 판정이라는 가설 — reasoning_effort 미지정이 기본

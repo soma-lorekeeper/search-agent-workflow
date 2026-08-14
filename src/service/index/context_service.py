@@ -64,9 +64,11 @@ def dump_graph_text(driver, database: str, tenant: Tenant) -> str:
     현재 DB의 도메인 노드/관계를 엔티티 중심 중첩 텍스트로 직렬화한다.
 
     - 관계는 전부 노드 줄에 인라인한다(별도 '## 관계' 섹션 없음):
-        Character 하위에 상태(HAS_STATE, 그 안에 ESTABLISHED_IN 회차·ABOUT 대상)와
-        인물 관계(RELATED_TO)를 중첩, Event 줄에 장소(HOSTS)·참여(APPEARS_IN) 인라인,
+        Character 하위에 상태(HAS_STATE, 그 안에 ESTABLISHED_IN 회차·ABOUT 대상)를 중첩,
+        Event 줄에 장소(HOSTS)·참여(APPEARS_IN) 인라인,
         Location/Organization 줄에 상위(LOCATED_IN/PART_OF) 인라인.
+        인물 사이의 관계는 별도 간선이 아니라 ABOUT이 상대 인물을 가리키는 상태이므로,
+        상태 줄의 '대상:' 항목으로 함께 실린다.
         어떤 규칙에도 안 걸리는 관계 타입은 출발 노드 하위에 일반형으로 인라인.
     - Event/CharacterState는 이름·구조 정보만 싣고 description은 제외한다(덤프 크기의
         대부분을 차지하는 서술을 빼 선형 증가를 억제). CharacterState의 성립 회차는
@@ -134,7 +136,7 @@ def dump_graph_text(driver, database: str, tenant: Tenant) -> str:
     # 인라인 규칙이 소화하는 관계 타입. 이 밖의 타입은 출발 노드 하위에 일반형으로 인라인.
     _HANDLED = {
         "HAS_STATE", "ESTABLISHED_IN", "ABOUT", "APPEARS_IN",
-        "HOSTS", "LOCATED_IN", "PART_OF", "RELATED_TO",
+        "HOSTS", "LOCATED_IN", "PART_OF",
     }
 
     def _generic_rel_lines(nid: str, indent: str = "  ") -> list[str]:
@@ -185,14 +187,8 @@ def dump_graph_text(driver, database: str, tenant: Tenant) -> str:
                 (t for typ, t, _ in outs[cid] if typ == "HAS_STATE"),
                 key=lambda sid: (state_chapter.get(sid) or 0, _name_of(props_of[sid])),
             )
+            # 인물 사이의 관계도 상태다(ABOUT→Character) — 위 줄이 대상까지 함께 싣는다.
             lines.extend(_state_line(sid) for sid in state_ids)
-            # 인물 관계(RELATED_TO).
-            for typ, t, rprops in outs[cid]:
-                if typ != "RELATED_TO":
-                    continue
-                prop_str = ", ".join(f"{k}={v}" for k, v in rprops.items() if v)
-                suffix = f" — {prop_str}" if prop_str else ""
-                lines.append(f"  · 관계: {_name_of(props_of[t])}와 RELATED_TO{suffix}")
             lines.extend(_generic_rel_lines(cid))
 
         # 소유자(HAS_STATE) 없는 고아 상태도 한 번은 등장해야 한다(무손실).

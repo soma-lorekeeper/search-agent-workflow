@@ -4,8 +4,11 @@ KG 스키마 정의 모듈.
 웹소설 회차를 누적 인덱싱하기 위한 도메인 스키마를 정의한다. 범위는 다음과 같다.
   - 엔티티: Character / Location / Event / Organization / Item
   - 상태 변화: CharacterState(인물이 특정 시점부터 갖는 상태) + HAS_STATE / ESTABLISHED_IN
-  - 대상 지시: 소유·소속·역할처럼 대상이 있는 상태는 ABOUT으로 그 노드를 직접 가리킨다
-               (문자열이 아닌 그래프 노드로 식별해 '이 사물의 현재 소유자' 같은 조회를 가능케 함)
+  - 대상 지시: 소유·소속·역할·인물 관계처럼 대상이 있는 상태는 ABOUT으로 그 노드를 직접 가리킨다
+               (문자열이 아닌 그래프 노드로 식별해 '이 사물의 현재 소유자' 같은 조회를 가능케 함).
+               인물↔인물 관계도 직접 간선을 두지 않고 양쪽의 CharacterState를 거쳐 잇는다 —
+               관계에도 성립 시점(ESTABLISHED_IN)과 근거(EVIDENCED_BY)가 붙고, 관계가 바뀌면
+               새 상태 노드가 쌓여 이력이 남는다(간선 속성은 그 어느 것도 못 한다).
   - 시간·공간 구조: Event.chapter / story_order, Location의 LOCATED_IN 계층
   - 근거(provenance): evidence_chunk → EVIDENCED_BY(아래 별도 주석 참고)
 
@@ -35,7 +38,8 @@ CHARACTER = NodeType(
     additional_properties=False,
     description=(
         "소설에 등장하는 인물. 이 노드는 '누구인가'를 식별하는 자리이고, 그 인물에 관한 사실·상태는 "
-        "변하든 변하지 않든 전부 CharacterState로 둔다(나이·신분·소속·능력·부상·생사·소유·역할 등). "
+        "변하든 변하지 않든 전부 CharacterState로 둔다(나이·신분·소속·능력·부상·생사·소유·역할·"
+        "다른 인물과의 관계 등). "
         "한 번 만든 뒤 값을 갱신하지 않는 정적 식별자 노드다. "
         "서사적으로 의미 있는 인물만 만든다(지나가는 행인·단역 같은 이름 없는 엑스트라는 제외)."
     ),
@@ -166,6 +170,10 @@ CHARACTER_STATE = NodeType(
         "인물에 관한 사실은 Character.description에만 남기지 말고 반드시 이 노드로도 만든다. "
         "대상이 있는 상태는 그 대상을 ABOUT으로 직접 가리킨다: 소지품 소유는 ABOUT→Item, 조직 소속은 "
         "ABOUT→Organization, 작품의 저자·독자·제작자 같은 역할도 ABOUT→Item(대상은 문자열이 아니라 노드로 식별). "
+        "**인물 사이의 관계(사제·동맹·적대·혈연·연인·동료 등)도 이 상태로 만들고 ABOUT→Character로 상대를 "
+        "가리킨다.** 관계는 두 사람 각자의 상태이므로 **양쪽을 모두 만든다** — A가 B의 스승이면 A에게 "
+        "'B의 스승'을, B에게 'A의 제자'를 각각 만들어 서로를 ABOUT으로 가리키게 한다(한쪽만 만들면 "
+        "그 인물을 조회했을 때 관계가 보이지 않는다). 각 상태의 name은 그 사람 입장에서 읽히게 쓴다. "
         "소지품이 인물 간 이동하면 넘긴 인물과 받은 인물의 상태를 각각 만든다. "
         "'회사원'·'계약직' 같은 신분·고용형태는 소속과 별개의 상태로 분리한다. "
         "제외 기준은 '변하는가'가 아니라 **지속되는가·서사적으로 의미가 있는가**다 — 일시적 통증·피로처럼 "
@@ -182,7 +190,7 @@ CHARACTER_STATE = NodeType(
             description=(
                 "이 인물에 관한 사실·상태를 그 자체로 읽히게 서술한다(예: '어깨를 칼날에 깊게 베임', "
                 "'대한물산 인사팀에 계약직으로 소속', '코인 6200 보유', '탑의 문의 유일한 독자', "
-                "'스물여덟 살', '청일고교 2학년'). "
+                "'스물여덟 살', '청일고교 2학년', '진자강의 제자'). "
                 "원문 문장을 그대로 옮기지 말고 상태로 압축하되, 무엇에 관한 상태인지 알 수 있을 만큼 "
                 "구체적으로 쓴다 — 이 노드만 따로 읽혔을 때도 뜻이 통해야 한다(성립 정황은 description이 담당). "
                 "대상이 있는 상태는 그 대상 노드를 ABOUT으로 함께 잇는다."
@@ -306,39 +314,13 @@ PART_OF = RelationshipType(
     ),
 )
 
-RELATED_TO = RelationshipType(
-    label="RELATED_TO",
-    additional_properties=False,
-    description=(
-        "인물↔인물의 서사적 관계(동맹·적대·사제·혈연·연인 등). 종류는 type 속성에. 방향은 주체→대상(상호적 관계는 "
-        "한 방향만). 현재 확립된 관계만 담는다(시점 추적이 필요하면 CharacterState로). "
-        "작품의 저작·소비처럼 사물을 매개로 한 역할은 사람-사람 관계가 아니므로 이 관계로 묶지 말고, 각자를 그 "
-        "사물에 대한 CharacterState로 만든다(작가와 독자를 이 관계로 평탄화하지 않는다)."
-    ),
-    properties=[
-        PropertyType(
-            name="type",
-            type="STRING",
-            description="관계 종류를 짧게(예: 동맹, 적대, 사제, 혈연, 연인). 같은 종류는 항상 같은 표현으로 통일한다.",
-        ),
-        PropertyType(
-            name="description",
-            type="STRING",
-            description=(
-                "이 관계에 대한 짧은 부연(예: '어린 시절 같은 스승 밑에서 수학'). 없으면 생략 가능. "
-                "구조로 표현 가능한 사실은 여기에만 두지 말고 반드시 해당 노드/관계로도 만든다 — "
-                "부연에 등장하는 인물·조직·사물도 노드로 존재해야 한다."
-            ),
-        ),
-    ],
-)
-
 ABOUT = RelationshipType(
     label="ABOUT",
     description=(
         "CharacterState가 어떤 외부 대상에 관한 것인지 그 노드로 직접 가리킨다 — 소유·역할 상태는 Item, "
-        "소속 상태는 Organization. 덕분에 대상을 문자열이 아닌 그래프 노드로 식별한다('이 사물의 현재 소유자', "
-        "'이 작품의 저자', '이 조직의 구성원' 조회). 부상·생사·능력처럼 외부 대상이 없는 상태에는 만들지 않는다."
+        "소속 상태는 Organization, **인물 관계 상태는 상대 Character**. 덕분에 대상을 문자열이 아닌 "
+        "그래프 노드로 식별한다('이 사물의 현재 소유자', '이 작품의 저자', '이 조직의 구성원', "
+        "'이 인물과 관계된 사람' 조회). 부상·생사·능력처럼 외부 대상이 없는 상태에는 만들지 않는다."
     ),
 )
 
@@ -356,9 +338,9 @@ PATTERNS = [
     ("CharacterState", "ESTABLISHED_IN", "Event"),
     ("Location", "LOCATED_IN", "Location"),
     ("Organization", "PART_OF", "Organization"),
-    ("Character", "RELATED_TO", "Character"),
     ("CharacterState", "ABOUT", "Item"),             # 소유·역할(저자/독자/제작자) 대상
     ("CharacterState", "ABOUT", "Organization"),     # 소속 대상
+    ("CharacterState", "ABOUT", "Character"),        # 인물 관계(사제·동맹·혈연 등) 대상
 ]
 
 # --- 스키마 조립 ---
@@ -367,8 +349,7 @@ PATTERNS = [
 
 NODE_TYPES = [CHARACTER, LOCATION, EVENT, CHARACTER_STATE, ORGANIZATION, ITEM]
 RELATIONSHIP_TYPES = [
-    APPEARS_IN, HOSTS, HAS_STATE, ESTABLISHED_IN, LOCATED_IN, PART_OF,
-    RELATED_TO, ABOUT,
+    APPEARS_IN, HOSTS, HAS_STATE, ESTABLISHED_IN, LOCATED_IN, PART_OF, ABOUT,
 ]
 
 SCHEMA: GraphSchema = SchemaBuilder.create_schema_model(

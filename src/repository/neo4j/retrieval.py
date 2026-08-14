@@ -26,8 +26,8 @@ neo4j-graphrag의 base `Retriever`를 상속하거나 그 구현체이며, LLM �
   - 이웃 서브그래프(`[관련 그래프]` 부록)는 **기본으로 수집하지 않는다**(include_graph=False).
     판정에 필요한 관계는 이미 본문에 흡수돼 있고(참가자 목록·근거 원문·[관련인물]/[상위]),
     부록은 같은 인물 설명이 결과마다 반복돼 근거 토큰의 2/3를 차지했다. 켜면 1-hop 도메인
-    이웃과 '사실을 완성하는' 2-hop 관계(ESTABLISHED_IN/ABOUT/HOSTS/RELATED_TO/LOCATED_IN/
-    PART_OF)까지 화이트리스트로 확장한다 — 참가자→그들의 상태로 재확장하지는 않는다.
+    이웃과 '사실을 완성하는' 2-hop 관계(ESTABLISHED_IN/ABOUT/HOSTS/LOCATED_IN/PART_OF)까지
+    화이트리스트로 확장한다 — 참가자→그들의 상태로 재확장하지는 않는다.
     **사실 계층(fact_search)에는 이 부록이 아예 없다.** 설명문을 통째로 나르는 대신
     이름 수준의 `[연관]` 줄(_FACT_RELATED)로 대체했다 — 사실 1개당 0.42개만 늘어난다.
 """
@@ -174,7 +174,7 @@ class _EscapedHybridCypherRetriever(HybridCypherRetriever):
 # 1) 청크 계층 retrieval_query (VectorCypher·HybridCypher 공용)
 # ---------------------------------------------------------------------------
 # 앵커 Chunk(`node`)에서 EVIDENCED_BY 역방향으로 사실을 모으고, 각 사실에서 1-hop 도메인
-# 이웃(+RELATED_TO 인물, LOCATED_IN 상위 장소, PART_OF 상위 조직)으로 확장한 뒤 그 노드 집합
+# 이웃(+관계 상태를 거친 상대 인물, LOCATED_IN 상위 장소, PART_OF 상위 조직)으로 확장한 뒤 그 노드 집합
 # 내부의 관계만 추리는 무거운 절. include_graph=False면 통째로 빠진다 — 남는 건 IN_CHAPTER
 # 한 줄이라 쿼리 자체가 크게 가벼워진다.
 _CHUNK_GRAPH = """
@@ -186,7 +186,10 @@ CALL (facts) {
   MATCH (f)--(nbr)
   WHERE nbr:Character OR nbr:Location OR nbr:Organization
         OR nbr:Item OR nbr:Event OR nbr:CharacterState
-  OPTIONAL MATCH (nbr)-[:RELATED_TO]-(rc:Character)
+  // 관계 상대. 인물 관계는 직접 간선이 아니라 상태를 거치므로 2홉이다
+  // (A)-[:HAS_STATE]->(:CharacterState)-[:ABOUT]->(B). 양방향으로 만들어지지만
+  // 한쪽이 빠진 경우에도 잡히도록 방향을 두지 않는다.
+  OPTIONAL MATCH (nbr)-[:HAS_STATE|ABOUT]-(:CharacterState)-[:ABOUT]-(rc:Character)
   OPTIONAL MATCH (nbr)-[:LOCATED_IN*1..]->(pl:Location)
   OPTIONAL MATCH (nbr)-[:PART_OF*1..]->(po:Organization)
   UNWIND [nbr, rc, pl, po] AS x
@@ -377,7 +380,7 @@ def build_hybrid_cypher_retriever(
 # 사실(f)에서 뻗는 이웃 확장. fact_search와 entity_search가 공유한다.
 #   1-hop: 사실에 직접 붙은 도메인 노드(참가자·무대·대상 등)만 화이트리스트로 받는다.
 #   2-hop: 그 이웃에서 '사실을 완성하는' 관계만 한 번 더 탄다 — 상태가 성립한 사건
-#          (ESTABLISHED_IN), 상태의 대상(ABOUT), 사건의 무대(HOSTS), 인물 관계(RELATED_TO),
+#          (ESTABLISHED_IN), 상태의 대상(ABOUT — 사물·조직·관계 상대), 사건의 무대(HOSTS),
 #          상위 장소·조직(LOCATED_IN/PART_OF).
 # APPEARS_IN/HAS_STATE로는 2-hop을 타지 않는다. 타면 '사건 → 다른 참가자 → 그들의 모든 상태'로
 # 번져서, 김독자처럼 사건 수십 개에 참여하는 인물에서 그래프 절반이 딸려온다.
@@ -386,7 +389,10 @@ _FACT_NEIGHBORS = """
   WHERE nbr:Character OR nbr:Location OR nbr:Organization
         OR nbr:Item OR nbr:Event OR nbr:CharacterState
   OPTIONAL MATCH (nbr)-[:ESTABLISHED_IN|ABOUT|HOSTS]->(w)
-  OPTIONAL MATCH (nbr)-[:RELATED_TO]-(rc:Character)
+  // 관계 상대. 인물 관계는 직접 간선이 아니라 상태를 거치므로 2홉이다
+  // (A)-[:HAS_STATE]->(:CharacterState)-[:ABOUT]->(B). 양방향으로 만들어지지만
+  // 한쪽이 빠진 경우에도 잡히도록 방향을 두지 않는다.
+  OPTIONAL MATCH (nbr)-[:HAS_STATE|ABOUT]-(:CharacterState)-[:ABOUT]-(rc:Character)
   OPTIONAL MATCH (nbr)-[:LOCATED_IN*1..]->(pl:Location)
   OPTIONAL MATCH (nbr)-[:PART_OF*1..]->(po:Organization)
   UNWIND [nbr, w, rc, pl, po] AS x
@@ -405,20 +411,25 @@ OPTIONAL MATCH (f)-[:EVIDENCED_BY]->(ck:Chunk)
 # 사실이 어떤 도메인 노드와 묶여 있는지를 **이름으로만** 딸고 오는 절. 사실 타입마다 붙는
 # 관계가 다르므로 갈라서 받는다(schema.PATTERNS와 1:1이다).
 #   Event         ← (Location)-[:HOSTS]->     무대가 된 장소
-#   CharacterState → -[:ABOUT]-> Item|Organization  소유물·소속 조직처럼 상태가 가리키는 대상
-# 인물은 위쪽 participants가 이미 담당하므로 여기서 다시 받지 않는다.
+#   CharacterState → -[:ABOUT]-> Item|Organization|Character
+#                     소유물·소속 조직처럼 상태가 가리키는 대상, 그리고 **관계의 상대 인물**.
+# participants(APPEARS_IN/HAS_STATE로 이 사실에 얽힌 인물)와는 다른 축이다 — 그쪽은 "이 사실에
+# 누가 관여했나"이고 여기는 "이 상태가 누구를 향한 것인가"다. 관계 상태('진자강의 제자')는
+# 대상을 여기서만 얻는다.
 #
 # 설명문(description)을 싣지 않는 것이 요점이다. 예전 `[관련 그래프]` 부록은 같은 인물 설명이
 # 결과마다 반복돼 근거 토큰의 2/3를 차지했는데, 판정에 실제로 필요한 건 "이 사실이 어느 조직·
 # 물건·장소에 묶여 있나"라는 이름 수준의 연결뿐이다. 실측으로 사실 1개당 0.42개만 늘어난다.
 _FACT_RELATED = """
 OPTIONAL MATCH (loc:Location)-[:HOSTS]->(f) WHERE f:Event
-OPTIONAL MATCH (f)-[:ABOUT]->(tgt) WHERE f:CharacterState AND (tgt:Item OR tgt:Organization)
+OPTIONAL MATCH (f)-[:ABOUT]->(tgt)
+  WHERE f:CharacterState AND (tgt:Item OR tgt:Organization OR tgt:Character)
 WITH f, score, chapter, evidence, participants,
      [x IN collect(DISTINCT {name: loc.name, label: 'Location', rel: 'HOSTS'})
       WHERE x.name IS NOT NULL]
      + [x IN collect(DISTINCT {name: tgt.name, rel: 'ABOUT',
-                               label: head([l IN labels(tgt) WHERE l IN ['Item', 'Organization']])})
+                               label: head([l IN labels(tgt)
+                                            WHERE l IN ['Item', 'Organization', 'Character']])})
         WHERE x.name IS NOT NULL] AS related
 """
 
@@ -559,9 +570,23 @@ WHERE (e:Character OR e:Item OR e:Organization OR e:Location)
   AND e.tenant_id = $tenant_id
   AND (e.name = $entity_name
        OR any(a IN split(coalesce(e.aliases, ''), ',') WHERE trim(a) = $entity_name))
-OPTIONAL MATCH (e)-[rel:RELATED_TO]-(oc:Character)
-WITH e, [r IN collect(DISTINCT {name: oc.name, type: rel.type, description: rel.description})
-         WHERE r.name IS NOT NULL] AS related_characters
+// 관계 상대. 인물 관계는 직접 간선이 아니라 상태를 거친다:
+//   (e)-[:HAS_STATE]->(rs:CharacterState)-[:ABOUT]->(oc:Character)
+// 상태 이름('진자강의 제자')이 예전 관계 간선의 type 자리를 대신한다 — 그쪽이 '사제' 같은
+// 분류어였다면 이쪽은 그 사람 입장에서 읽히는 서술이라 오히려 정보가 는다.
+//
+// 이 인물 **자신의** 상태를 먼저 모은다. 스키마가 관계를 양쪽에 만들도록 요구하므로
+// 정상적인 그래프에서는 이것만으로 충분하다.
+OPTIONAL MATCH (e)-[:HAS_STATE]->(rs:CharacterState)-[:ABOUT]->(oc:Character)
+WITH e, [r IN collect(DISTINCT {name: oc.name, type: rs.name, description: rs.description})
+         WHERE r.name IS NOT NULL] AS own_rel
+// 상대 쪽에만 상태가 생긴 경우의 안전망. 이미 잡힌 인물은 뺀다 — 안 그러면 양방향으로
+// 제대로 만들어진 관계가 같은 상대를 두 번 내보낸다.
+OPTIONAL MATCH (e)<-[:ABOUT]-(rs2:CharacterState)<-[:HAS_STATE]-(oc2:Character)
+WITH e, own_rel,
+     [r IN collect(DISTINCT {name: oc2.name, type: rs2.name, description: rs2.description})
+      WHERE r.name IS NOT NULL AND NOT r.name IN [x IN own_rel | x.name]] AS other_rel
+WITH e, own_rel + other_rel AS related_characters
 OPTIONAL MATCH (e)-[:LOCATED_IN*1..]->(pl:Location)
 OPTIONAL MATCH (e)-[:PART_OF*1..]->(po:Organization)
 RETURN 'profile' AS kind, elementId(e) AS eid, labels(e) AS entity_labels,

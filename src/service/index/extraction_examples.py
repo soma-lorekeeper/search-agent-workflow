@@ -42,7 +42,7 @@ EXTRACTION_FEW_SHOT = r"""
   {"type": "ABOUT", "start_node_id": "6", "end_node_id": "3", "properties": {}}
 ]}
 
-예시 2 (무협 — 같은 회차 두 사건을 story_order 12.0/12.1로 순서 부여, 별칭은 aliases로, 소속(Organization+ABOUT), 사제 관계, 무공)
+예시 2 (무협 — 같은 회차 두 사건을 story_order 12.0/12.1로 순서 부여, 별칭은 aliases로, 소속(Organization+ABOUT), **인물 관계를 양쪽 CharacterState+ABOUT→Character로**, 무공)
 
 입력 텍스트:
 [chapter:12]
@@ -56,21 +56,29 @@ EXTRACTION_FEW_SHOT = r"""
   {"id": "3", "label": "Event", "properties": {"name": "청운의 화산파 입문", "description": "청운이 화산파에 정식으로 입문했다. 입문 경위나 조건은 원문에 서술되지 않는다.", "chapter": 12, "story_order": 12.0, "evidence_chunk": "C0"}},
   {"id": "4", "label": "Event", "properties": {"name": "진자강의 매화검법 전수와 청운의 대성", "description": "청운의 사부인 검선 진자강이 매화검법을 전수했고, 청운이 마침내 그것을 대성했다.", "chapter": 12, "story_order": 12.1, "evidence_chunk": "C1"}},
   {"id": "5", "label": "CharacterState", "properties": {"name": "화산파에 정식 입문", "description": "청운이 화산파의 정식 문인이 되었다. 입문 경위는 원문에 서술되지 않는다.", "evidence_chunk": "C0"}},
-  {"id": "6", "label": "CharacterState", "properties": {"name": "매화검법 대성", "description": "사부 검선 진자강에게 매화검법을 전수받아 마침내 대성했다.", "evidence_chunk": "C1"}}
+  {"id": "6", "label": "CharacterState", "properties": {"name": "매화검법 대성", "description": "사부 검선 진자강에게 매화검법을 전수받아 마침내 대성했다.", "evidence_chunk": "C1"}},
+  {"id": "7", "label": "CharacterState", "properties": {"name": "진자강의 제자", "description": "청운이 검선 진자강을 사부로 두고 매화검법을 전수받았다.", "evidence_chunk": "C1"}},
+  {"id": "8", "label": "CharacterState", "properties": {"name": "청운의 사부", "description": "진자강이 청운의 사부로서 매화검법을 전수했다.", "evidence_chunk": "C1"}}
 ],
 "relationships": [
   {"type": "APPEARS_IN", "start_node_id": "0", "end_node_id": "3", "properties": {}},
   {"type": "APPEARS_IN", "start_node_id": "0", "end_node_id": "4", "properties": {}},
   {"type": "APPEARS_IN", "start_node_id": "1", "end_node_id": "4", "properties": {}},
-  {"type": "RELATED_TO", "start_node_id": "0", "end_node_id": "1", "properties": {"type": "사제", "description": "청운이 진자강의 제자로 매화검법을 전수받음"}},
   {"type": "HAS_STATE", "start_node_id": "0", "end_node_id": "5", "properties": {}},
   {"type": "ESTABLISHED_IN", "start_node_id": "5", "end_node_id": "3", "properties": {}},
   {"type": "ABOUT", "start_node_id": "5", "end_node_id": "2", "properties": {}},
   {"type": "HAS_STATE", "start_node_id": "0", "end_node_id": "6", "properties": {}},
-  {"type": "ESTABLISHED_IN", "start_node_id": "6", "end_node_id": "4", "properties": {}}
+  {"type": "ESTABLISHED_IN", "start_node_id": "6", "end_node_id": "4", "properties": {}},
+  {"type": "HAS_STATE", "start_node_id": "0", "end_node_id": "7", "properties": {}},
+  {"type": "ESTABLISHED_IN", "start_node_id": "7", "end_node_id": "4", "properties": {}},
+  {"type": "ABOUT", "start_node_id": "7", "end_node_id": "1", "properties": {}},
+  {"type": "HAS_STATE", "start_node_id": "1", "end_node_id": "8", "properties": {}},
+  {"type": "ESTABLISHED_IN", "start_node_id": "8", "end_node_id": "4", "properties": {}},
+  {"type": "ABOUT", "start_node_id": "8", "end_node_id": "0", "properties": {}}
 ]}
 (주의 1: '검선'은 진자강을 부르는 다른 호칭이므로 aliases에 넣는다 — description에 '검선이라 불리는'처럼 서술로 묻어 두지 않는다.
-주의 2: id3 '청운의 화산파 입문'의 근거 원문은 "청운은 화산파에 정식 입문했다" 한 문장뿐이다. description은 이 문장이 주는 것만 풀어 쓰고, 입문 경위·조건처럼 원문에 없는 정황은 '원문에 서술되지 않는다'로 한계를 명시할 뿐 지어내지 않는다 — name을 어미만 바꿔 되풀이하거나 없는 정황을 채우느니 짧게 끝내는 편이 옳다. 단, 원문이 단서·암시를 주는 경우에는 '~로 암시된다'처럼 암시 수준으로 쓰고, '원문에 서술되지 않는다'는 아무 단서도 없을 때만 쓴다.)
+주의 2: 사제 관계를 두 인물 사이의 간선 하나로 두지 않고 **양쪽의 CharacterState 두 개**(id7 '진자강의 제자', id8 '청운의 사부')로 만들어 서로를 ABOUT으로 가리키게 했다. 한쪽만 만들면 다른 인물을 조회했을 때 그 관계가 보이지 않는다. 각 상태의 name은 그 사람 입장에서 읽히게 쓰고, 관계에도 성립 시점(ESTABLISHED_IN)과 근거(evidence_chunk)를 붙인다.
+주의 3: id3 '청운의 화산파 입문'의 근거 원문은 "청운은 화산파에 정식 입문했다" 한 문장뿐이다. description은 이 문장이 주는 것만 풀어 쓰고, 입문 경위·조건처럼 원문에 없는 정황은 '원문에 서술되지 않는다'로 한계를 명시할 뿐 지어내지 않는다 — name을 어미만 바꿔 되풀이하거나 없는 정황을 채우느니 짧게 끝내는 편이 옳다. 단, 원문이 단서·암시를 주는 경우에는 '~로 암시된다'처럼 암시 수준으로 쓰고, '원문에 서술되지 않는다'는 아무 단서도 없을 때만 쓴다.)
 
 예시 3 (로맨스 판타지 — Item(정체성) + 소유 이동을 두 CharacterState + ABOUT로: 넘긴 인물과 받은 인물의 상태를 각각)
 
@@ -166,6 +174,6 @@ EXTRACTION_FEW_SHOT = r"""
   {"type": "ESTABLISHED_IN", "start_node_id": "5", "end_node_id": "3", "properties": {}},
   {"type": "ABOUT", "start_node_id": "5", "end_node_id": "2", "properties": {}}
 ]}
-(주의 1: 해무와 준호는 '작가-독자'이지만 작품(탑의 문)에 대한 각자의 역할이므로 두 인물 사이에 RELATED_TO를 만들지 않는다. 각자를 그 작품에 대한 CharacterState로 만들고 ABOUT으로 작품에 잇는다.
+(주의 1: 해무와 준호는 '작가-독자'이지만 작품(탑의 문)에 대한 각자의 역할이므로 서로를 가리키는 관계 상태를 만들지 않는다. 각자를 그 작품에 대한 CharacterState로 만들고 ABOUT으로 작품에 잇는다 — ABOUT의 대상이 사람이 아니라 작품이라는 점이 인물 관계와 다르다.
 주의 2: C2의 '유행하는 아무 소설'은 심심풀이로 제목만 흘려본 소품·농담성 언급이라 Item으로 만들지 않는다 — 준호가 실제로 몰입해 읽는 <탑의 문>만 만든다.)
 """
