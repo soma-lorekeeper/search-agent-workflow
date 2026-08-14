@@ -18,6 +18,11 @@ from fastapi.testclient import TestClient
 
 from src import webapp
 from src.chat import agent as chat_agent
+from src.chat import kg_scope
+
+# KG에 인덱싱돼 있다고 보는 작품. 실제 값은 환경변수라서 테스트에서 고정한다.
+WORK_ID = 1
+OTHER_WORK_ID = WORK_ID + 1
 
 # ---------- /api/chat 요청 계약 ----------
 
@@ -32,8 +37,31 @@ def captured_chat(monkeypatch):
         return {"content": "답", "tool_calls": [], "suggested_title": None}
 
     monkeypatch.setattr(webapp, "run_chat", _stub)
+    monkeypatch.setattr(kg_scope, "KG_INDEXED_WORK_ID", WORK_ID)
     with TestClient(webapp.app) as client:
         yield client, captured
+
+
+def test_chat_다른_작품의_질문은_400이다(captured_chat):
+    """KG에 작품 격리가 없어서, 다른 작품으로 물으면 남의 작품 그래프로 답하게 된다.
+
+    답이 그럴듯해 보이는 게 특히 나쁘다 — 작가는 자기 작품 설정으로 알고 그걸 근거로 글을 쓴다.
+    """
+    client, captured = captured_chat
+
+    response = client.post(
+        "/api/chat",
+        json={
+            "work_id": OTHER_WORK_ID,
+            "session_id": 7,
+            "messages": [{"role": "user", "content": "주인공이 누구야?"}],
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert str(OTHER_WORK_ID) in detail and str(WORK_ID) in detail
+    assert captured == {}  # 에이전트를 부르지도 않는다(LLM 비용 0)
 
 
 def test_chat_받은_회차_컨텍스트를_그대로_에이전트에_넘긴다(captured_chat):

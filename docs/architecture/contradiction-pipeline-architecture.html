@@ -309,8 +309,12 @@ flowchart TB
         <div class="stage-body">
           <h3>배경 컨텍스트 준비</h3>
           <p>lorekeeper-poc의 <code>context.py</code>를 그대로 재사용 — <code>dump_graph_text</code> +
-            <code>load_summaries</code> → <code>build_context</code>. 전역 줄거리 압축 + 최근 회차 요약 +
+            <code>load_summaries</code> → <code>build_context</code>. 전역 줄거리 압축 + 회차 요약 +
             그래프 덤프를 하나의 텍스트로 합쳐 1·2단계에 공급.</p>
+          <p>검사 대상이 N화면 <strong>N화 직전까지</strong>로 상한을 건다 — 회차 요약은
+            <code>c.number &lt; N</code>, 그래프 덤프는 회차를 판정할 수 있는 노드(Event·CharacterState)를
+            걸러내고, 회차별로 쪼갤 수 없는 전역 줄거리 압축은 통째로 뺀다. 상한이 없으면 N화를 N화
+            자신이 만든 사실과 대조해 "일치"라고 자평하고, N+1화 이후의 반전을 N화에 심어둔 모순으로 읽는다.</p>
         </div>
         <div class="stage-meta"><span class="pill fixed">고정</span><br/>LLM 호출 0회</div>
       </div>

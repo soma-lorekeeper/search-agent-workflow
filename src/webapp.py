@@ -25,7 +25,7 @@ from lorekeeper.indexing import indexing as run_indexing
 
 from src import config  # noqa: F401 — import 시점에 .env를 로드해 NEO4J_*/OPENAI_API_KEY를 환경변수로 채운다
 from src.chat import run_chat
-from src.chat.kg_scope import kg_scope
+from src.chat.kg_scope import KG_INDEXED_WORK_ID, kg_scope, require_indexed_work
 from src.config import DATA_DIR
 from src.contradiction import save_report_files
 from src.contradiction.pipeline import check_new_episode_streaming
@@ -67,6 +67,23 @@ DATA_DIR.mkdir(exist_ok=True)
 _index_jobs: dict[str, dict] = {}  # job_id -> 위 모양의 dict
 _index_queue: asyncio.Queue = asyncio.Queue()  # 접수된 job_id의 FIFO
 
+# 지금까지 큐에 넣은 화 번호의 최대치. 오름차순 규칙을 "요청 하나 안"이 아니라 "큐 전체"에서
+# 지키기 위한 워터마크다.
+#
+# 왜 필요한가: 화별 검증 루프(index_episodes)는 한 요청 안의 순서만 본다. 그래서 POST [5,6]
+# 직후 POST [3,4]가 들어오면 둘 다 200을 받고 큐는 FIFO라 [5,6,3,4] 순으로 실행된다 — 3화를
+# 추출할 때 그래프와 Story.summary에는 이미 5·6화가 들어 있어서, 추출기가 "지금까지의 줄거리"
+# 라며 미래를 읽는다. 그래프가 조용히 오염되고 되돌릴 방법이 없다. 같은 구멍으로 같은 화가
+# 두 요청에 겹쳐 들어와 두 번 인덱싱되기도 한다(LLM 비용 전액 이중 지출).
+#
+# 그래서 요청 하나의 루프가 강제하는 규칙(episodeNo는 반드시 증가)을 큐 범위로 끌어올린다.
+# 이미 완료 마커가 있는 화는 비교에서 뺀다 — 재제출은 일하지 않으므로 순서를 깨지 않는다.
+#
+# 프로세스 메모리라서 재시작하면 0으로 돌아간다. 그때는 마커가 있는 화만 걸러질 뿐 "그래프에는
+# 6화까지 있는데 3화를 새로 넣는" 요청을 막지 못한다 — 워터마크를 그래프에서 복원하려면
+# _already_indexed와 다른 쿼리(요청에 없는 화까지 보는)가 필요해서 지금은 하지 않는다.
+_max_queued_episode_no = 0
+
 
 async def _index_worker() -> None:
     """서버가 떠 있는 동안 계속 도는 단일 워커. 큐에서 작업을 하나씩 꺼내 그 작업의 화들을
@@ -97,8 +114,14 @@ async def _run_index_job(job_id: str) -> None:
             # 접수 시점에 완료 마커가 확인된 화 — 다시 인덱싱하지 않는다.
             continue
         if failed_no is not None:
-            episode["status"] = "error"
-            episode["error"] = f"Skipped due to preceding episode ({failed_no}) failure"
+            # 상태와 사유는 한 번의 update로 함께 쓴다 — 조회 API는 다른 스레드에서 돌아서,
+            # 두 줄로 나눠 쓰면 그 사이에 들어온 조회가 "error인데 사유는 없음"을 본다.
+            episode.update(
+                {
+                    "error": f"Skipped due to preceding episode ({failed_no}) failure",
+                    "status": "error",
+                }
+            )
             continue
 
         episode["status"] = "running"
@@ -126,8 +149,8 @@ async def _run_index_job(job_id: str) -> None:
                 episode["episode_id"],
                 episode["episode_no"],
             )
-            episode["status"] = "error"
-            episode["error"] = str(exc)
+            # 위와 같은 이유로 사유와 상태를 한 번에 쓴다(터진 읽기 방지).
+            episode.update({"error": str(exc), "status": "error"})
             failed_no = episode["episode_no"]
 
 
@@ -221,6 +244,11 @@ class CamelModel(BaseModel):
 #   - 없으면 → 처음부터 다시 인덱싱(중간까지 쓰다 만 결과 위에 다시 돌려도 Neo4jWriter가
 #     전부 upsert라 같은 값으로 수렴한다)
 # 재시작으로 진행 상태가 날아가 Spring이 같은 화를 다시 보내도 안전한 이유가 이것이다.
+#
+# 이 마커는 화 번호만으로 판정하고 작품을 구분하지 못한다 — 그래프에 workId가 아예 없기
+# 때문이다(kg_scope 참고). 그래서 작품 B의 6화가 작품 A의 6화 마커에 걸려 "이미 인덱싱됨"으로
+# 보고되는 사고가 성립하는데, 그 구멍은 여기가 아니라 접수 관문(require_indexed_work)에서
+# 막는다: 애초에 인덱싱된 작품 외의 요청을 받지 않으면 이 쿼리는 항상 같은 작품 안에서만 답한다.
 _INDEXED_MARKER_CYPHER = """
 MATCH (c:Chapter)-[:IN_STORY]->(:Story {id: 'main'})
 WHERE c.number IN $chapters
@@ -305,6 +333,23 @@ def _now_rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ---------- 원고 원문 파일 ----------
+# 파일 이름에 작품을 넣는다. 예전 이름(episode{N}.txt)은 화 번호만 써서, 작품이 달라도 같은
+# 파일을 가리켰다 — 뷰어가 다른 작품의 원고를 보여주거나 서로 덮어쓰는 사고가 난다.
+# 지금은 접수 관문이 작품 하나만 통과시키므로 실제로 섞일 일이 없지만, 이름이 작품을 구분하지
+# 못한다는 사실 자체가 그 관문을 지웠을 때 되살아나는 지뢰라서 지금 고쳐 둔다.
+
+
+def _episode_path(work_id: int, chapter: int) -> Path:
+    return DATA_DIR / f"work{work_id}_episode{chapter}.txt"
+
+
+def _write_episode_files(work_id: int, episodes: list[tuple[int, str]]) -> None:
+    """원고 전문을 화마다 한 파일씩 쓴다(동기 I/O — 호출자가 스레드로 뺀다)."""
+    for chapter, text in episodes:
+        _episode_path(work_id, chapter).write_text(text, encoding="utf-8")
+
+
 class IndexEpisode(CamelModel):
     # episodeId는 Spring의 식별자다 — 이 서버는 해석하지 않고 상태 조회에서 그대로 돌려주기만 한다.
     # episodeNo가 실제 인덱싱 단위(lorekeeper의 Chapter.number)다.
@@ -340,10 +385,13 @@ async def index_episodes(req: IndexRequest):
     실제 처리(lorekeeper.indexing 호출)는 _index_worker가 이 요청의 커넥션과 무관하게
     백그라운드에서, 받은 순서대로 하나씩 진행한다.
 
-    접수 순서: 입력 검증 → 화별 완료 마커 확인 → TPM 여유 확인 → 저장·큐잉.
+    접수 순서: 작품 확인 → 입력 검증 → 화별 완료 마커 확인 → 큐 전체 오름차순 확인 →
+    TPM 여유 확인 → 저장·큐잉.
     TPM에서 거절(429)당한 요청은 어디에도 남지 않아야 하므로, 상태 등록과 원고 파일 쓰기는
     모두 그 확인을 통과한 뒤에 한다.
     """
+    require_indexed_work(req.work_id)
+
     if not req.episodes:
         raise HTTPException(status_code=400, detail="episodes must not be empty")
 
@@ -363,12 +411,42 @@ async def index_episodes(req: IndexRequest):
 
     # 이미 인덱싱된 화는 일하지 않으므로 TPM도 쓰지 않는다 — 재제출뿐인 요청이 429로
     # 거절당하면 "안전한 재제출"이라는 스펙의 전제가 깨진다.
-    indexed = _already_indexed([e.episode_no for e in req.episodes])
-    pending_texts = [e.text or "" for e in req.episodes if e.episode_no not in indexed]
+    #
+    # Neo4j 왕복이라 스레드로 뺀다. async 함수 안에서 그냥 부르면 그동안 이벤트 루프가 통째로
+    # 멈춰 인덱싱 워커·채팅·헬스체크가 다 같이 선다(그래프가 죽어 있으면 드라이버에 접속
+    # 타임아웃이 없어 30초쯤 멈춘다).
+    indexed = await asyncio.to_thread(_already_indexed, [e.episode_no for e in req.episodes])
+    pending = [e for e in req.episodes if e.episode_no not in indexed]
+
+    # 여기부터 큐에 넣기까지는 await가 없다 — 그래야 동시에 들어온 두 요청이 같은 워터마크를
+    # 읽고 둘 다 통과하는 일이 없다(같은 화가 두 번 인덱싱되는 경로).
+    global _max_queued_episode_no
+    if pending and pending[0].episode_no <= _max_queued_episode_no:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"episodeNo {pending[0].episode_no} was already queued behind "
+                f"{_max_queued_episode_no}; episodes must be submitted in ascending order "
+                f"across requests, not just within one"
+            ),
+        )
 
     now = time.monotonic()
     remaining = _tpm_remaining(now)
-    estimated = _estimate_tokens(pending_texts)
+    estimated = _estimate_tokens([e.text or "" for e in pending])
+    # 한도 자체를 넘는 묶음은 지금 여유가 아무리 생겨도 통과할 수 없다. 그런데도 429를 주면
+    # 호출자는 Retry-After만큼 기다렸다 똑같은 묶음을 영원히 다시 보낸다 — 끝나지 않는 재시도
+    # 루프다. 회차당 고정 비용(_CONTEXT_TOKENS_PER_EPISODE)만으로도 14화쯤이면 여기 걸리므로
+    # 드문 경우도 아니다. "기다려라"가 아니라 "쪼개서 다시 보내라"고 말해야 한다.
+    if estimated > INDEX_TPM_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"estimated {estimated} tokens exceeds the per-minute limit "
+                f"({INDEX_TPM_LIMIT}) on its own — this bundle can never be accepted. "
+                f"Split it into smaller requests."
+            ),
+        )
     if estimated > remaining:
         logger.warning(
             "TPM 부족으로 인덱싱 요청 거절 | userId=%s workId=%s 추정=%d 여유=%d",
@@ -406,15 +484,24 @@ async def index_episodes(req: IndexRequest):
             for e in req.episodes
         ],
     }
+    # 워터마크는 실제로 큐에 넣는 요청만 올린다(429/400으로 거절한 요청은 없던 일이어야 하므로).
+    _max_queued_episode_no = max(_max_queued_episode_no, req.episodes[-1].episode_no)
+    # 워터마크를 올린 요청은 같은 블록에서 큐에 들어가야 한다. 사이에 await를 하나라도 두면
+    # 뒤 요청이 그 틈에 끼어들어 먼저 큐에 들어갈 수 있고, 그러면 워터마크로 막으려던 역순
+    # 실행이 그대로 일어난다. 큐에 상한이 없어 put_nowait은 절대 막히지 않는다(= await 불필요).
+    _index_queue.put_nowait(job_id)
 
     # lorekeeper는 Chunk 단위로만 원문을 보관하므로, "원고 목록" 뷰어에서 보여줄 원문 전체는
-    # 우리 쪽에서 별도로 data/episode{N}.txt에 저장해 둔다.
-    for episode in req.episodes:
-        (DATA_DIR / f"episode{episode.episode_no}.txt").write_text(
-            episode.text or "", encoding="utf-8"
-        )
+    # 우리 쪽에서 별도로 파일에 저장해 둔다. 화 하나가 5만 자까지 가고 한 요청에 여러 화가
+    # 실리므로, 이벤트 루프에서 직접 쓰면 그동안 서버 전체가 멈춘다 — 스레드로 뺀다.
+    # 큐잉 뒤에 쓰는 건 순서 보장이 우선이기 때문이다. 워커는 이 파일을 읽지 않고 job에 실린
+    # 원고로 인덱싱하므로, 파일이 조금 늦게 생겨도 인덱싱에는 영향이 없다(뷰어만 잠깐 늦는다).
+    await asyncio.to_thread(
+        _write_episode_files,
+        req.work_id,
+        [(e.episode_no, e.text or "") for e in req.episodes],
+    )
 
-    await _index_queue.put(job_id)
     return IndexAccepted(
         job_id=job_id,
         user_id=req.user_id,
@@ -480,11 +567,13 @@ _detect_jobs: dict[str, dict] = {}  # job_id -> {"status": ..., "claims": [...],
 async def _run_detect(job_id: str, work_id: int, episode_number: int, text: str) -> None:
     def on_claims_extracted(claims: list[dict]) -> None:
         # claim 추출 직후 시점 — 호출자가 이 시점부터 claim별 진행 목록을 그릴 수 있게 한다.
+        # claim은 LLM이 만든 JSON이라 키가 있어도 값이 null일 수 있다. 기본값을 or로 씌워
+        # 조회 API가 응답 검증에서 500을 내지 않게 한다(진행 조회는 무슨 일이 있어도 살아야 한다).
         _detect_jobs[job_id]["claims"] = [
             {
                 "index": i,
-                "quote": c.get("quote", ""),
-                "category": c.get("category", "기타"),
+                "quote": c.get("quote") or "",
+                "category": c.get("category") or "기타",
                 "status": "running",
                 "label": None,
                 "established_fact": None,
@@ -511,14 +600,24 @@ async def _run_detect(job_id: str, work_id: int, episode_number: int, text: str)
         # 인덱싱 워커와 같은 이유로 여기서도 kg_scope를 통과시킨다 — 파이프라인이 보는 그래프의
         # 작품 범위를 정하는 지점은 이 프로젝트에서 kg_scope 하나뿐이어야 한다.
         kg_scope(work_id)
-        findings = await check_new_episode_streaming(text, on_claims_extracted, on_claim_done)
-        save_report_files(findings, job_id, display_label=f"{episode_number}화")
-        _detect_jobs[job_id]["status"] = "done"
-        _detect_jobs[job_id]["findings"] = findings
+        # episode_number를 파이프라인에 넘긴다. 이게 없으면 검사 대상 회차를 **자기 자신을 포함한
+        # 그래프 전체**와 대조하게 된다 — 5화를 5화가 만든 사실과 비교해 "일치"라고 자평하고,
+        # 6~10화가 나중에 밝힌 반전을 5화에 심어둔 모순으로 읽는다.
+        findings = await check_new_episode_streaming(
+            text, episode_number, on_claims_extracted, on_claim_done
+        )
+        # 리포트는 파일 두 개(md+json)를 쓴다 — 이벤트 루프에서 직접 쓰지 않는다.
+        await asyncio.to_thread(
+            save_report_files, findings, job_id, display_label=f"{episode_number}화"
+        )
+        # 결과와 상태를 한 번의 update로 쓴다. 조회 API(get_detect_job)는 다른 스레드에서 도는데,
+        # 두 줄로 나눠 쓰면 그 사이에 들어온 폴링이 status="done" + findings=null을 보고,
+        # 호출자는 폴링을 멈춘 뒤 "오류 0건"인 빈 리포트를 확정 저장한다.
+        _detect_jobs[job_id].update({"findings": findings, "status": "done"})
     except Exception as exc:  # noqa: BLE001 — 실패 사유를 상태로 노출해야 호출자가 보여줄 수 있다
         logger.exception("설정 오류 탐지 실패 | job_id=%s episode=%s", job_id, episode_number)
-        _detect_jobs[job_id]["status"] = "error"
-        _detect_jobs[job_id]["detail"] = str(exc)
+        # 같은 이유로 사유와 상태를 함께 쓴다(status="error" + detail=null을 보이지 않게).
+        _detect_jobs[job_id].update({"detail": str(exc), "status": "error"})
 
 
 class DetectRequest(BaseModel):
@@ -539,6 +638,8 @@ class JobAck(BaseModel):
 async def start_detect(req: DetectRequest) -> JobAck:
     """설정 오류 탐지를 백그라운드로 시작하고 즉시 응답한다. 실제 검사(claim 추출 → claim별
     병렬 검증 → 판정 집계)는 이 요청의 커넥션과 무관하게 진행된다."""
+    require_indexed_work(req.work_id)
+
     known = _detect_jobs.get(req.job_id)
     if known is not None:
         # 인덱싱과 같은 이유(재시도 방어). 여기선 그래프가 더러워지진 않지만 회차 하나 검사에
@@ -550,13 +651,35 @@ async def start_detect(req: DetectRequest) -> JobAck:
     return JobAck(job_id=req.job_id, status="queued")
 
 
+class DetectClaimProgress(BaseModel):
+    """검사 중인 claim 하나의 진행 상황. 프론트가 검사가 끝나기 전에 목록을 그리기 위한 것이다.
+
+    claim 추출이 끝나는 순간 전부 status="running"으로 한꺼번에 나타나고, 검증이 끝난 것부터
+    하나씩 status="done"으로 바뀐다(claim들은 병렬 검증이라 끝나는 순서는 index 순이 아니다).
+    index는 이 배열 안에서 고정이라 프론트가 행을 안정적으로 식별할 수 있다.
+    """
+
+    index: int  # 0부터. 검사가 끝날 때까지 이 claim의 고정 식별자다.
+    quote: str  # 신규 회차 원문에서 뽑은 서술 그대로
+    category: str  # 생사/소유물/능력/관계/소속/시점 등. 추출기가 정하고 미지정이면 "기타"
+    status: str  # "running" | "done"
+    # 아래 넷은 status="done"이 되기 전까지 전부 null이다(판정 전에는 알 수 없는 값이라서).
+    label: str | None = None  # "contradiction" | "consistent" | "unknown"
+    established_fact: str | None = None
+    # 모델이 "3" 또는 "3화"처럼 돌려줄 수 있어 숫자로 강제하지 않는다 — 조회 API가 판정 결과의
+    # 표기 때문에 500을 내면 안 된다.
+    source_episode: int | str | None = None
+    explanation: str | None = None
+
+
 class DetectStatus(BaseModel):
     job_id: str
     status: str
     detail: str | None = None
-    # claims: 진행 상황(검사 중에도 채워진다). findings: 최종 판정 결과(status=done일 때만).
-    # 필드 이름은 파이프라인이 만들어내는 그대로다 — 여기서 바꾸면 이름만 다른 같은 값이 둘이 된다.
-    claims: list[dict] | None = None
+    # claims: 진행 상황(검사 중에도 채워진다). 접수 직후엔 빈 배열이고 절대 null이 아니다.
+    # findings: 최종 판정 결과(status="done"일 때만 채워진다). claims와 달리 파이프라인이 만든
+    # dict 그대로 나간다 — tool_calls_used·entities처럼 claims에 없는 필드가 더 들어 있다.
+    claims: list[DetectClaimProgress] = []
     findings: list[dict] | None = None
 
 
@@ -566,12 +689,16 @@ def get_detect_job(job_id: str) -> DetectStatus:
     state = _detect_jobs.get(job_id)
     if state is None:
         raise HTTPException(status_code=404, detail=f"'{job_id}' 탐지 작업 기록이 없습니다.")
+    # 검사 작업은 이벤트 루프에서, 이 조회는 FastAPI의 스레드풀에서 돈다. 필드를 하나씩 읽으면
+    # 읽는 도중에 상태가 바뀌어 "status는 새 값, findings는 옛 값" 같은 조합을 볼 수 있다.
+    # dict(state) 한 번으로 스냅샷을 떠서 그 한 시점만 보고 응답을 만든다.
+    snapshot = dict(state)
     return DetectStatus(
         job_id=job_id,
-        status=state["status"],
-        detail=state.get("detail"),
-        claims=state.get("claims"),
-        findings=state.get("findings"),
+        status=snapshot["status"],
+        detail=snapshot.get("detail"),
+        claims=snapshot.get("claims") or [],
+        findings=snapshot.get("findings"),
     )
 
 
@@ -646,6 +773,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     suggested_title은 대화 첫 턴에만 채워진다. 세션 제목을 저장할지 말지는 API 서버가 정한다.
     """
+    require_indexed_work(req.work_id)
+
     result = await run_chat(
         work_id=req.work_id,
         session_id=req.session_id,
@@ -672,7 +801,9 @@ class EpisodeDetail(BaseModel):
 
 
 def _episode_chars(chapter: int) -> int:
-    path = DATA_DIR / f"episode{chapter}.txt"
+    # 뷰어는 작품을 인자로 받지 않는다 — 그래프가 작품 하나뿐이라 여기서 보여줄 수 있는 원고도
+    # 그 작품(KG_INDEXED_WORK_ID)의 것뿐이다. 격리가 생기면 이 두 API도 workId를 받아야 한다.
+    path = _episode_path(KG_INDEXED_WORK_ID, chapter)
     return len(path.read_text(encoding="utf-8")) if path.exists() else 0
 
 
@@ -709,7 +840,7 @@ def get_episode(chapter: int) -> EpisodeDetail:
         driver.close()
     if not records:
         raise HTTPException(status_code=404, detail=f"{chapter}화는 아직 접수되지 않았습니다.")
-    path = DATA_DIR / f"episode{chapter}.txt"
+    path = _episode_path(KG_INDEXED_WORK_ID, chapter)
     raw_text = path.read_text(encoding="utf-8") if path.exists() else ""
     return EpisodeDetail(
         chapter=chapter,
