@@ -17,7 +17,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import app as app_module
-from src.controller import chat_controller
 from src.service.chat import agent as chat_agent
 
 # ---------- /api/chat 요청 계약 ----------
@@ -33,7 +32,8 @@ def captured_chat(monkeypatch):
         captured.update(kwargs)
         return {"content": "답", "tool_calls": [], "suggested_title": None}
 
-    monkeypatch.setattr(chat_controller, "run_chat", _stub)
+    # 컨트롤러가 agent 모듈을 통해 부르므로(agent.run_chat), 이름을 심을 곳도 agent 모듈이다.
+    monkeypatch.setattr(chat_agent, "run_chat", _stub)
     with TestClient(app_module.app) as client:
         yield client, captured
 
