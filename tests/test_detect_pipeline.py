@@ -734,3 +734,35 @@ def test_retrieval_queries_truncate_with_final_k():
         assert "LIMIT $final_k" in q
         # 절단은 필터 **뒤**에 와야 한다 — 앞에 오면 자르고 나서 거르는 꼴이라 의미가 없다.
         assert q.index("$tenant_id") < q.index("LIMIT $final_k")
+
+
+def test_unreadable_judge_response_raises_instead_of_reporting_zero_errors(monkeypatch):
+    """판정 응답을 못 읽으면 "오류 0건"이 아니라 실패다.
+
+    판정 결과가 비면 findings=[]가 되고 검사는 status=DONE·오류 0건으로 끝난다. 작가는
+    검사가 성공했다고 믿는데 실제로는 아무것도 판정되지 않았고, LLM 비용은 이미 다 나갔다.
+
+    parse_verdicts는 "누락된 claim을 0점으로 채우지 않는다"는 구분을 지키고 있다 —
+    0점은 "근거가 없다"는 판정이고 빈 결과는 "판정을 못 읽었다"다. 그 구분을 상위에서
+    실제로 쓰는 자리가 여기다.
+    """
+    async def _broken(**kwargs):
+        return _FakeResponse("이건 JSON이 아니다")
+
+    monkeypatch.setattr(judge_service, "create_completion", _broken)
+    claims = [{"id": "P1", "quote": "q", "axis": "a", "value": "v", "lines": [1]}]
+
+    with pytest.raises(RuntimeError, match="판정 응답을 읽지 못했다"):
+        asyncio.run(judge_service.judge(claims, {"records": []}))
+
+
+def test_empty_verdicts_object_also_raises(monkeypatch):
+    """JSON은 멀쩡한데 verdicts가 비어 온 경우도 마찬가지다."""
+    async def _empty(**kwargs):
+        return _FakeResponse(json.dumps({"verdicts": []}))
+
+    monkeypatch.setattr(judge_service, "create_completion", _empty)
+    claims = [{"id": "P1", "quote": "q", "axis": "a", "value": "v", "lines": [1]}]
+
+    with pytest.raises(RuntimeError, match="판정 응답을 읽지 못했다"):
+        asyncio.run(judge_service.judge(claims, {"records": []}))

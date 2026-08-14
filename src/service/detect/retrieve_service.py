@@ -123,6 +123,10 @@ async def retrieve(
     # 그래프에 닿지 못한 것이다. 그대로 두면 판정기가 빈 문서고를 보고 "대조할 설정이
     # 없다"며 전부 낮은 점수를 매기고, 검사는 "오류 0건"으로 완료된다 — 작가는 검사가
     # 돌지도 않았다는 걸 모른 채 초록불을 본다. 조용한 성공보다 시끄러운 실패가 낫다.
+    #
+    # 실패 표시는 content가 아니라 flag로 센다. 실패 사유를 content에 적어두긴 하지만
+    # **문서고는 content를 읽지 않는다**(items의 metadata만 본다) — 그쪽에 적힌 문구로
+    # 판정하려 들면 아무 효과가 없다.
     total = sum(len(r["channels"]) for r in records)
     failed = sum(1 for r in records for c in r["channels"] if c["failed"])
     if total and failed == total:

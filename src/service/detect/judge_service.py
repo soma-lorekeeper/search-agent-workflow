@@ -174,6 +174,15 @@ async def judge(claims: list[dict], evidence: dict) -> list[dict]:
         # 폴백이 얼마나 도는지가 다음 개선의 신호다. 응답에는 싣지 않는다.
         logger.warning("판정 파싱 문제 | %s", problems)
 
+    # 응답이 통째로 안 읽히면 "오류 0건"이 아니라 실패다.
+    #
+    # 판정 결과가 비면 아래 루프가 한 번도 안 돌아 findings=[]가 되고, 검사는 status=DONE
+    # 오류 0건으로 끝난다. 작가는 검사가 성공했다고 믿고, LLM 비용은 전액 지불된 뒤다.
+    # parse_verdicts의 docstring이 "누락을 0점으로 메우면 안 된다"고 짚은 구분을 여기서
+    # 실제로 쓰는 자리다 — 0점은 "근거가 없다"는 판정이고, 빈 결과는 "판정을 못 읽었다"다.
+    if not verdicts:
+        raise RuntimeError(f"판정 응답을 읽지 못했다({', '.join(problems) or '결과 없음'}).")
+
     findings: list[dict] = []
     for idx in sorted(verdicts):
         v = verdicts[idx]
