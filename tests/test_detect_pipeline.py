@@ -109,8 +109,10 @@ def test_bounded_context_drops_future_chapters(fake_driver):
 
 def test_bound_reaches_the_queries(fake_driver):
     pipeline.background_context(TENANT, up_to_chapter=5)
+    # 미래 노드를 골라내는 쿼리도 테넌트로 좁는다. 상한만 걸면 그래프 전체를 훑어
+    # 남의 작품 노드 id까지 제외 집합에 담는다(결과는 안 틀리지만 전수 스캔이 된다).
     params = [p for q, p in fake_driver.calls if "coalesce(n.chapter" in q]
-    assert params == [{"up_to_chapter": 5}]
+    assert params == [{"up_to_chapter": 5, **TENANT.params()}]
     # 회차 요약 쿼리는 상한과 테넌트를 함께 받는다 — 상한만 걸고 테넌트를 빠뜨리면 남의
     # 작품 줄거리가 "기존 설정"으로 섞여 들어온다.
     params = [p for q, p in fake_driver.calls if "c.summary IS NOT NULL" in q]
@@ -135,7 +137,7 @@ def test_unbounded_context_is_unchanged(fake_driver):
 
 def test_bounded_driver_drops_relationships_touching_removed_nodes(fake_driver):
     """관계 한쪽 끝만 걸러내고 관계를 남기면 덤프 렌더러가 없는 노드를 찾다 죽는다."""
-    bounded = pipeline._ChapterBoundedDriver(fake_driver, "neo4j", 5)
+    bounded = pipeline._ChapterBoundedDriver(fake_driver, "neo4j", TENANT, 5)
 
     nodes, _, _ = bounded.execute_query(
         "MATCH (n) RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props"
@@ -151,7 +153,7 @@ def test_bounded_driver_drops_relationships_touching_removed_nodes(fake_driver):
 
 def test_bounded_driver_passes_other_queries_through(fake_driver):
     """상한 드라이버는 덤프가 던지는 쿼리만 손댄다 — 모르는 결과 모양은 그대로 통과시킨다."""
-    bounded = pipeline._ChapterBoundedDriver(fake_driver, "neo4j", 5)
+    bounded = pipeline._ChapterBoundedDriver(fake_driver, "neo4j", TENANT, 5)
     records, _, _ = bounded.execute_query(
         "MATCH (s:Story {id:'main'}) RETURN s.summary AS summary"
     )

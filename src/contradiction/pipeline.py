@@ -93,6 +93,7 @@ def _all_chapter_summaries(
 _FUTURE_NODES_CYPHER = """
 MATCH (n)
 WHERE NOT n:Chunk AND NOT n:Chapter AND NOT n:Story
+  AND n.tenant_id = $tenant_id
 OPTIONAL MATCH (n)-[:ESTABLISHED_IN]->(ev:Event)
 OPTIONAL MATCH (n)-[:EVIDENCED_BY]->(ck:Chunk)
 WITH n, coalesce(n.chapter, min(ev.chapter), min(ck.chapter)) AS chapter
@@ -110,10 +111,12 @@ class _ChapterBoundedDriver:
       노드 {id, labels, props} / 관계 {s, t, e, props} / 상태-회차 {id, chapter}
     """
 
-    def __init__(self, driver, database: str, up_to_chapter: int):
+    def __init__(self, driver, database: str, tenant: Tenant, up_to_chapter: int):
         self._driver = driver
         records, _, _ = driver.execute_query(
-            _FUTURE_NODES_CYPHER, {"up_to_chapter": up_to_chapter}, database_=database
+            _FUTURE_NODES_CYPHER,
+            {"up_to_chapter": up_to_chapter, **tenant.params()},
+            database_=database,
         )
         self._future_ids = {r["id"] for r in records}
 
@@ -154,7 +157,9 @@ def background_context(tenant: Tenant, up_to_chapter: int | None = None) -> str:
             graph_dump = dump_graph_text(driver, LOREKEEPER_DATABASE, tenant)
             global_summary, _recent_unused = load_summaries(driver, LOREKEEPER_DATABASE, tenant)
         else:
-            bounded = _ChapterBoundedDriver(driver, LOREKEEPER_DATABASE, up_to_chapter)
+            bounded = _ChapterBoundedDriver(
+                driver, LOREKEEPER_DATABASE, tenant, up_to_chapter
+            )
             graph_dump = dump_graph_text(bounded, LOREKEEPER_DATABASE, tenant)
             global_summary = ""
         all_summaries = _all_chapter_summaries(
@@ -207,9 +212,11 @@ async def extract_claims(text: str, background_context: str) -> list[dict]:
     return [claim for claims in chunk_results for claim in claims]
 
 
-async def check_new_episode(text: str, up_to_chapter: int | None = None) -> list[dict]:
+async def check_new_episode(
+    text: str, tenant: Tenant, up_to_chapter: int | None = None
+) -> list[dict]:
     """0~2단계를 이어서 실행한다: 컨텍스트 준비 → claim 추출 → claim별 병렬 검증(fork)."""
-    return await check_new_episode_streaming(text, up_to_chapter)
+    return await check_new_episode_streaming(text, tenant, up_to_chapter)
 
 
 async def check_new_episode_streaming(
