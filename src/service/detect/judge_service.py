@@ -119,12 +119,18 @@ def _resolve_cited(aliases: list[str], store: dict) -> list[dict]:
     """
     chunks = store.get("chunks") or {}
     facts = store.get("facts") or {}
-    by_alias = {}
-    for eid, c in chunks.items():
+
+    by_alias: dict[str, list[tuple]] = {}
+    for c in chunks.values():
         by_alias[c["alias"]] = [(c.get("chapter"), c.get("index"))]
-    for eid, f in facts.items():
-        ev = f.get("evidence") or []
-        by_alias[f["alias"]] = [(e.get("chapter"), e.get("index")) for e in ev]
+    for f in facts.values():
+        # 사실의 evidence는 **청크 eid 목록**이다 — build_docstore가 근거 원문을 청크
+        # 사전으로 옮기고 키만 남기기 때문이다. 그 키로 청크를 되짚어야 좌표가 나온다.
+        by_alias[f["alias"]] = [
+            (chunks[k].get("chapter"), chunks[k].get("index"))
+            for k in (f.get("evidence") or [])
+            if k in chunks
+        ]
 
     out: list[dict] = []
     seen: set[tuple] = set()

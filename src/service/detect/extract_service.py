@@ -110,7 +110,9 @@ async def extract(
     """
     lines = split_lines(text)
     units = _chunk(text)
-    system = _build_system(tenant, up_to_chapter)
+    # 등장인물 노드 조회는 Neo4j 왕복이고 드라이버가 동기 API다. 여기서 그냥 부르면
+    # 그동안 이벤트 루프가 통째로 멈춰 인덱싱 워커·채팅·헬스체크가 다 같이 선다.
+    system = await asyncio.to_thread(_build_system, tenant, up_to_chapter)
 
     # gather는 순서를 보존한다 — claim 번호가 원고 등장 순서와 같아지는 근거다.
     results = await asyncio.gather(*[_extract_one(system, u) for u in units])
