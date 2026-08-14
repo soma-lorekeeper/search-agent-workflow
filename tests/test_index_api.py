@@ -21,8 +21,9 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from src import webapp
-from src.chat import kg_scope
+from src import app as app_module
+from src.service.index import job_service as index_job_service
+from src.service import kg_scope
 from conftest import RecordingDict  # tests/에 __init__.py가 없어 pytest가 경로에 넣어준다
 
 RFC3339_UTC = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
@@ -42,7 +43,7 @@ def stub_indexing(monkeypatch):
         calls.append(episode_no)
         return {"chapter": episode_no}
 
-    monkeypatch.setattr(webapp, "run_indexing", _stub)
+    monkeypatch.setattr(index_job_service, "run_indexing", _stub)
     return calls
 
 
@@ -55,14 +56,14 @@ def client(monkeypatch, tmp_path):
     테스트에서 "다른 루프에 묶인 큐" 오류가 난다.
     큐 오름차순 워터마크(_max_queued_episode_no)도 모듈 전역이라 매번 0으로 되돌린다.
     """
-    webapp._index_jobs.clear()
-    webapp._tpm_window.clear()
-    monkeypatch.setattr(webapp, "_index_queue", asyncio.Queue())
-    monkeypatch.setattr(webapp, "_max_queued_episode_no", 0)
+    index_job_service._index_jobs.clear()
+    index_job_service._tpm_window.clear()
+    monkeypatch.setattr(index_job_service, "_index_queue", asyncio.Queue())
+    monkeypatch.setattr(index_job_service, "_max_queued_episode_no", 0)
     monkeypatch.setattr(kg_scope, "KG_INDEXED_WORK_ID", WORK_ID)
     # 기본값은 "아직 인덱싱 안 됨" — 마커가 있는 경우는 해당 테스트에서 따로 뒤집는다.
-    monkeypatch.setattr(webapp, "_already_indexed", lambda episode_nos: set())
-    with TestClient(webapp.app) as c:
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: set())
+    with TestClient(app_module.app) as c:
         yield c
 
 
@@ -106,7 +107,7 @@ def test_submit_returns_201_contract(client, stub_indexing):
     assert body["userId"] == 42
     assert body["workId"] == WORK_ID
     assert body["episodeIds"] == [101, 102]
-    assert body["remainingTpm"] < webapp.INDEX_TPM_LIMIT  # 추정치만큼 창에서 깎였다
+    assert body["remainingTpm"] < index_job_service.INDEX_TPM_LIMIT  # 추정치만큼 창에서 깎였다
     assert re.match(RFC3339_UTC, body["requestedAt"])
 
 
@@ -140,7 +141,7 @@ def test_descending_episode_no_is_400(client, stub_indexing):
 
 
 def _index_job_count() -> int:
-    return len(webapp._index_jobs)
+    return len(index_job_service._index_jobs)
 
 
 # ---------- 인덱싱된 작품 외의 요청(400) ----------
@@ -170,7 +171,7 @@ def test_other_work_is_400_even_when_marker_says_done(client, stub_indexing, mon
     이게 이 버그의 심장이다 — 관문이 없으면 여기서 201 + 전부 done이 나가고, 그 화는 영영
     인덱싱되지 않는다. 관문은 마커를 보기도 전에 막아야 한다.
     """
-    monkeypatch.setattr(webapp, "_already_indexed", lambda episode_nos: set(episode_nos))
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: set(episode_nos))
     res = _submit(
         client, [{"episodeId": 101, "episodeNo": 6, "text": "다른 작품 6화"}], work_id=OTHER_WORK_ID
     )
@@ -236,7 +237,7 @@ def test_already_indexed_resubmit_is_not_blocked_by_watermark(client, stub_index
     보면 다시 POST한다"는 스펙의 복구 경로가 막힌다.
     """
     assert _submit(client, [{"episodeId": 107, "episodeNo": 7, "text": "7화"}]).status_code == 201
-    monkeypatch.setattr(webapp, "_already_indexed", lambda episode_nos: {3, 4})
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: {3, 4})
     res = _submit(
         client,
         [
@@ -252,10 +253,10 @@ def test_already_indexed_resubmit_is_not_blocked_by_watermark(client, stub_index
 
 def test_rejected_request_does_not_raise_the_watermark(client, stub_indexing, monkeypatch):
     """429로 거절한 요청은 없던 일이어야 한다 — 워터마크만 올려두면 재시도가 400으로 막힌다."""
-    monkeypatch.setattr(webapp, "INDEX_TPM_LIMIT", 20000)
-    webapp._tpm_window.append((time.monotonic(), 19000))  # 여유를 거의 없애 429를 유도
+    monkeypatch.setattr(index_job_service, "INDEX_TPM_LIMIT", 20000)
+    index_job_service._tpm_window.append((time.monotonic(), 19000))  # 여유를 거의 없애 429를 유도
     assert _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화"}]).status_code == 429
-    webapp._tpm_window.clear()
+    index_job_service._tpm_window.clear()
     assert _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화"}]).status_code == 201
 
 
@@ -267,8 +268,8 @@ def test_tpm_exhausted_returns_429_and_stores_nothing(client, stub_indexing, mon
 
     (한도 자체를 넘어 영영 통과할 수 없는 요청은 429가 아니라 400이다. 위 테스트 참고.)
     """
-    monkeypatch.setattr(webapp, "INDEX_TPM_LIMIT", 20000)
-    webapp._tpm_window.append((time.monotonic(), 19000))  # 방금 19,000을 썼다고 가정
+    monkeypatch.setattr(index_job_service, "INDEX_TPM_LIMIT", 20000)
+    index_job_service._tpm_window.append((time.monotonic(), 19000))  # 방금 19,000을 썼다고 가정
     res = _submit(client, [{"episodeId": 101, "episodeNo": 6, "text": "6화 원고"}])
     assert res.status_code == 429
     assert res.headers["Retry-After"] == "60"  # 방금 기록이라 창이 다 흐르려면 60초
@@ -282,7 +283,7 @@ def test_tpm_exhausted_returns_429_and_stores_nothing(client, stub_indexing, mon
 
 def test_bundle_larger_than_the_whole_limit_is_400_not_429(client, stub_indexing, monkeypatch):
     """한도 자체를 넘는 묶음은 기다린다고 통과하지 못한다 — 429는 끝나지 않는 재시도 루프다."""
-    monkeypatch.setattr(webapp, "INDEX_TPM_LIMIT", 20000)
+    monkeypatch.setattr(index_job_service, "INDEX_TPM_LIMIT", 20000)
     # 회차당 고정 비용 15,000 × 2 = 30,000 > 20,000. 창이 텅 비어 있어도 절대 못 들어간다.
     res = _submit(
         client,
@@ -322,7 +323,7 @@ def test_episode_status_transitions(client, monkeypatch):
             await asyncio.sleep(0.01)
         return {}
 
-    monkeypatch.setattr(webapp, "run_indexing", _blocking)
+    monkeypatch.setattr(index_job_service, "run_indexing", _blocking)
     job_id = _submit(
         client,
         [
@@ -355,7 +356,7 @@ def test_failure_skips_following_episodes(client, monkeypatch):
             raise RuntimeError("추출 실패")
         return {}
 
-    monkeypatch.setattr(webapp, "run_indexing", _fail_on_seven)
+    monkeypatch.setattr(index_job_service, "run_indexing", _fail_on_seven)
     job_id = _submit(
         client,
         [
@@ -391,7 +392,7 @@ def test_error_status_never_appears_without_its_reason(monkeypatch):
     async def _fail(episode_no: int, text: str) -> dict:
         raise RuntimeError("추출 실패")
 
-    monkeypatch.setattr(webapp, "run_indexing", _fail)
+    monkeypatch.setattr(index_job_service, "run_indexing", _fail)
     episodes = [
         RecordingDict(
             {"episode_id": 101, "episode_no": 6, "text": "6화", "status": "waiting", "error": None}
@@ -400,16 +401,16 @@ def test_error_status_never_appears_without_its_reason(monkeypatch):
             {"episode_id": 102, "episode_no": 7, "text": "7화", "status": "waiting", "error": None}
         ),
     ]
-    webapp._index_jobs["job-torn"] = {
+    index_job_service._index_jobs["job-torn"] = {
         "user_id": 42,
         "work_id": WORK_ID,
         "requested_at": "2026-08-14T00:00:00Z",
         "episodes": episodes,
     }
     try:
-        asyncio.run(webapp._run_index_job("job-torn"))
+        asyncio.run(index_job_service._run_index_job("job-torn"))
     finally:
-        webapp._index_jobs.pop("job-torn", None)
+        index_job_service._index_jobs.pop("job-torn", None)
 
     # 첫 화는 실패, 둘째 화는 연쇄 스킵 — 둘 다 error다.
     assert [e["status"] for e in episodes] == ["error", "error"]
@@ -422,7 +423,7 @@ def test_error_status_never_appears_without_its_reason(monkeypatch):
 
 def test_already_indexed_episodes_skip_work(client, stub_indexing, monkeypatch):
     """완료 마커가 있는 화는 즉시 done이고, 인덱싱도 TPM 소비도 하지 않는다."""
-    monkeypatch.setattr(webapp, "_already_indexed", lambda episode_nos: {6})
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: {6})
     res = _submit(
         client,
         [
@@ -442,8 +443,8 @@ def test_already_indexed_episodes_skip_work(client, stub_indexing, monkeypatch):
 
 def test_fully_indexed_resubmit_costs_no_tpm(client, stub_indexing, monkeypatch):
     """전부 이미 인덱싱된 재제출은 TPM을 전혀 쓰지 않는다 — 안 그러면 재제출이 429로 막힌다."""
-    monkeypatch.setattr(webapp, "_already_indexed", lambda episode_nos: set(episode_nos))
-    monkeypatch.setattr(webapp, "INDEX_TPM_LIMIT", 1000)
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: set(episode_nos))
+    monkeypatch.setattr(index_job_service, "INDEX_TPM_LIMIT", 1000)
     res = _submit(client, [{"episodeId": 101, "episodeNo": 6, "text": "6화" * 5000}])
     assert res.status_code == 201
     assert res.json()["remainingTpm"] == 1000
@@ -468,8 +469,8 @@ def test_inflight_resubmit_is_not_blocked_by_watermark(client, monkeypatch):
         await asyncio.to_thread(release.wait, 5)
         return {"chapter": chapter}
 
-    monkeypatch.setattr(webapp, "run_indexing", blocking_indexing)
-    monkeypatch.setattr(webapp, "_already_indexed", lambda episode_nos: set())
+    monkeypatch.setattr(index_job_service, "run_indexing", blocking_indexing)
+    monkeypatch.setattr(index_job_service, "_already_indexed", lambda episode_nos: set())
 
     episodes = [
         {"episodeId": 102, "episodeNo": 2, "text": "2화"},

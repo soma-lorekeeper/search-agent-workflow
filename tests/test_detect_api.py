@@ -16,8 +16,9 @@ import pytest
 from conftest import RecordingDict  # tests/에 __init__.py가 없어 pytest가 경로에 넣어준다
 from fastapi.testclient import TestClient
 
-from src import webapp
-from src.chat import kg_scope
+from src import app as app_module
+from src.service.detect import job_service as detect_job_service
+from src.service import kg_scope
 
 WORK_ID = 1
 OTHER_WORK_ID = WORK_ID + 1
@@ -32,11 +33,11 @@ CLAIMS = [
 @pytest.fixture
 def detect_client(monkeypatch):
     """매 테스트마다 깨끗한 탐지 작업 상태로 시작한다."""
-    webapp._detect_jobs.clear()
+    detect_job_service._detect_jobs.clear()
     monkeypatch.setattr(kg_scope, "KG_INDEXED_WORK_ID", WORK_ID)
     # 리포트 파일은 이 테스트의 관심사가 아니다(실제 reports/를 건드리지 않게 막는다).
-    monkeypatch.setattr(webapp, "save_report_files", lambda *args, **kwargs: {})
-    with TestClient(webapp.app) as c:
+    monkeypatch.setattr(detect_job_service, "save_report_files", lambda *args, **kwargs: {})
+    with TestClient(app_module.app) as c:
         yield c
 
 
@@ -72,7 +73,7 @@ def test_other_work_is_400(detect_client):
     assert res.status_code == 400
     detail = res.json()["detail"]
     assert str(OTHER_WORK_ID) in detail and str(WORK_ID) in detail
-    assert webapp._detect_jobs == {}  # 작업이 만들어지지도 않는다
+    assert detect_job_service._detect_jobs == {}  # 작업이 만들어지지도 않는다
 
 
 # ---------- 검사 대상 회차가 파이프라인까지 가는가 ----------
@@ -87,7 +88,7 @@ def test_episode_number_is_passed_to_the_pipeline(detect_client, monkeypatch):
         captured["up_to_chapter"] = up_to_chapter
         return []
 
-    monkeypatch.setattr(webapp, "check_new_episode_streaming", _stub)
+    monkeypatch.setattr(detect_job_service, "check_new_episode_streaming", _stub)
     assert _start(detect_client, episode_number=5, text="5화 원고").status_code == 202
     _wait_until(detect_client, "job-1", lambda b: b["status"] == "done")
 
@@ -119,7 +120,7 @@ def test_claims_progress_is_visible_while_running(detect_client, monkeypatch):
             await asyncio.sleep(0.01)
         return [{"quote": CLAIMS[0]["quote"], "label": "contradiction"}]
 
-    monkeypatch.setattr(webapp, "check_new_episode_streaming", _stub)
+    monkeypatch.setattr(detect_job_service, "check_new_episode_streaming", _stub)
     assert _start(detect_client).status_code == 202
 
     try:
@@ -160,7 +161,7 @@ def test_claims_is_an_empty_list_before_extraction(detect_client, monkeypatch):
             await asyncio.sleep(0.01)
         return []
 
-    monkeypatch.setattr(webapp, "check_new_episode_streaming", _stub)
+    monkeypatch.setattr(detect_job_service, "check_new_episode_streaming", _stub)
     assert _start(detect_client).status_code == 202
     try:
         body = detect_client.get("/api/detect/job-1").json()
@@ -177,7 +178,7 @@ def test_claim_without_category_still_renders(detect_client, monkeypatch):
         on_claims_extracted([{"quote": None, "category": None}])
         return []
 
-    monkeypatch.setattr(webapp, "check_new_episode_streaming", _stub)
+    monkeypatch.setattr(detect_job_service, "check_new_episode_streaming", _stub)
     assert _start(detect_client).status_code == 202
     body = _wait_until(detect_client, "job-1", lambda b: b["status"] == "done")
     assert body["claims"] == [
@@ -217,14 +218,14 @@ def test_done_never_appears_without_findings(monkeypatch):
     async def _stub(text, up_to_chapter=None, on_claims_extracted=None, on_claim_done=None):
         return findings
 
-    monkeypatch.setattr(webapp, "check_new_episode_streaming", _stub)
-    monkeypatch.setattr(webapp, "save_report_files", lambda *args, **kwargs: {})
+    monkeypatch.setattr(detect_job_service, "check_new_episode_streaming", _stub)
+    monkeypatch.setattr(detect_job_service, "save_report_files", lambda *args, **kwargs: {})
     state = RecordingDict({"status": "queued", "claims": []})
-    webapp._detect_jobs["job-torn"] = state
+    detect_job_service._detect_jobs["job-torn"] = state
     try:
-        asyncio.run(webapp._run_detect("job-torn", WORK_ID, 5, "5화 원고"))
+        asyncio.run(detect_job_service._run_detect("job-torn", WORK_ID, 5, "5화 원고"))
     finally:
-        webapp._detect_jobs.pop("job-torn", None)
+        detect_job_service._detect_jobs.pop("job-torn", None)
 
     assert state["status"] == "done" and state["findings"] == findings
     assert [s for s in state.snapshots if s["status"] == "done" and not s.get("findings")] == []
@@ -236,13 +237,13 @@ def test_error_never_appears_without_a_reason(monkeypatch):
     async def _stub(text, up_to_chapter=None, on_claims_extracted=None, on_claim_done=None):
         raise RuntimeError("그래프 접속 실패")
 
-    monkeypatch.setattr(webapp, "check_new_episode_streaming", _stub)
+    monkeypatch.setattr(detect_job_service, "check_new_episode_streaming", _stub)
     state = RecordingDict({"status": "queued", "claims": []})
-    webapp._detect_jobs["job-torn"] = state
+    detect_job_service._detect_jobs["job-torn"] = state
     try:
-        asyncio.run(webapp._run_detect("job-torn", WORK_ID, 5, "5화 원고"))
+        asyncio.run(detect_job_service._run_detect("job-torn", WORK_ID, 5, "5화 원고"))
     finally:
-        webapp._detect_jobs.pop("job-torn", None)
+        detect_job_service._detect_jobs.pop("job-torn", None)
 
     assert state["status"] == "error" and state["detail"] == "그래프 접속 실패"
     assert [s for s in state.snapshots if s["status"] == "error" and not s.get("detail")] == []

@@ -38,4 +38,4 @@ jobs:
           # config.py 가 임포트 시점에 os.environ["OPENAI_API_KEY"] 를 읽는다.
           # 실제 호출은 하지 않으므로 자리표시자로 충분하다.
           OPENAI_API_KEY: sk-ci-placeholder
-        run: python -c "import src.webapp; print('ok')"
+        run: python -c "import src.app; print('ok')"

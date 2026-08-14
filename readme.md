@@ -73,7 +73,7 @@ python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
 # 5. 서버 실행
-.venv/bin/uvicorn src.webapp:app --host 127.0.0.1 --port 8000
+.venv/bin/uvicorn src.app:app --host 127.0.0.1 --port 8000
 ```
 
 > **파이썬은 3.12로 고정한다.** 의존성 `python-mecab-ko`의 aarch64 휠이 cp312까지만

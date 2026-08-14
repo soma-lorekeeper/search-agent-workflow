@@ -1,3 +1,33 @@
+"""인덱싱 작업의 접수·큐·워커·상태를 관리한다.
+
+작업 id(jobId)는 이 서버가 UUID로 발급한다. 예전에는 Spring이 발급한 id로 일했지만,
+이제 요청 하나가 여러 화를 묶어서 들어오고 그 묶음의 진행 상태(화별 waiting/running/
+done/error)를 관리하는 주체가 이 서버라서, 묶음의 이름도 여기서 짓는 게 맞다.
+Spring은 201 응답으로 받은 jobId로 진행 상황을 조회한다.
+
+처리는 요청 커넥션과 완전히 분리된 백그라운드 워커가 한다 — 요청한 쪽이 끊겨도,
+애초에 기다리는 클라이언트가 없어도 서버 프로세스가 떠 있는 한 계속 진행된다.
+큐는 단순 FIFO다: 예전에는 화 번호로 정렬하는 PriorityQueue였지만, 이제 "오름차순"은
+요청 자체가 보장해야 하는 조건이고(어기면 400) 한 요청 안의 화들은 받은 순서대로
+처리하므로, 큐가 순서를 다시 정할 이유가 없다.
+
+큐와 워커는 작품 구분 없이 전역이고 워커는 하나뿐이다. 지금 KG에는 작품 격리가 아예
+없어서(kg_scope 참고) 그래프 전체가 "인덱싱된 작품 하나"이고, 여러 작품을 동시에
+인덱싱하는 상황 자체가 없다. 여기서 workId별로 큐를 쪼개면 없는 격리를 있는 척하게 될
+뿐이다 — KG가 workId를 갖게 되는 시점에 큐/워커를 작품별로 나눈다.
+
+작업 상태는 이 프로세스 메모리에만 있다. 재시작하면 상태가 사라지고 진행 중이던 인덱싱도
+함께 끊긴다 — 스펙이 인정하는 정상 시나리오다(Spring은 조회에서 404를 보면 다시 POST한다).
+그렇게 다시 보내도 안전한 근거는 _already_indexed의 완료 마커다.
+
+job 한 건의 모양:
+  {"user_id": 42, "work_id": 7, "requested_at": "2026-08-11T03:11:00Z",
+   "episodes": [{"episode_id": 101, "episode_no": 6, "text": "...",
+                 "status": "waiting", "error": None}, ...]}
+text를 상태에 함께 들고 있는 건 워커가 나중에 꺼내 쓰기 때문이고, 조회 응답에는 나가지
+않는다(응답 모델이 episodeId/status/error만 뽑는다).
+"""
+
 import asyncio
 import logging
 import math
@@ -5,15 +35,13 @@ import os
 import time
 import uuid
 from collections import deque
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from openai import RateLimitError
-from pydantic import BaseModel, ConfigDict
-from pydantic.alias_generators import to_camel
 
+from src.dto.index_dto import IndexAccepted, IndexEpisodeStatus, IndexJobStatus, IndexRequest
 from src.lorekeeper.client import get_driver
 
 # lorekeeper/__init__.py가 `indexing`이라는 이름을 함수(async def indexing(...))로 재노출해서
@@ -21,43 +49,9 @@ from src.lorekeeper.client import get_driver
 # 직접 가져와야 한다(패키지 네임스페이스의 재바인딩을 건너뛴다).
 from src.lorekeeper.indexing import DATABASE as LOREKEEPER_DATABASE
 from src.lorekeeper.indexing import indexing as run_indexing
+from src.service.kg_scope import kg_scope, require_indexed_work
 
-from src import config  # noqa: F401 — import 시점에 .env를 로드해 NEO4J_*/OPENAI_API_KEY를 환경변수로 채운다
-from src.chat import run_chat
-from src.chat.kg_scope import kg_scope, require_indexed_work
-from src.contradiction import save_report_files
-from src.contradiction.pipeline import check_new_episode_streaming
-from src.health import collect as collect_health
-
-logger = logging.getLogger("webapp")
-
-# ---------- 인덱싱 작업 큐 ----------
-# 작업 id(jobId)는 이 서버가 UUID로 발급한다. 예전에는 Spring이 발급한 id로 일했지만,
-# 이제 요청 하나가 여러 화를 묶어서 들어오고 그 묶음의 진행 상태(화별 waiting/running/
-# done/error)를 관리하는 주체가 이 서버라서, 묶음의 이름도 여기서 짓는 게 맞다.
-# Spring은 201 응답으로 받은 jobId로 진행 상황을 조회한다.
-#
-# 처리는 요청 커넥션과 완전히 분리된 백그라운드 워커가 한다 — 요청한 쪽이 끊겨도,
-# 애초에 기다리는 클라이언트가 없어도 서버 프로세스가 떠 있는 한 계속 진행된다.
-# 큐는 단순 FIFO다: 예전에는 화 번호로 정렬하는 PriorityQueue였지만, 이제 "오름차순"은
-# 요청 자체가 보장해야 하는 조건이고(어기면 400) 한 요청 안의 화들은 받은 순서대로
-# 처리하므로, 큐가 순서를 다시 정할 이유가 없다.
-#
-# 큐와 워커는 작품 구분 없이 전역이고 워커는 하나뿐이다. 지금 KG에는 작품 격리가 아예
-# 없어서(kg_scope 참고) 그래프 전체가 "인덱싱된 작품 하나"이고, 여러 작품을 동시에
-# 인덱싱하는 상황 자체가 없다. 여기서 workId별로 큐를 쪼개면 없는 격리를 있는 척하게 될
-# 뿐이다 — KG가 workId를 갖게 되는 시점에 큐/워커를 작품별로 나눈다.
-#
-# 작업 상태는 이 프로세스 메모리에만 있다. 재시작하면 상태가 사라지고 진행 중이던 인덱싱도
-# 함께 끊긴다 — 스펙이 인정하는 정상 시나리오다(Spring은 조회에서 404를 보면 다시 POST한다).
-# 그렇게 다시 보내도 안전한 근거는 _already_indexed의 완료 마커다.
-#
-# job 한 건의 모양:
-#   {"user_id": 42, "work_id": 7, "requested_at": "2026-08-11T03:11:00Z",
-#    "episodes": [{"episode_id": 101, "episode_no": 6, "text": "...",
-#                  "status": "waiting", "error": None}, ...]}
-# text를 상태에 함께 들고 있는 건 워커가 나중에 꺼내 쓰기 때문이고, 조회 응답에는 나가지
-# 않는다(응답 모델이 episodeId/status/error만 뽑는다).
+logger = logging.getLogger("index")
 
 _index_jobs: dict[str, dict] = {}  # job_id -> 위 모양의 dict
 _index_queue: asyncio.Queue = asyncio.Queue()  # 접수된 job_id의 FIFO
@@ -65,7 +59,7 @@ _index_queue: asyncio.Queue = asyncio.Queue()  # 접수된 job_id의 FIFO
 # 지금까지 큐에 넣은 화 번호의 최대치. 오름차순 규칙을 "요청 하나 안"이 아니라 "큐 전체"에서
 # 지키기 위한 워터마크다.
 #
-# 왜 필요한가: 화별 검증 루프(index_episodes)는 한 요청 안의 순서만 본다. 그래서 POST [5,6]
+# 왜 필요한가: 화별 검증 루프(submit)는 한 요청 안의 순서만 본다. 그래서 POST [5,6]
 # 직후 POST [3,4]가 들어오면 둘 다 200을 받고 큐는 FIFO라 [5,6,3,4] 순으로 실행된다 — 3화를
 # 추출할 때 그래프와 Story.summary에는 이미 5·6화가 들어 있어서, 추출기가 "지금까지의 줄거리"
 # 라며 미래를 읽는다. 그래프가 조용히 오염되고 되돌릴 방법이 없다. 같은 구멍으로 같은 화가
@@ -95,7 +89,7 @@ def _active_episode_nos() -> set[int]:
     }
 
 
-async def _index_worker() -> None:
+async def worker() -> None:
     """서버가 떠 있는 동안 계속 도는 단일 워커. 큐에서 작업을 하나씩 꺼내 그 작업의 화들을
     순서대로 인덱싱한다. 동시에 여러 화를 처리하지 않는다(lorekeeper의 누적 컨텍스트가
     이전 화 완료를 전제하므로 순차 처리 필수)."""
@@ -195,48 +189,11 @@ async def _run_indexing_with_retry(episode_no: int, text: str) -> dict:
     raise AssertionError("unreachable")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    asyncio.create_task(_index_worker())
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
-
-# NOTE: 이 서버의 API는 전부 API 서버(Spring)가 호출하는 내부 API다. 인증은 없다 —
-# 호출자가 Spring 하나뿐이고 이 서버는 127.0.0.1에만 떠 있어 외부에서 닿을 수 없다.
-# 작업형 API 둘은 작업 id 발급 주체가 서로 다르다: 인덱싱은 이 서버가 jobId를 발급하고
-# (요청 하나가 여러 화를 묶는 단위라서), 설정 오류 탐지는 여전히 Spring이 발급한 job_id로
-# 일한다. 필드 표기도 그래서 다르다 — 인덱싱만 스펙대로 camelCase이고 나머지는 snake_case다.
-
-
-@app.get("/api/health")
-def health() -> dict:
-    """이 서버가 두 DB 에 실제로 닿는지 점검한다.
-
-    API 서버(Spring)가 이걸 호출해 자기 점검 결과와 합쳐 프론트에 내려준다.
-    프로덕션에서 이 서버는 127.0.0.1 에만 떠 있어 외부에서 직접 부를 수 없다.
-
-    DB 가 죽어도 HTTP 200 을 준다 — 상태는 본문의 status 로 구분한다. 여기서 5xx 를
-    내면 "에이전트가 죽음"과 "에이전트는 살아있고 DB 만 죽음"을 호출자가 구분하지 못한다.
-    """
-    return collect_health()
-
-
-# ---------- 인덱싱 API ----------
-# 요청·응답 필드는 스펙대로 camelCase다. 파이썬 쪽 필드 이름은 snake_case로 두고 alias로만
-# 바꾼다 — 필드 이름 자체를 camelCase로 쓰면 이 파일 안에 이름 규칙이 두 개 생긴다.
-
-
-class CamelModel(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-
 # ---------- 완료 마커 ----------
 # "이 화가 인덱싱됐는가"의 진실은 이 서버의 메모리가 아니라 Neo4j다. lorekeeper 인덱싱의
-# 마지막 쓰기가 Chapter-[:IN_STORY]->Story(id:'main') 관계이므로(lorekeeper-poc의
-# context.update_global_summary — 전역 요약 갱신과 같은 쿼리에서 한 번에 MERGE된다),
-# 이 관계가 있으면 그 화는 추출·근거링크·요약까지 전부 끝났다는 뜻이다.
+# 마지막 쓰기가 Chapter-[:IN_STORY]->Story(id:'main') 관계이므로(context.update_global_summary
+# — 전역 요약 갱신과 같은 쿼리에서 한 번에 MERGE된다), 이 관계가 있으면 그 화는 추출·근거링크·
+# 요약까지 전부 끝났다는 뜻이다.
 #
 # 그래서 접수 시점에 화마다 이 마커를 확인한다:
 #   - 있으면 → 일하지 않고 즉시 done
@@ -332,46 +289,16 @@ def _now_rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-# ---------- 원고 원문 파일 ----------
-class IndexEpisode(CamelModel):
-    # episodeId는 Spring의 식별자다 — 이 서버는 해석하지 않고 상태 조회에서 그대로 돌려주기만 한다.
-    # episodeNo가 실제 인덱싱 단위(lorekeeper의 Chapter.number)다.
-    episode_id: int
-    episode_no: int
-    # text는 없으면 400으로 돌려주려고 일부러 옵셔널로 받는다. 필수로 선언하면 FastAPI가
-    # 먼저 422를 내는데, 스펙은 검증 실패를 400 {"detail": ...}로 정해뒀다.
-    text: str | None = None
-
-
-class IndexRequest(CamelModel):
-    # userId × workId가 작품 하나를 가리킨다. 둘 다 지금 KG에서 실제 필터로 쓰이지 않지만
-    # (kg_scope 참고) 인터페이스에는 처음부터 둔다 — 격리가 생겨도 API 계약을 다시 깨지 않게.
-    user_id: int
-    work_id: int
-    # 비었을 때 422가 아니라 400을 주려고 기본값을 둔다(text와 같은 이유).
-    episodes: list[IndexEpisode] = []
-
-
-class IndexAccepted(CamelModel):
-    job_id: str
-    user_id: int
-    work_id: int
-    episode_ids: list[int]
-    requested_at: str
-    remaining_tpm: int
-
-
-@app.post("/api/index", response_model=IndexAccepted, status_code=201)
-async def index_episodes(req: IndexRequest):
+async def submit(req: IndexRequest):
     """여러 화를 한 작업으로 접수하고 즉시 응답한다.
 
-    실제 처리(lorekeeper.indexing 호출)는 _index_worker가 이 요청의 커넥션과 무관하게
+    실제 처리(lorekeeper.indexing 호출)는 worker가 이 요청의 커넥션과 무관하게
     백그라운드에서, 받은 순서대로 하나씩 진행한다.
 
     접수 순서: 작품 확인 → 입력 검증 → 화별 완료 마커 확인 → 큐 전체 오름차순 확인 →
     TPM 여유 확인 → 저장·큐잉.
-    TPM에서 거절(429)당한 요청은 어디에도 남지 않아야 하므로, 상태 등록과 원고 파일 쓰기는
-    모두 그 확인을 통과한 뒤에 한다.
+    TPM에서 거절(429)당한 요청은 어디에도 남지 않아야 하므로, 상태 등록은 그 확인을
+    통과한 뒤에 한다.
     """
     require_indexed_work(req.work_id)
 
@@ -497,24 +424,7 @@ async def index_episodes(req: IndexRequest):
     )
 
 
-class IndexEpisodeStatus(CamelModel):
-    episode_id: int
-    # waiting | running | done | error. 모든 화가 done 또는 error면 그 작업은 끝난 것이다
-    # (작업 단위 status 필드는 따로 두지 않는다 — 화별 상태에서 유도되는 값이라 두 곳에
-    # 같은 사실을 적어두면 어긋날 수 있다).
-    status: str
-    error: str | None = None
-
-
-class IndexJobStatus(CamelModel):
-    job_id: str
-    user_id: int
-    work_id: int
-    episodes: list[IndexEpisodeStatus]
-
-
-@app.get("/api/index/jobs/{job_id}", response_model=IndexJobStatus)
-def get_index_job(job_id: str) -> IndexJobStatus:
+def get_status(job_id: str) -> IndexJobStatus:
     """작업 하나의 화별 진행 상태. 서버 프로세스 메모리에만 있으므로 재시작하면 사라지고,
     진행 중이던 인덱싱도 함께 끊긴다 — 그래도 되는 건 이게 "작업 중 상태"일 뿐 진실이 아니기
     때문이다. 무엇이 실제로 인덱싱됐는지의 정답은 Neo4j(완료 마커)이고, 작업 이력의 정답은
@@ -532,238 +442,7 @@ def get_index_job(job_id: str) -> IndexJobStatus:
         user_id=job["user_id"],
         work_id=job["work_id"],
         episodes=[
-            IndexEpisodeStatus(
-                episode_id=e["episode_id"], status=e["status"], error=e["error"]
-            )
+            IndexEpisodeStatus(episode_id=e["episode_id"], status=e["status"], error=e["error"])
             for e in job["episodes"]
         ],
     )
-
-
-# ---------- 설정 오류 탐지 API ----------
-# 인덱싱과 달리 회차 순서를 지킬 필요가 없다(검사 대상 회차 하나를 그 시점의 그래프와
-# 대조할 뿐, 검사끼리 서로 의존하지 않는다). 그래서 큐 없이 요청마다
-# asyncio.create_task로 바로 백그라운드에 띄운다 — 요청 커넥션과 무관하게 계속 진행되는
-# 성질은 인덱싱 워커와 동일하다.
-
-_detect_jobs: dict[str, dict] = {}  # job_id -> {"status": ..., "claims": [...], "findings": [...]}
-
-
-async def _run_detect(job_id: str, work_id: int, episode_number: int, text: str) -> None:
-    def on_claims_extracted(claims: list[dict]) -> None:
-        # claim 추출 직후 시점 — 호출자가 이 시점부터 claim별 진행 목록을 그릴 수 있게 한다.
-        # claim은 LLM이 만든 JSON이라 키가 있어도 값이 null일 수 있다. 기본값을 or로 씌워
-        # 조회 API가 응답 검증에서 500을 내지 않게 한다(진행 조회는 무슨 일이 있어도 살아야 한다).
-        _detect_jobs[job_id]["claims"] = [
-            {
-                "index": i,
-                "quote": c.get("quote") or "",
-                "category": c.get("category") or "기타",
-                "status": "running",
-                "label": None,
-                "established_fact": None,
-                "source_episode": None,
-                "explanation": None,
-            }
-            for i, c in enumerate(claims)
-        ]
-
-    def on_claim_done(index: int, result: dict) -> None:
-        entry = _detect_jobs[job_id]["claims"][index]
-        entry.update(
-            {
-                "status": "done",
-                "label": result.get("label"),
-                "established_fact": result.get("established_fact"),
-                "source_episode": result.get("source_episode"),
-                "explanation": result.get("explanation"),
-            }
-        )
-
-    _detect_jobs[job_id]["status"] = "running"
-    try:
-        # 인덱싱 워커와 같은 이유로 여기서도 kg_scope를 통과시킨다 — 파이프라인이 보는 그래프의
-        # 작품 범위를 정하는 지점은 이 프로젝트에서 kg_scope 하나뿐이어야 한다.
-        kg_scope(work_id)
-        # episode_number를 파이프라인에 넘긴다. 이게 없으면 검사 대상 회차를 **자기 자신을 포함한
-        # 그래프 전체**와 대조하게 된다 — 5화를 5화가 만든 사실과 비교해 "일치"라고 자평하고,
-        # 6~10화가 나중에 밝힌 반전을 5화에 심어둔 모순으로 읽는다.
-        findings = await check_new_episode_streaming(
-            text, episode_number, on_claims_extracted, on_claim_done
-        )
-        # 리포트는 파일 두 개(md+json)를 쓴다 — 이벤트 루프에서 직접 쓰지 않는다.
-        await asyncio.to_thread(
-            save_report_files, findings, job_id, display_label=f"{episode_number}화"
-        )
-        # 결과와 상태를 한 번의 update로 쓴다. 조회 API(get_detect_job)는 다른 스레드에서 도는데,
-        # 두 줄로 나눠 쓰면 그 사이에 들어온 폴링이 status="done" + findings=null을 보고,
-        # 호출자는 폴링을 멈춘 뒤 "오류 0건"인 빈 리포트를 확정 저장한다.
-        _detect_jobs[job_id].update({"findings": findings, "status": "done"})
-    except Exception as exc:  # noqa: BLE001 — 실패 사유를 상태로 노출해야 호출자가 보여줄 수 있다
-        logger.exception("설정 오류 탐지 실패 | job_id=%s episode=%s", job_id, episode_number)
-        # 같은 이유로 사유와 상태를 함께 쓴다(status="error" + detail=null을 보이지 않게).
-        _detect_jobs[job_id].update({"detail": str(exc), "status": "error"})
-
-
-class DetectRequest(BaseModel):
-    job_id: str
-    work_id: int
-    episode_number: int
-    text: str
-
-
-class JobAck(BaseModel):
-    # 인덱싱과 달리 여기서는 job_id를 Spring이 발급한다 — 검사 요청 하나가 회차 하나라
-    # 호출자가 부여한 id를 그대로 쓰는 편이 단순하다. 필드도 기존 snake_case 그대로다.
-    job_id: str
-    status: str
-
-
-@app.post("/api/detect", response_model=JobAck, status_code=202)
-async def start_detect(req: DetectRequest) -> JobAck:
-    """설정 오류 탐지를 백그라운드로 시작하고 즉시 응답한다. 실제 검사(claim 추출 → claim별
-    병렬 검증 → 판정 집계)는 이 요청의 커넥션과 무관하게 진행된다."""
-    require_indexed_work(req.work_id)
-
-    known = _detect_jobs.get(req.job_id)
-    if known is not None:
-        # 인덱싱과 같은 이유(재시도 방어). 여기선 그래프가 더러워지진 않지만 회차 하나 검사에
-        # 수십 번의 LLM 호출이 들어가므로 중복 실행 비용이 특히 크다.
-        return JobAck(job_id=req.job_id, status=known["status"])
-
-    _detect_jobs[req.job_id] = {"status": "queued", "claims": []}
-    asyncio.create_task(_run_detect(req.job_id, req.work_id, req.episode_number, req.text))
-    return JobAck(job_id=req.job_id, status="queued")
-
-
-class DetectClaimProgress(BaseModel):
-    """검사 중인 claim 하나의 진행 상황. 프론트가 검사가 끝나기 전에 목록을 그리기 위한 것이다.
-
-    claim 추출이 끝나는 순간 전부 status="running"으로 한꺼번에 나타나고, 검증이 끝난 것부터
-    하나씩 status="done"으로 바뀐다(claim들은 병렬 검증이라 끝나는 순서는 index 순이 아니다).
-    index는 이 배열 안에서 고정이라 프론트가 행을 안정적으로 식별할 수 있다.
-    """
-
-    index: int  # 0부터. 검사가 끝날 때까지 이 claim의 고정 식별자다.
-    quote: str  # 신규 회차 원문에서 뽑은 서술 그대로
-    category: str  # 생사/소유물/능력/관계/소속/시점 등. 추출기가 정하고 미지정이면 "기타"
-    status: str  # "running" | "done"
-    # 아래 넷은 status="done"이 되기 전까지 전부 null이다(판정 전에는 알 수 없는 값이라서).
-    label: str | None = None  # "contradiction" | "consistent" | "unknown"
-    established_fact: str | None = None
-    # 모델이 "3" 또는 "3화"처럼 돌려줄 수 있어 숫자로 강제하지 않는다 — 조회 API가 판정 결과의
-    # 표기 때문에 500을 내면 안 된다.
-    source_episode: int | str | None = None
-    explanation: str | None = None
-
-
-class DetectStatus(BaseModel):
-    job_id: str
-    status: str
-    detail: str | None = None
-    # claims: 진행 상황(검사 중에도 채워진다). 접수 직후엔 빈 배열이고 절대 null이 아니다.
-    # findings: 최종 판정 결과(status="done"일 때만 채워진다). claims와 달리 파이프라인이 만든
-    # dict 그대로 나간다 — tool_calls_used·entities처럼 claims에 없는 필드가 더 들어 있다.
-    claims: list[DetectClaimProgress] = []
-    findings: list[dict] | None = None
-
-
-@app.get("/api/detect/{job_id}", response_model=DetectStatus)
-def get_detect_job(job_id: str) -> DetectStatus:
-    """검사 하나의 진행 상태와 결과. 인덱싱 조회와 마찬가지로 모르는 job_id는 404다."""
-    state = _detect_jobs.get(job_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail=f"'{job_id}' 탐지 작업 기록이 없습니다.")
-    # 검사 작업은 이벤트 루프에서, 이 조회는 FastAPI의 스레드풀에서 돈다. 필드를 하나씩 읽으면
-    # 읽는 도중에 상태가 바뀌어 "status는 새 값, findings는 옛 값" 같은 조합을 볼 수 있다.
-    # dict(state) 한 번으로 스냅샷을 떠서 그 한 시점만 보고 응답을 만든다.
-    snapshot = dict(state)
-    return DetectStatus(
-        job_id=job_id,
-        status=snapshot["status"],
-        detail=snapshot.get("detail"),
-        claims=snapshot.get("claims") or [],
-        findings=snapshot.get("findings"),
-    )
-
-
-# ---------- AI 채팅 API ----------
-# 인덱싱/검사와 달리 백그라운드 작업이 아니다 — 작가가 답을 기다리고 있으므로 이 요청 안에서
-# 끝까지 처리해 JSON으로 한 번에 돌려준다(스트리밍 아님). 대화 기록은 서버 메모리에 남기지
-# 않는다: 진실의 원천은 API 서버(Spring)의 chat_messages 테이블이고, 여기는 매 턴 통째로
-# 받아서 답만 만들어 주는 무상태 계산기다(그래야 이 서버가 재시작해도 대화가 안 끊긴다).
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatEditingEpisode(BaseModel):
-    """작가가 지금 고쳐 쓰고 있는 회차. 본문은 발췌가 아니라 **전문**이다.
-
-    number가 없을 수 있다 — API 서버의 DRAFT는 화수가 확정되기 전이라 번호가 null이다.
-    """
-
-    # 화수. DRAFT(아직 확정 전)면 없다.
-    number: int | None = None
-    title: str | None = None
-    text: str | None = None
-
-
-class ChatContext(BaseModel):
-    """이번 질문의 회차 컨텍스트.
-
-    회차에 얽힌 개념은 셋인데 여기 실리는 건 둘뿐이다:
-      - editing_episode  : 집필 중인 회차(전문 포함). API 서버가 도메인 규칙으로 정한다.
-      - viewing_episode_number : 화면에 열어 둔 회차. 프론트만 알 수 있다.
-    셋째인 "인덱싱된 회차"는 **일부러 요청에 없다.** 그건 Neo4j 그래프의 사실이고, 요청이
-    들고 온 값은 인덱싱이 진행되는 동안 곧바로 낡는다. 에이전트가 매 턴 직접 조회한다
-    (src/chat/indexed.py).
-
-    셋 다 없어도 대화는 성립한다 — 편집기를 열지 않고 질문만 하는 경우가 있다.
-    """
-
-    editing_episode: ChatEditingEpisode | None = None
-    viewing_episode_number: int | None = None
-
-
-class ChatRequest(BaseModel):
-    work_id: int
-    session_id: int
-    messages: list[ChatMessage]
-    context: ChatContext = ChatContext()
-
-
-class ChatToolCall(BaseModel):
-    name: str
-    summary: str
-    status: str
-
-
-class ChatResponse(BaseModel):
-    content: str
-    tool_calls: list[ChatToolCall] = []
-    suggested_title: str | None = None
-
-
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> ChatResponse:
-    """작가의 질문 하나에 답한다.
-
-    에이전트가 KG(인물 상태·사건)와 원고 DB를 직접 조회해서 답을 만든다. 어떤 도구를 몇 번
-    부를지는 질문마다 다르므로 모델이 스스로 고른다 — 그 내역을 tool_calls로 함께 내려보내
-    프론트가 "무엇을 찾아봤는지"를 보여줄 수 있게 한다(근거 없는 답변처럼 보이지 않게 하는 게
-    이 필드의 목적이다).
-
-    suggested_title은 대화 첫 턴에만 채워진다. 세션 제목을 저장할지 말지는 API 서버가 정한다.
-    """
-    require_indexed_work(req.work_id)
-
-    result = await run_chat(
-        work_id=req.work_id,
-        session_id=req.session_id,
-        messages=[m.model_dump() for m in req.messages],
-        context=req.context.model_dump(),
-    )
-    return ChatResponse(**result)

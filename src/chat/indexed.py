@@ -5,7 +5,7 @@
 
 "인덱싱됐다"의 정의는 `Chapter-[:IN_STORY]->Story` 마커다. lorekeeper 인덱싱의 마지막
 쓰기가 이 관계라서(전역 요약 갱신과 같은 쿼리에서 MERGE된다), 이게 있으면 추출·근거링크·
-요약까지 전부 끝났다는 뜻이다. 인덱싱 접수의 빠른 경로(webapp._already_indexed)도 같은
+요약까지 전부 끝났다는 뜻이다. 인덱싱 접수의 빠른 경로(index job_service._already_indexed)도 같은
 마커를 본다. 다른 출처(Spring의 회차 목록, 인덱싱 작업 상태, 환경변수 …)는 전부 이 마커와
 어긋날 수 있다 — 회차가 저장돼 있어도 인덱싱은 아직 안 끝났을 수 있고, 작업이 done이어도
 그건 이 서버 메모리의 주장일 뿐이다. 그래서 그래프에 직접 묻는다.
@@ -22,7 +22,7 @@ import logging
 from src.lorekeeper.client import get_driver
 from src.lorekeeper.indexing import DATABASE as LOREKEEPER_DATABASE
 
-from src.chat.kg_scope import kg_scope
+from src.service.kg_scope import kg_scope
 
 logger = logging.getLogger("chat.indexed")
 

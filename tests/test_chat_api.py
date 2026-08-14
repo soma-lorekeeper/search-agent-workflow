@@ -16,9 +16,10 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from src import webapp
+from src import app as app_module
+from src.controller import chat_controller
 from src.chat import agent as chat_agent
-from src.chat import kg_scope
+from src.service import kg_scope
 
 # KG에 인덱싱돼 있다고 보는 작품. 실제 값은 환경변수라서 테스트에서 고정한다.
 WORK_ID = 1
@@ -36,9 +37,9 @@ def captured_chat(monkeypatch):
         captured.update(kwargs)
         return {"content": "답", "tool_calls": [], "suggested_title": None}
 
-    monkeypatch.setattr(webapp, "run_chat", _stub)
+    monkeypatch.setattr(chat_controller, "run_chat", _stub)
     monkeypatch.setattr(kg_scope, "KG_INDEXED_WORK_ID", WORK_ID)
-    with TestClient(webapp.app) as client:
+    with TestClient(app_module.app) as client:
         yield client, captured
 
 
