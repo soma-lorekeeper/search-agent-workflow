@@ -1,0 +1,94 @@
+"""서비스가 평가 하네스와 **같은 프롬프트**를 만드는지 대조한다.
+
+탐지 파이프라인의 성능 수치(검출 22/25, 클린 회차 오탐 0)는 하네스에서 잰 것이다. 서비스가
+그 수치를 물려받는 근거는 "같은 입력에 같은 프롬프트를 만든다"는 것뿐이라, 문안이 한 글자만
+달라져도 측정치는 무효가 된다.
+
+사람이 옮겨 적은 문자열은 언젠가 어긋난다 — 그때 조용히 성능만 떨어지는 대신 이 테스트가
+깨지게 한다. LLM이나 DB를 부르지 않는다(문자열 조립만 비교한다).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+# 하네스는 scripts/ 아래 있고 PYTHONPATH 없이도 임포트되도록 conftest가 루트를 잡아준다.
+eval_claims = pytest.importorskip(
+    "scripts.eval_claims", reason="평가 하네스가 없으면 대조할 기준도 없다"
+)
+
+from src.service.detect import docstore, judge_service, prompts  # noqa: E402
+from src.service.detect.extract_service import CHUNK_SIZE, _cap_for  # noqa: E402
+
+# 검색 결과 한 건이 든 최소 evidence. 두 구현에 같은 입력을 준다.
+_EVIDENCE = {
+    # run·draft는 하네스가 파일 이름을 짓는 데 쓰던 필드다. 서비스는 안 쓰지만
+    # 하네스 쪽 build_docstore가 요구하므로 대조 입력에는 넣어 둔다.
+    "run": "parity",
+    "draft": "parity",
+    "records": [
+        {
+            "claim": {"id": "P1", "quote": "인용", "axis": "축", "value": "값", "lines": [3]},
+            "channels": [
+                {
+                    "tool": "hybrid_search",
+                    "args": {},
+                    "content": "채널 텍스트",
+                    "items": [
+                        {
+                            "metadata": {
+                                "kind": "chunk",
+                                "eid": "e1",
+                                "chapter": 3,
+                                "chunk_index": 12,
+                                "text": "원문 조각",
+                            }
+                        }
+                    ],
+                }
+            ],
+        }
+    ],
+}
+_CLAIMS = [_EVIDENCE["records"][0]["claim"]]
+
+
+def test_추출_프롬프트_문안이_하네스와_같다():
+    """qav2 확정 문안 그대로여야 한다. 하네스는 치환 체인으로 만들고 서비스는 결과를 굳혀 뒀다."""
+    assert prompts.EXTRACT_CRITERIA == eval_claims._CRITERIA_QAV2
+    assert prompts.EXTRACT_FEWSHOT == eval_claims._FEWSHOT_QAV2
+    assert prompts.ENTITY_NODE_HEADER == eval_claims._NODE_HEADER
+
+
+def test_추출_범위_문단의_상한이_하네스와_같다():
+    """상한은 조각 크기에서 유도된다 — 조각 크기를 바꾸면 이 숫자도 함께 움직여야 한다."""
+    expected = eval_claims._SCOPE_CHUNK_NO_DRAFT.replace(
+        "{max_claims}", str(eval_claims.cap_for(CHUNK_SIZE))
+    )
+    assert prompts.EXTRACT_SCOPE.replace("{max_claims}", str(_cap_for(CHUNK_SIZE))) == expected
+
+
+def test_판정_프롬프트_문안이_하네스_p4와_같다():
+    criteria, fewshot = eval_claims._JUDGE_PROMPTS["p4"]
+    assert prompts.JUDGE_CRITERIA == criteria
+    assert prompts.JUDGE_FEWSHOT == fewshot
+
+
+def test_문서고_렌더가_하네스와_같다():
+    """별칭 부여와 렌더가 같아야 판정기가 보는 근거 문자열이 같다."""
+    harness = eval_claims.build_docstore(_EVIDENCE)
+    service = docstore.build_docstore(_EVIDENCE)
+    assert docstore.render_docstore(service) == eval_claims.render_docstore(harness)
+    assert docstore.render_claim_refs(service, _CLAIMS) == eval_claims.render_claim_refs(
+        harness, _CLAIMS
+    )
+
+
+def test_판정_system_전체가_하네스와_같다():
+    """기준+예시+문서고를 잇는 순서와 구분자까지 같은지 본다."""
+    harness_store = eval_claims.build_docstore(_EVIDENCE)
+    service_store = docstore.build_docstore(_EVIDENCE)
+    eval_claims.JUDGE_PROMPT_VERSION = "p4"
+    assert judge_service.build_system(service_store) == eval_claims.build_judge_system(
+        harness_store
+    )

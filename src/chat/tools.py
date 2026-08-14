@@ -1,11 +1,11 @@
 """채팅 에이전트가 쓰는 도구 6종.
 
-KG 4종은 lorekeeper의 retriever를 그대로 실행기로 쓰고(src/contradiction/tools.py와 같은
+KG 3종은 lorekeeper의 retriever를 그대로 실행기로 쓰고(src/service/retrieval_tools.py와 같은
 방식으로 OpenAI function-calling 스키마만 우리가 직접 명시한다), 나머지 2종은 PostgreSQL의
 원고/작품 테이블을 직접 읽는다. KG에는 요약·사실만 들어 있어 "16화 그 장면 원문 그대로"를
 답할 수 없으므로, 원고 조회는 그래프가 아니라 원본 DB에서 가져와야 한다.
 
-contradiction 쪽 도구와 두 가지가 다르다.
+탐지 쪽 도구와 두 가지가 다르다.
   1. 모든 도구가 (user_id, work_id)를 앞 두 인자로 받는다 — KG 도구는 그 둘로 테넌트를
      해소해 그래프를 좁히고, PostgreSQL 도구는 work_id로 조회한다(그쪽 테이블의 소유권
      검사는 Spring이 요청 전에 끝낸다). 인자 모양을 통일해 두면 에이전트의 주입 코드가
@@ -28,7 +28,7 @@ from neo4j_graphrag.tool import Tool
 
 from src import config  # noqa: F401 — import 시점에 .env를 로드해 DATABASE_URL을 환경변수로 채운다
 from src.service.kg_scope import kg_scope
-from src.contradiction.tools import format_tool_result
+from src.service.retrieval_tools import format_tool_result
 
 logger = logging.getLogger("chat.tools")
 

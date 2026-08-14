@@ -2,7 +2,7 @@
 
 플레이스홀더는 str.format이 아니라 .replace()로 채운다 — 도구 가이드나 사용자 발화에
 중괄호가 섞이면 str.format이 그걸 플레이스홀더로 오인해 KeyError를 내기 때문
-(src/contradiction/prompts.py와 같은 이유).
+(src/service/detect/prompts.py와 같은 이유).
 """
 
 # 채팅 호출은 시스템 프롬프트(도구 가이드 포함)라는 큰 공통 prefix를 매 턴 반복해서 보낸다.

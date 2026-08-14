@@ -1,45 +1,60 @@
 # search-agent-workflow — 결
 
-소설 업로드 → 검색(Q&A) → 설정 오류(모순) 탐지 리포트, 3가지를 제공하는 PoC.
+소설 원고를 지식 그래프로 인덱싱하고, 새 회차가 기존 설정과 어긋나는지 검사하고,
+작가의 질문에 그래프를 근거로 답하는 파이썬 워커.
 
-**2026-07-25 재구성**: DB/스키마/인덱싱을 자체 구현 대신 팀원의 [`lorekeeper-poc`](../lorekeeper-poc)를
-라이브러리로 가져다 쓰는 구조로 바꿨다. 이 문서 시점 기준으로 **아직 스캐폴딩 단계**이고
-(webapp이 정적 mock 페이지만 서빙), 검색/모순탐지 로직을 lorekeeper 위에 다시 구현하는
-작업이 남아있다.
+CloudFront → Spring(8080) → **이 서버(127.0.0.1:8000)** 구조의 맨 안쪽이다. 외부에
+노출되지 않고 Spring만 호출한다.
 
 ## 디렉토리 구조
 
 ```
-agentic-workflow/
-├─ lorekeeper-poc/        # 팀원 레포를 이 폴더 안에 clone (gitignore 대상, 우리 레포에 커밋 안 됨)
-│                         # → requirements.txt가 pip install -e 로 편집 가능 설치
-│                         # → 내부 로직(poc/src/*.py)은 절대 수정하지 않음, import만
-├─ src/                   # 우리 오케스트레이션 레이어 (지금은 최소 스캐폴딩만)
-│  ├─ config.py           # .env 로드 (NEO4J_*, OPENAI_API_KEY 등)
-│  └─ webapp.py           # FastAPI — 지금은 정적 페이지 서빙만, 백엔드 API 없음
-├─ static/                # 개발용 데모 페이지 (제품 화면 아님 — 제품 프론트는 API 서버 쪽이다)
-│  ├─ upload.html         # 원고 접수 (POST /api/index — 여러 화를 한 번에, jobId는 서버가 발급)
-│  └─ library.html        # 원고 목록 + 뷰어
-├─ data/                  # 원문(episode*.txt, 저작권상 미커밋) — lorekeeper.indexing()에 넣을 입력
-├─ docker-compose.yml     # lorekeeper-poc와 동일한 Neo4j 5.26+APOC 설정 (인증정보 반드시 일치)
-├─ requirements.txt
-├─ .env / .env.example
-└─ archive/               # 이전 세션의 자체 구현(Qdrant→MySQL+Neo4j→Neo4j단독 등 여러 버전 거침).
-                           # 참고용으로 보존, 더 이상 실행 대상 아님. 상세: archive/ARCHITECTURE.md, archive/SUMMARY.md
+search-agent-workflow/
+├─ src/
+│  ├─ app.py                  # FastAPI 조립. 진입점은 src.app:app
+│  ├─ config/                 # .env 로드, 모델·경로 상수
+│  ├─ common/                 # Tenant(소설 격리 키), OpenAI 호출 관문, 토큰 집계
+│  ├─ controller/             # 라우트와 상태 코드만 안다 (health/index/detect/chat)
+│  ├─ dto/                    # 와이어 포맷 (index·detect는 camelCase, chat만 snake_case)
+│  ├─ service/
+│  │  ├─ index/               # 인덱싱 — 작업 큐·워커·TPM + 추출 파이프라인·요약·병합
+│  │  ├─ detect/              # 설정 오류 탐지 — 추출 → 검색 → 판정 3단계
+│  │  ├─ chat/                # 작가 Q&A 에이전트
+│  │  └─ kg_scope.py          # 요청을 KG 테넌트로 해소하는 유일한 지점
+│  └─ repository/
+│     ├─ neo4j/               # 드라이버·청크·사실·근거·검색 (그래프)
+│     └─ postgres/            # 원고 조회, 탐지 결과 기록 (Spring과 공유하는 DB)
+├─ scripts/eval_claims.py     # 탐지 파이프라인 평가 하네스. 프롬프트 문안의 원천이다
+├─ tests/                     # LLM·DB를 실제로 부르지 않는다(전부 가짜로 대체)
+├─ docs/
+│  ├─ api-spec.md             # Indexing API 스펙 (Spring 팀용)
+│  └─ detect-api-spec.md      # Detection API 스펙 (Spring 팀용)
+├─ data/                      # 원문(저작권상 미커밋)
+├─ docker-compose.yml         # 로컬 Neo4j 2026.07 + PostgreSQL 17
+├─ requirements.txt           # 운영 의존성
+├─ requirements-dev.txt       # + 테스트
+└─ archive/                   # 이전 세션의 자체 구현. 참고용 보존, 실행 대상 아님
 ```
 
-## lorekeeper 패키지 사용법
+## 지식 그래프 계층
 
-`lorekeeper-poc/poc`를 editable 설치하면 `lorekeeper` 패키지로 import된다 (자세한 스펙은
-`lorekeeper-poc/README.md` 참고, 이 레포에서 그 파일을 수정하지 않는다):
+원래 팀원 레포(`lorekeeper-poc`)를 editable 설치해 라이브러리로 쓰다가, 그쪽에 쌓인
+로컬 수정이 어느 레포에도 저장되지 않는 문제 때문에 이 레포로 들여왔다. 지금은
+`src/repository/neo4j/`(쿼리)와 `src/service/index/`(인덱싱 정책)로 나뉘어 있다.
 
 ```python
-from lorekeeper import indexing                          # async def indexing(chapter: int, text: str) -> dict
-from lorekeeper import build_retrievers, build_retrieval_tools
+from src.common.tenant import Tenant
+from src.service.index.indexing_service import indexing
+from src.repository.neo4j.retrieval import build_retrievers, build_retrieval_tools
 
-retrievers = build_retrievers()   # {"vector_cypher", "hybrid_cypher", "entity_state_history", "text2cypher"}
-tools = build_retrieval_tools()   # neo4j_graphrag.tool.Tool 리스트 — LangGraph 등에 배선
+tenant = Tenant.of(user_id=42, work_id=7)   # 소설 한 편 = 테넌트
+await indexing(tenant, chapter=6, text="…")
+retrievers = build_retrievers(tenant)       # {"hybrid_cypher", "fact_search", "entity_search"}
+tools = build_retrieval_tools(tenant)       # LLM 도구로 감싼 것
 ```
+
+**모든 그래프 접근이 `Tenant`를 요구한다.** 그래프가 소설별로 격리돼 있고, 필터를
+빠뜨린 경로가 타입으로 드러나게 하려는 설계다.
 
 ## 이 서버의 위치
 
@@ -59,21 +74,21 @@ CloudFront ──/api/*──▶ Spring (:8080) ──▶ 이 서버 (127.0.0.1:
 ## 로컬 실행
 
 ```bash
-# 1. 별도 레포를 라이브러리로 클론 (.gitignore 대상이라 이 레포에 없다)
-git clone https://github.com/Gomdadi/lorekeeper-poc.git
-
-# 2. DB 기동 — Neo4j + PostgreSQL
+# 1. DB 기동 — Neo4j + PostgreSQL
 docker compose up -d
 
-# 3. .env 구성 (.env.example 참고)
-cp .env.example .env    # OPENAI_API_KEY 를 채운다
+# 2. .env 구성 (.env.example 참고)
+cp .env.example .env    # OPENAI_API_KEY 와 DATABASE_URL 을 채운다
 
-# 4. 의존성 설치 (lorekeeper-poc 를 editable install)
+# 3. 의존성 설치
 python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements-dev.txt   # 운영만 필요하면 requirements.txt
 
-# 5. 서버 실행
+# 4. 서버 실행
 .venv/bin/uvicorn src.app:app --host 127.0.0.1 --port 8000
+
+# 테스트 (LLM·DB 를 실제로 부르지 않는다)
+.venv/bin/pytest -q
 ```
 
 > **파이썬은 3.12로 고정한다.** 의존성 `python-mecab-ko`의 aarch64 휠이 cp312까지만
@@ -128,7 +143,7 @@ curl localhost:8000/api/health | python3 -m json.tool
 `main`에 푸시하면 GitHub Actions가 소스를 묶어 S3에 올리고 SSM으로 EC2에서 설치·재기동한다.
 
 의존성 설치는 러너가 아니라 **인스턴스에서** 한다 — 러너는 x86_64, 인스턴스는 arm64라
-휠이 다르기 때문이다. `lorekeeper-poc`도 설치 직전에 클론한다.
+휠이 다르기 때문이다.
 
 원고(`data/`)와 리포트(`reports/`)는 아티팩트에 담지 않는다. 서버의 `/opt/agent/state/`를
 심볼릭 링크로 연결해 재배포해도 유지된다.

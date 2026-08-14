@@ -12,7 +12,7 @@
 judge(판정) 단계는 이번 범위 밖이다 — 추출 커버리지와 검색 도달률까지만 잰다. assemble은
 그 judge에 넘길 컨텍스트를 미리 조립해 분량과 근거 보존을 재는 단계다.
 
-여기 프롬프트는 프로덕션(src/contradiction/prompts.py)의 구 스키마와 별개인 신 스키마
+여기 프롬프트는 프로덕션(src/service/detect/prompts.py)에 동결된 문안의 원천이다 — 신 스키마
 실험용이고, 둘을 같은 초고로 비교한 뒤에 src 반영을 결정한다.
 """
 
@@ -43,9 +43,9 @@ def _eval_tenant() -> Tenant:
 from openai import AsyncOpenAI, RateLimitError
 
 from src.config import DATA_DIR, OPENAI_API_KEY
-from src.contradiction import usage
+from src.common import usage
 from src.common.tenant import Tenant
-from src.contradiction.tools import build_openai_tools, format_tool_result
+from src.service.retrieval_tools import build_openai_tools, format_tool_result
 
 # Neo4j가 RELATED_TO 관계 부재(알려진 갭)를 매 쿼리마다 경고로 뱉어 출력을 뒤덮는다.
 logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
@@ -2672,7 +2672,7 @@ async def _judge_once(
 
 
 async def _create_with_retry(**kwargs):
-    """RateLimitError에 지수 백오프 + 지터. src/contradiction/agent.py:33-53과 같은 패턴.
+    """RateLimitError에 지수 백오프 + 지터. src/common/openai_client.py와 같은 패턴.
 
     그쪽을 import하지 않는 이유는 private 함수인 데다 그 모듈이 tools/prompts를 끌고 오기
     때문이다. 판정은 한 호출에 27k를 쓰므로 몇 편만 겹쳐도 조직 TPM에 순간적으로 몰린다.

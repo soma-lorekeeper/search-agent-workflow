@@ -10,6 +10,9 @@ from src.dto.common import CamelModel
 class DetectRequest(CamelModel):
     # userId × workId가 KG 테넌트(소설 한 편)를 가리킨다. 인덱싱과 같은 키여야
     # 인덱싱한 그래프를 검사가 찾을 수 있다.
+    #
+    # jobId는 Spring이 발급한다 — 검사 요청 하나가 회차 하나라 호출자가 부여한 id를
+    # 그대로 쓰는 편이 단순하고, 이 서버가 죽어도 "무엇을 맡겼는지"가 그쪽에 남는다.
     job_id: str
     user_id: int
     work_id: int
@@ -18,39 +21,44 @@ class DetectRequest(CamelModel):
 
 
 class JobAck(CamelModel):
-    # 인덱싱과 달리 여기서는 job_id를 Spring이 발급한다 — 검사 요청 하나가 회차 하나라
-    # 호출자가 부여한 id를 그대로 쓰는 편이 단순하다.
     job_id: str
     status: str
 
 
-class DetectClaimProgress(CamelModel):
-    """검사 중인 claim 하나의 진행 상황. 프론트가 검사가 끝나기 전에 목록을 그리기 위한 것이다.
+class DetectFinding(CamelModel):
+    """설정 오류로 판정된 claim 하나.
 
-    claim 추출이 끝나는 순간 전부 status="running"으로 한꺼번에 나타나고, 검증이 끝난 것부터
-    하나씩 status="done"으로 바뀐다(claim들은 병렬 검증이라 끝나는 순서는 index 순이 아니다).
-    index는 이 배열 안에서 고정이라 프론트가 행을 안정적으로 식별할 수 있다.
+    **오류가 아닌 claim은 여기 오지 않는다.** 화면이 그리는 것이 오류 목록이라, 일치하거나
+    근거가 없어 판단할 수 없는 claim까지 내보내면 회차당 수백 건이 오간다. 검사한 총량은
+    claimCount가 대신 말해준다.
     """
 
-    index: int  # 0부터. 검사가 끝날 때까지 이 claim의 고정 식별자다.
-    quote: str  # 신규 회차 원문에서 뽑은 서술 그대로
-    category: str  # 생사/소유물/능력/관계/소속/시점 등. 추출기가 정하고 미지정이면 "기타"
-    status: str  # "RUNNING" | "DONE"
-    # 아래 넷은 status="done"이 되기 전까지 전부 null이다(판정 전에는 알 수 없는 값이라서).
-    label: str | None = None  # "contradiction" | "consistent" | "unknown"
-    established_fact: str | None = None
-    # 모델이 "3" 또는 "3화"처럼 돌려줄 수 있어 숫자로 강제하지 않는다 — 조회 API가 판정 결과의
-    # 표기 때문에 500을 내면 안 된다.
-    source_episode: int | str | None = None
-    explanation: str | None = None
+    claim_id: str  # P1~PN. 추출 순서 = 원고 등장 순서라 화면 정렬에 그대로 쓸 수 있다.
+    quote: str  # 원고에서 문제가 된 서술 그대로
+    axis: str  # 무엇에 대한 주장인가(예: "서진우의 소속")
+    value: str  # 원고가 주장하는 값
+    line_ids: list[int]  # 원고 줄 번호. 화면이 본문 위에 하이라이트를 건다.
+    # 지금은 항상 true다(오류만 싣는다). 임계값을 옮기거나 "의심" 등급을 더해도 계약이
+    # 안 바뀌도록 필드로 둔다.
+    is_error: bool
+    reason: str
+    # 근거 원문의 좌표. (회차, 조각 번호) 자연키라 화면이 그 조각을 바로 열 수 있다.
+    cited: list[dict]
 
 
 class DetectStatus(CamelModel):
     job_id: str
+    # QUEUED | RUNNING | DONE | ERROR
     status: str
+    # EXTRACT | RETRIEVE | JUDGE. 진행 중일 때만 값이 있다.
+    # 판정은 한 번에 배치로 하므로 claim 단위 진행률이라는 게 없다 — 대신 어느 단계인지만
+    # 알린다. DB에는 없는 값이다(메모리 전용).
+    phase: str | None = None
+    # 검사한 claim 총수. 추출이 끝나야 알 수 있어 그 전에는 null이다.
+    claim_count: int | None = None
+    # 오류로 판정된 수. DB 컬럼과 같은 의미로 항상 실린다(DONE 전에는 0).
+    contradiction_count: int = 0
+    # 완료 전에는 null이다. 절대 빈 배열이 아니다 — 빈 배열은 "검사했는데 오류 0건"이라는
+    # 다른 뜻이라, 진행 중을 그렇게 표시하면 호출자가 폴링을 멈춘다.
+    findings: list[DetectFinding] | None = None
     detail: str | None = None
-    # claims: 진행 상황(검사 중에도 채워진다). 접수 직후엔 빈 배열이고 절대 null이 아니다.
-    # findings: 최종 판정 결과(status="done"일 때만 채워진다). claims와 달리 파이프라인이 만든
-    # dict 그대로 나간다 — tool_calls_used·entities처럼 claims에 없는 필드가 더 들어 있다.
-    claims: list[DetectClaimProgress] = []
-    findings: list[dict] | None = None
