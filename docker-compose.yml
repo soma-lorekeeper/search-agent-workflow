@@ -2,6 +2,11 @@
 # (Neo4j = 전용 EC2, PostgreSQL = RDS). 여기 값들은 전부 로컬 전용이라 비밀이 아니다.
 #
 #   docker compose up -d
+
+# 프로젝트명을 못 박는다. 지정하지 않으면 디렉터리명이 쓰이는데, 그러면 폴더를 옮기거나
+# 이름을 바꾸는 순간 볼륨 접두어가 달라져 기존 DB 데이터가 통째로 안 보이게 된다.
+name: lorekeeper-ai
+
 services:
   neo4j:
     # 2026.x 달력 버저닝. 5.26에서 올린 이유는 벡터 인덱스의 인-인덱스 필터(SEARCH 절)다 —
@@ -12,7 +17,7 @@ services:
     # 5.26이고 2028-11까지 지원된다 — 안정성이 우선이면 그쪽이 선택지지만, 인-인덱스 필터가
     # 2026.02 GA라 테넌트 격리를 위해 올린다.)
     image: neo4j:2026.07.1-community
-    container_name: agentic-workflow-neo4j
+    container_name: lorekeeper-ai-neo4j
     ports:
       - "7474:7474"   # Neo4j Browser
       - "7687:7687"   # Bolt
@@ -45,7 +50,7 @@ services:
     # 프로덕션 RDS 와 같은 메이저 버전. lorekeeper-backend 의 compose.dev.yml 과도
     # 같은 DB/계정을 쓴다 — 두 서비스가 같은 관계형 데이터를 본다.
     image: postgres:17-alpine
-    container_name: agentic-workflow-postgres
+    container_name: lorekeeper-ai-postgres
     ports:
       - "5432:5432"
     environment:

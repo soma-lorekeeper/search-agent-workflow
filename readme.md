@@ -1,4 +1,4 @@
-# search-agent-workflow — 결
+# lorekeeper-ai — 결
 
 소설 원고를 지식 그래프로 인덱싱하고, 새 회차가 기존 설정과 어긋나는지 검사하고,
 작가의 질문에 그래프를 근거로 답하는 파이썬 워커.
@@ -9,7 +9,7 @@ CloudFront → Spring(8080) → **이 서버(127.0.0.1:8000)** 구조의 맨 안
 ## 디렉토리 구조
 
 ```
-search-agent-workflow/
+lorekeeper-ai/
 ├─ src/
 │  ├─ app.py                  # FastAPI 조립. 진입점은 src.app:app
 │  ├─ config/                 # .env 로드, 모델·경로 상수
