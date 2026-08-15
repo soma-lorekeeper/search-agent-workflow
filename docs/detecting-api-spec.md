@@ -67,6 +67,42 @@ jobId를 Spring이 발급하는 이유는 검사 요청 하나가 회차 하나�
 
 즉시 응답하고 검사는 백그라운드로 진행된다. **같은 `jobId`로 다시 보내면 재실행하지 않고** 현재 상태를 그대로 돌려준다 — 회차 하나 검사에 LLM을 수십 번 부르므로 중복 실행 비용이 크다.
 
+### Response `429 Too Many Requests` — 거절
+
+> **신규.** 이전 버전에는 없던 응답이다. Spring 쪽 대응 구현이 필요하다.
+
+검사를 시작할 여유가 없다. 요청은 어디에도 저장되지 않으며, 그 `jobId`는 조회해도 404다(접수된 적이 없다).
+
+**중복 제출은 이 검사를 거치지 않는다.** 이미 접수한 `jobId`를 다시 보내면 서버가 아무리 바빠도 202로 현재 상태를 돌려준다 — 재제출은 자원을 쓰지 않기 때문이다. 429는 **새 검사**에만 나온다.
+
+사유는 두 가지이고 본문으로 구분된다.
+
+**(1) 동시 검사 초과** — 검사는 큐 없이 전부 동시에 돌기 때문에 진행 중인 수 자체를 제한한다.
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 90
+```
+```json
+{
+  "detail": "Too many detections in progress. Retry after the Retry-After period.",
+  "runningDetections": 4
+}
+```
+
+**(2) 모델 한도 소진** — 같은 OpenAI 모델을 쓰는 인덱싱이 한도를 거의 다 썼다.
+
+```json
+{
+  "detail": "Model rate limit is nearly exhausted. Retry after the Retry-After period.",
+  "remainingTpm": 1200
+}
+```
+
+**Spring 대응**: `Retry-After`(초) 대기 후 **같은 요청을 그대로 다시 POST**한다. 인덱싱 API의 429와 같은 규약이다(`docs/indexing-api-spec.md` 3장).
+
+> **왜 생겼나**: 탐지는 원래 접수 제한이 없어 요청이 오는 대로 전부 동시에 실행했다. 검사 하나가 claim 수십 건 × 4채널의 검색과 27k 토큰짜리 판정을 하므로, 몇 건만 겹쳐도 OpenAI 한도를 순식간에 먹는다. 게다가 탐지와 인덱싱이 **같은 모델**을 쓰게 되면서 한쪽만 자제하고 다른 쪽은 무제한인 비대칭이 생겼다.
+
 ## 4. `GET /api/detect/jobs/{jobId}` — 진행 상태 조회
 
 ### Response `200 OK` — 진행 중
