@@ -36,8 +36,29 @@ WORK_ID = 1
 
 
 @pytest.fixture
-def stub_indexing(monkeypatch):
-    """run_indexing을 "바로 성공하고 호출 기록만 남기는" 스텁으로 바꾼다.
+def graph(monkeypatch):
+    """인덱싱된 화를 기억하는 가짜 그래프(테넌트 id → 완료된 화 번호 집합).
+
+    회차 순서 검증이 "그래프의 다음 화"를 보기 때문에 **정적 스텁으로는 연속 제출을 표현할
+    수 없다** — 6화를 넣은 뒤 7화를 넣으려면 그 사이에 그래프가 6을 알고 있어야 한다.
+    그래서 stub_indexing 이 여기에 기록하고, 마커 조회가 여기서 읽는다.
+
+    실제 `_already_indexed`와 같은 계약을 지킨다: (요청 중 마커가 있는 화, 완료된 최대 화).
+    인덱싱된 화가 없으면 최대 화는 None 이고, 그때 첫 화는 1이어야 한다.
+    """
+    indexed: dict[str, set[int]] = {}
+
+    def _marker(tenant: Tenant, episode_nos: list[int]):
+        done = indexed.get(tenant.id, set())
+        return {n for n in episode_nos if n in done}, (max(done) if done else None)
+
+    monkeypatch.setattr(index_job_service, "_already_indexed", _marker)
+    return indexed
+
+
+@pytest.fixture
+def stub_indexing(monkeypatch, graph):
+    """run_indexing을 "바로 성공하고 가짜 그래프에 기록하는" 스텁으로 바꾼다.
 
     첫 인자로 Tenant를 받는다 — 인덱싱은 어느 소설의 그래프에 쓸지를 이 값으로만 안다.
     """
@@ -45,6 +66,7 @@ def stub_indexing(monkeypatch):
 
     async def _stub(tenant: Tenant, episode_no: int, text: str) -> dict:
         calls.append(episode_no)
+        graph.setdefault(tenant.id, set()).add(episode_no)
         return {"chapter": episode_no}
 
     monkeypatch.setattr(index_job_service, "run_indexing", _stub)
@@ -52,26 +74,29 @@ def stub_indexing(monkeypatch):
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path):
+def client(monkeypatch, graph):
     """매 테스트마다 깨끗한 서버 상태로 시작한다.
 
     _index_queue를 새로 만드는 건 asyncio.Queue가 처음 쓰인 이벤트 루프에 묶이기 때문이다 —
     TestClient는 인스턴스마다 새 루프를 만들어서, 모듈 전역 큐를 그대로 쓰면 두 번째
     테스트에서 "다른 루프에 묶인 큐" 오류가 난다.
-    큐 오름차순 워터마크(_max_queued_episode_no)도 모듈 전역이라 매번 비운다 — 테넌트 id를
-    키로 하는 dict이므로 빈 dict가 "아무 화도 큐에 넣은 적 없음"이다.
     """
     index_job_service._index_jobs.clear()
     # 미터도 비운다 — 접수 게이트의 마지막 안전망이 모델 버킷 잔량을 보므로, 앞 테스트가
     # 남긴 값이 남아 있으면 엉뚱한 429가 난다.
     monkeypatch.setattr(llm_limit, "_buckets", {})
     monkeypatch.setattr(index_job_service, "_index_queue", asyncio.Queue())
-    monkeypatch.setattr(index_job_service, "_max_queued_episode_no", {})
-    # 기본값은 "아직 인덱싱 안 됨" — 마커가 있는 경우는 해당 테스트에서 따로 뒤집는다.
-    # 완료 마커 조회는 테넌트 안에서만 유효하므로 첫 인자로 Tenant를 받는다.
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda tenant, episode_nos: set())
     with TestClient(app_module.app) as c:
         yield c
+
+
+def _indexed_up_to(graph, latest: int, user_id=USER_ID, work_id=WORK_ID) -> None:
+    """이 소설이 latest 화까지 인덱싱된 상태로 둔다.
+
+    6화부터 시작하는 테스트가 "5화까지는 이미 있다"를 밝히는 수단이다 — 새 규칙은 그래프의
+    다음 화만 받으므로, 밝히지 않으면 1화가 아니라서 400이 난다.
+    """
+    graph[f"{user_id}:{work_id}"] = set(range(1, latest + 1))
 
 
 def _submit(client, episodes, user_id=USER_ID, work_id=WORK_ID):
@@ -100,7 +125,8 @@ def _terminal(body):
 # ---------- 접수(201) ----------
 
 
-def test_submit_returns_201_contract(client, stub_indexing):
+def test_submit_returns_201_contract(client, stub_indexing, graph):
+    _indexed_up_to(graph, 5)
     res = _submit(
         client,
         [
@@ -136,7 +162,9 @@ def test_missing_text_is_400(client, stub_indexing):
     assert _index_job_count() == 0
 
 
-def test_descending_episode_no_is_400(client, stub_indexing):
+def test_descending_episode_no_is_400(client, stub_indexing, graph):
+    """역순은 물론이고 건너뛰기도 막는다 — 규칙이 부등식에서 등식으로 바뀌었다."""
+    _indexed_up_to(graph, 5)
     res = _submit(
         client,
         [
@@ -145,7 +173,23 @@ def test_descending_episode_no_is_400(client, stub_indexing):
         ],
     )
     assert res.status_code == 400
-    assert "ascending" in res.json()["detail"]
+    assert "consecutive" in res.json()["detail"]
+    assert _index_job_count() == 0
+
+
+def test_gap_inside_one_request_is_400(client, stub_indexing, graph):
+    """요청 **안**의 구멍도 막는다. 예전에는 오름차순만 봐서 [8,10]이 통과했고,
+    9화 없이 10화를 추출하면 누적 컨텍스트가 빈 채로 해석돼 그래프가 조용히 잘못 만들어졌다."""
+    _indexed_up_to(graph, 7)
+    res = _submit(
+        client,
+        [
+            {"episodeId": 108, "episodeNo": 8, "text": "8화"},
+            {"episodeId": 110, "episodeNo": 10, "text": "10화"},
+        ],
+    )
+    assert res.status_code == 400
+    assert "consecutive" in res.json()["detail"]
     assert _index_job_count() == 0
 
 
@@ -156,12 +200,25 @@ def _index_job_count() -> int:
 # ---------- 요청을 가로지르는 오름차순(400) ----------
 
 
-def test_lower_episode_after_higher_request_is_400(client, stub_indexing):
-    """POST [5,6] 다음의 POST [3,4]는 400이다.
+def test_queued_episodes_count_toward_the_next_expected(client, graph, monkeypatch):
+    """큐에 있는 화도 "다음에 와야 할 화" 계산에 들어간다.
 
-    큐는 FIFO라 받아주면 [5,6,3,4] 순으로 실행되고, 3화를 추출할 때 그래프와 Story.summary에는
-    이미 5·6화가 들어 있다 — 추출기가 미래를 "지금까지의 줄거리"로 읽어 그래프가 조용히 오염된다.
+    완료 마커는 인덱싱이 **끝나야** 찍힌다. 그래프만 보면 5·6화가 큐에서 도는 동안에도
+    "다음은 5화"라고 답하게 되어, 9화 같은 건너뛰기가 통과하거나 5화가 두 번 접수된다.
+
+    예전 규칙(부등식 + 메모리 워터마크)에서는 [5,6] 뒤의 [3,4]가 통과해 큐가 [5,6,3,4]가
+    됐다. 지금은 5화가 접수됐다는 것 자체가 4화까지 그래프에 있다는 뜻이라 그 시나리오가
+    성립하지 않는다 — 앞선 화는 이미 마커가 있어 일하지 않는다.
     """
+    _indexed_up_to(graph, 4)
+    release = threading.Event()
+
+    async def _blocking(tenant, episode_no, text):
+        await asyncio.to_thread(release.wait, 5)
+        return {"chapter": episode_no}
+
+    monkeypatch.setattr(index_job_service, "run_indexing", _blocking)
+
     first = _submit(
         client,
         [
@@ -171,25 +228,26 @@ def test_lower_episode_after_higher_request_is_400(client, stub_indexing):
     )
     assert first.status_code == 201
 
-    second = _submit(
-        client,
-        [
-            {"episodeId": 103, "episodeNo": 3, "text": "3화"},
-            {"episodeId": 104, "episodeNo": 4, "text": "4화"},
-        ],
-    )
-    assert second.status_code == 400
-    assert "ascending" in second.json()["detail"]
-    assert _index_job_count() == 1  # 첫 요청만 남았다
+    # 그래프는 아직 4까지만 안다. 큐의 5·6을 안 보면 9화가 "다음 화"로 통과해버린다.
+    skipping = _submit(client, [{"episodeId": 109, "episodeNo": 9, "text": "9화"}])
+    assert skipping.status_code == 400
+    assert "expected episodeNo 7" in skipping.json()["detail"]
+
+    # 이어지는 7화는 받아야 한다(파이프라이닝).
+    assert _submit(client, [{"episodeId": 107, "episodeNo": 7, "text": "7화"}]).status_code == 201
+    release.set()
 
 
-def test_watermark_does_not_cross_tenants(client, stub_indexing):
-    """워터마크는 테넌트(userId × workId)마다 따로 센다.
+def test_order_rule_does_not_cross_tenants(client, stub_indexing, graph):
+    """순서는 테넌트(userId × workId)마다 따로 본다.
 
-    전역 워터마크 하나였다면 작품 1의 7화가 올려둔 값에 작품 2의 3화가 걸려 400을 받는다 —
-    서로 아무 상관 없는 두 소설이 서로의 진도에 발이 묶인다. 오름차순이 필요한 이유는
-    "누적 컨텍스트가 오염된다"이고, 그 누적은 테넌트 안에서만 일어난다.
+    전역 하나로 셌다면 작품 1이 7화까지 갔을 때 작품 2의 3화가 막힌다 — 서로 아무 상관 없는
+    두 소설이 서로의 진도에 발이 묶인다. 순서가 필요한 이유(누적 컨텍스트 오염)는 테넌트
+    안에서만 성립한다.
     """
+    _indexed_up_to(graph, 6, user_id=1, work_id=1)
+    _indexed_up_to(graph, 2, user_id=1, work_id=2)
+
     assert (
         _submit(
             client,
@@ -209,18 +267,29 @@ def test_watermark_does_not_cross_tenants(client, stub_indexing):
     assert res.status_code == 201
     body = _wait_until(client, res.json()["jobId"], _terminal)
     assert body["episodes"][0]["status"] == "DONE"
-    assert stub_indexing == [7, 3]  # 3화가 실제로 인덱싱까지 갔다
+    assert stub_indexing == [7, 3]
 
 
-def test_same_episode_in_two_requests_is_400(client, stub_indexing):
-    """같은 화가 두 요청에 겹쳐 들어오면 400 — 안 막으면 같은 화를 두 번 인덱싱한다(LLM 비용 2배)."""
+def test_same_episode_resubmitted_is_not_indexed_twice(client, stub_indexing, graph):
+    """같은 화를 다시 보내도 두 번 인덱싱하지 않는다.
+
+    예전에는 워터마크가 400으로 막았다. 지금은 완료 마커가 그 화를 pending 에서 빼므로
+    **일하지 않고 201**이 된다 — 재제출은 이 API의 계약이라 거절하지 않는 편이 맞고,
+    비용 이중 지출은 마커가 막는다.
+    """
+    _indexed_up_to(graph, 5)
     assert _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화"}]).status_code == 201
+    _wait_until(client, _job_ids()[0], _terminal)
+
     res = _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화 다시"}])
-    assert res.status_code == 400
-    assert "ascending" in res.json()["detail"]
+    assert res.status_code == 201
+    body = _wait_until(client, res.json()["jobId"], _terminal)
+    assert body["episodes"][0]["status"] == "DONE"
+    assert stub_indexing == [6], "6화가 두 번 인덱싱됐다"
 
 
-def test_ascending_across_requests_is_accepted(client, stub_indexing):
+def test_ascending_across_requests_is_accepted(client, stub_indexing, graph):
+    _indexed_up_to(graph, 5)
     """규칙은 "요청마다 처음부터"가 아니라 "이어서 오름차순"이다 — 정상 흐름을 막으면 안 된다."""
     assert _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화"}]).status_code == 201
     assert _submit(client, [{"episodeId": 107, "episodeNo": 7, "text": "7화"}]).status_code == 201
@@ -233,46 +302,51 @@ def test_ascending_across_requests_is_accepted(client, stub_indexing):
     assert stub_indexing == [6, 7, 8]
 
 
-def test_already_indexed_resubmit_is_not_blocked_by_watermark(client, stub_indexing, monkeypatch):
-    """완료 마커가 있는 화의 재제출은 워터마크 비교에서 빠진다.
+def test_completed_episodes_in_a_resubmit_are_skipped(client, stub_indexing, graph):
+    """404(재시작) 후 묶음을 통째로 다시 보내는 흐름(스펙 7.3).
 
-    재제출은 아무 일도 하지 않으므로 순서를 깨지 않는다. 여기서 400을 주면 "재시작 후 404를
-    보면 다시 POST한다"는 스펙의 복구 경로가 막힌다.
+    완료된 화가 섞여 들어오므로, 순서 판정은 **마커를 뺀 나머지**(pending)의 첫 화로 해야
+    한다. 요청의 첫 화로 판정하면 이미 끝난 3화가 "다음 화가 아니다"로 400을 받는다.
     """
-    assert _submit(client, [{"episodeId": 107, "episodeNo": 7, "text": "7화"}]).status_code == 201
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda tenant, episode_nos: {3, 4})
+    _indexed_up_to(graph, 4)
     res = _submit(
         client,
         [
             {"episodeId": 103, "episodeNo": 3, "text": "3화"},
             {"episodeId": 104, "episodeNo": 4, "text": "4화"},
+            {"episodeId": 105, "episodeNo": 5, "text": "5화"},
         ],
     )
     assert res.status_code == 201
     body = _wait_until(client, res.json()["jobId"], _terminal)
-    assert [e["status"] for e in body["episodes"]] == ["DONE", "DONE"]
-    assert stub_indexing == [7]  # 3·4화는 실제로 인덱싱되지 않았다
+    assert [e["status"] for e in body["episodes"]] == ["DONE", "DONE", "DONE"]
+    assert stub_indexing == [5], "이미 끝난 3·4화는 다시 인덱싱하지 않는다"
 
 
-def test_rejected_request_does_not_raise_the_watermark(client, monkeypatch):
-    """429로 거절한 요청은 없던 일이어야 한다 — 워터마크만 올려두면 재시도가 400으로 막힌다."""
+def test_rejected_request_leaves_no_trace(client, graph, monkeypatch):
+    """429로 거절한 요청은 없던 일이어야 한다 — 흔적이 남으면 재시도가 계속 막힌다."""
+    _indexed_up_to(graph, 4)
     monkeypatch.setattr(index_job_service, "INDEX_MAX_WAIT_SECONDS", 120)  # = 1화
     release = threading.Event()
 
     async def _blocking(tenant, episode_no, text):
         await asyncio.to_thread(release.wait, 5)
+        graph.setdefault(tenant.id, set()).add(episode_no)
         return {"chapter": episode_no}
 
     monkeypatch.setattr(index_job_service, "run_indexing", _blocking)
 
-    # 1화를 넣어 큐를 채운다 → 다음 요청은 큐 혼잡으로 429
     assert _submit(client, [{"episodeId": 105, "episodeNo": 5, "text": "5화"}]).status_code == 201
     assert _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화"}]).status_code == 429
 
-    # 큐가 빠지면 같은 화가 다시 통과해야 한다(워터마크가 올라가 있으면 400이 된다).
+    # 큐가 빠지면 같은 화가 통과해야 한다.
     release.set()
     _wait_until(client, _job_ids()[0], _terminal)
     assert _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화"}]).status_code == 201
+
+
+def _job_ids() -> list[str]:
+    return list(index_job_service._index_jobs)
 
 
 def _job_ids() -> list[str]:
@@ -348,8 +422,9 @@ def test_many_small_episodes_are_400_too(client, stub_indexing):
 # ---------- 화별 상태 전이 ----------
 
 
-def test_episode_status_transitions(client, monkeypatch):
+def test_episode_status_transitions(client, graph, monkeypatch):
     """앞 화가 도는 동안 뒤 화는 QUEUED이고, 풀어주면 순서대로 DONE이 된다."""
+    _indexed_up_to(graph, 5)
     gate = threading.Event()
     started: list[int] = []
 
@@ -386,7 +461,8 @@ def test_episode_status_transitions(client, monkeypatch):
 # ---------- 실패 연쇄 스킵 ----------
 
 
-def test_failure_skips_following_episodes(client, monkeypatch):
+def test_failure_skips_following_episodes(client, graph, monkeypatch):
+    _indexed_up_to(graph, 5)
     async def _fail_on_seven(tenant: Tenant, episode_no: int, text: str) -> dict:
         if episode_no == 7:
             raise RuntimeError("추출 실패")
@@ -461,7 +537,9 @@ def test_error_status_never_appears_without_its_reason(monkeypatch):
 
 def test_already_indexed_episodes_skip_work(client, stub_indexing, monkeypatch):
     """완료 마커가 있는 화는 즉시 DONE이고, 인덱싱도 TPM 소비도 하지 않는다."""
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda tenant, episode_nos: {6})
+    monkeypatch.setattr(
+        index_job_service, "_already_indexed", lambda tenant, episode_nos: ({6}, 6)
+    )
     res = _submit(
         client,
         [
@@ -487,9 +565,9 @@ def test_marker_is_looked_up_within_the_requesting_tenant(client, stub_indexing,
     """
     seen: list[str] = []
 
-    def _fake_marker(tenant: Tenant, episode_nos: list[int]) -> set[int]:
+    def _fake_marker(tenant: Tenant, episode_nos: list[int]) -> tuple[set[int], int | None]:
         seen.append(tenant.id)
-        return set()
+        return set(), 5  # 5화까지 인덱싱된 상태 — 다음은 6화여야 한다
 
     monkeypatch.setattr(index_job_service, "_already_indexed", _fake_marker)
     assert (
@@ -511,7 +589,9 @@ def test_fully_indexed_resubmit_is_not_gated(client, stub_indexing, monkeypatch)
     429를 받고 영원히 재시도한다.
     """
     monkeypatch.setattr(
-        index_job_service, "_already_indexed", lambda tenant, episode_nos: set(episode_nos)
+        index_job_service,
+        "_already_indexed",
+        lambda tenant, episode_nos: (set(episode_nos), max(episode_nos)),
     )
     monkeypatch.setattr(index_job_service, "INDEX_MAX_WAIT_SECONDS", 0)  # 어떤 대기도 불허
     res = _submit(client, [{"episodeId": 101, "episodeNo": 6, "text": "6화" * 5000}])
@@ -521,7 +601,7 @@ def test_fully_indexed_resubmit_is_not_gated(client, stub_indexing, monkeypatch)
     assert stub_indexing == []
 
 
-def test_inflight_resubmit_is_not_blocked_by_watermark(client, monkeypatch):
+def test_inflight_resubmit_is_not_blocked_by_watermark(client, graph, monkeypatch):
     """아직 처리 중인 화의 재제출은 워터마크에 걸리지 않는다.
 
     완료 마커는 인덱싱이 끝나야 찍힌다. 그래서 큐에 들어가 처리 중인 화는 마커가 없고,
@@ -529,6 +609,7 @@ def test_inflight_resubmit_is_not_blocked_by_watermark(client, monkeypatch):
     정상 재제출이 영구 실패가 된다 — 실제로 이미 인덱싱이 끝난 회차가 화면에 "반영 실패"로
     표시된 회귀가 있었다.
     """
+    _indexed_up_to(graph, 1)
     started = threading.Event()
     release = threading.Event()
 
@@ -538,7 +619,6 @@ def test_inflight_resubmit_is_not_blocked_by_watermark(client, monkeypatch):
         return {"chapter": chapter}
 
     monkeypatch.setattr(index_job_service, "run_indexing", blocking_indexing)
-    monkeypatch.setattr(index_job_service, "_already_indexed", lambda tenant, episode_nos: set())
 
     episodes = [
         {"episodeId": 102, "episodeNo": 2, "text": "2화"},
@@ -623,3 +703,74 @@ def test_여유가_충분하면_안전망은_통과시킨다(client, stub_indexi
         {"x-ratelimit-limit-tokens": "200000", "x-ratelimit-remaining-tokens": "190000"},
     )
     assert _submit(client, [{"episodeId": 101, "episodeNo": 1, "text": "1화"}]).status_code == 201
+
+
+def test_failed_episode_can_be_resubmitted(client, graph, monkeypatch):
+    """실패한 화부터 다시 보내는 흐름이 통과해야 한다 — 스펙 4장이 약속한 복구 경로다.
+
+    예전 규칙은 **접수 이력**(메모리 워터마크)으로 판정해서 이걸 막았다. [5,6,7]을 보내고
+    6화가 실패하면 워터마크는 7인데 그래프에는 5까지만 있다 — 계약대로 [6,7]을 다시 보내면
+    "6은 이미 7 뒤에 큐잉됐다"며 400을 받았고, 그 회차는 영영 인덱싱되지 않았다.
+
+    지금은 그래프가 근거라 "다음 화는 6"이 되어 통과한다.
+    """
+    _indexed_up_to(graph, 4)
+    fail_on_six = {"active": True}
+
+    async def _maybe_fail(tenant: Tenant, episode_no: int, text: str) -> dict:
+        if episode_no == 6 and fail_on_six["active"]:
+            raise RuntimeError("6화 인덱싱 실패")
+        graph.setdefault(tenant.id, set()).add(episode_no)
+        return {"chapter": episode_no}
+
+    monkeypatch.setattr(index_job_service, "run_indexing", _maybe_fail)
+
+    first = _submit(
+        client,
+        [
+            {"episodeId": 105, "episodeNo": 5, "text": "5화"},
+            {"episodeId": 106, "episodeNo": 6, "text": "6화"},
+            {"episodeId": 107, "episodeNo": 7, "text": "7화"},
+        ],
+    )
+    body = _wait_until(client, first.json()["jobId"], _terminal)
+    assert [e["status"] for e in body["episodes"]] == ["DONE", "ERROR", "ERROR"]
+
+    # 원인이 해소됐다고 가정하고 실패 화부터 재제출한다.
+    fail_on_six["active"] = False
+    again = _submit(
+        client,
+        [
+            {"episodeId": 106, "episodeNo": 6, "text": "6화"},
+            {"episodeId": 107, "episodeNo": 7, "text": "7화"},
+        ],
+    )
+    assert again.status_code == 201, again.json()
+    body = _wait_until(client, again.json()["jobId"], _terminal)
+    assert [e["status"] for e in body["episodes"]] == ["DONE", "DONE"]
+
+
+def test_first_episode_of_a_work_must_be_one(client, stub_indexing, graph):
+    """인덱싱된 화가 하나도 없으면 1화부터 시작해야 한다.
+
+    예전에는 메모리 워터마크가 0이라 아무 화나 첫 화가 될 수 있었고, 재시작 후에는 그래프에
+    6화까지 있어도 3화를 새로 넣는 요청을 막지 못했다.
+    """
+    res = _submit(client, [{"episodeId": 105, "episodeNo": 5, "text": "5화"}])
+    assert res.status_code == 400
+    assert "expected episodeNo 1" in res.json()["detail"]
+    assert _index_job_count() == 0
+
+
+def test_order_check_is_skipped_when_the_graph_is_unreachable(client, stub_indexing, monkeypatch):
+    """그래프를 못 읽으면 순서 검증을 건너뛴다.
+
+    "모른다"를 "1화가 아니다"로 읽으면 그래프가 잠깐 흔들릴 때 접수가 통째로 멈춘다.
+    어차피 인덱싱도 실패할 상황이라 거절해서 얻는 것이 없다.
+    """
+    monkeypatch.setattr(
+        index_job_service,
+        "_already_indexed",
+        lambda tenant, nos: (set(), index_job_service._MARKER_UNKNOWN),
+    )
+    assert _submit(client, [{"episodeId": 142, "episodeNo": 42, "text": "42화"}]).status_code == 201
