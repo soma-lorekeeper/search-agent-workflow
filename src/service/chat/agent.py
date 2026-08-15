@@ -13,11 +13,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 from typing import Any
 
-from openai import AsyncOpenAI, RateLimitError
-
+# 이름을 이 모듈에 바인딩해 부른다(`openai_client.create_completion(...)`처럼 정규화해
+# 부르지 않는다). 이 레포의 테스트는 정의처가 아니라 **소비 모듈**의 속성을 스텁으로
+# 갈아끼우는 방식이라, 그래야 다른 서비스와 같은 방법으로 LLM을 막을 수 있다.
+from src.common.openai_client import create_completion
 from src.service.chat.indexed import fetch_indexed_episodes
 from src.service.chat.prompts import (
     CHAT_CACHE_KEY,
@@ -26,43 +27,24 @@ from src.service.chat.prompts import (
     TITLE_SYSTEM_PROMPT,
 )
 from src.service.chat.tools import TOOL_GUIDE, build_chat_tools
-from src.config import OPENAI_API_KEY, OPENAI_MODEL
+from src.config import OPENAI_MODEL
 
 logger = logging.getLogger("chat.agent")
 
 MAX_TOOL_CALLS = 5
 MAX_TURNS = MAX_TOOL_CALLS + 2  # 도구 호출 예산 + 최종 답변 여유 턴. 무한루프 방지용 안전판.
-RATE_LIMIT_MAX_RETRIES = 5  # 조직 TPM 한도(429)에 걸렸을 때 재시도 횟수
 
 # 이 길이를 넘으면 "첫 턴"이 아니다 — 제목은 대화가 시작될 때 한 번만 지으면 되고,
 # 매 턴 다시 지으면 사이드바 제목이 계속 바뀌어 작가가 대화를 못 찾는다.
 FIRST_TURN_MESSAGE_COUNT = 2
 TITLE_MAX_CHARS = 20
 
-_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-
-async def _create_with_retry(**kwargs: Any) -> Any:
-    """RateLimitError(429)면 지수 백오프로 재시도한다.
-
-    채팅은 사람이 기다리는 요청이라 그냥 실패시키면 그대로 에러 말풍선이 뜬다. 몇 초 늦더라도
-    답이 오는 편이 낫다(같은 서버에서 설정 오류 검사가 claim별로 병렬로 돌고 있으면 조직
-    TPM 한도에 순간적으로 몰리기 쉽다).
-    """
-    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
-        try:
-            return await _client.chat.completions.create(**kwargs)
-        except RateLimitError:
-            if attempt == RATE_LIMIT_MAX_RETRIES:
-                raise
-            delay = min(2**attempt, 30) + random.uniform(0, 1)
-            logger.warning(
-                "rate limit(429) — %.1f초 후 재시도 (%d/%d)",
-                delay,
-                attempt + 1,
-                RATE_LIMIT_MAX_RETRIES,
-            )
-            await asyncio.sleep(delay)
+# 429 재시도는 관문(src/common/openai_client.py)이 한다. 예전에는 여기에 같은 로직이
+# 한 벌 더 있었는데, 두 벌이면 정책이 조용히 갈라진다(한쪽만 고치면 다른 쪽은 그대로).
+# 흡수하면서 동작이 두 가지 바뀐다:
+#   - 재시도 횟수 6회 → 5회(관문의 _MAX_ATTEMPTS)
+#   - 크레딧 소진(insufficient_quota)이면 즉시 실패한다. 예전에는 기다려도 안 풀리는
+#     429를 붙들고 6번 헛돌았다 — 그동안 작가는 빈 화면을 본다.
 
 
 def _format_indexed(indexed: list[int]) -> str:
@@ -181,7 +163,7 @@ def _to_openai_messages(messages: list[dict]) -> list[dict]:
 async def _suggest_title(user_text: str, answer: str) -> str | None:
     """대화 첫 턴에만 세션 제목을 짓는다. 실패해도 대화 자체는 성공이므로 None으로 삼킨다."""
     try:
-        response = await _create_with_retry(
+        response = await create_completion(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": TITLE_SYSTEM_PROMPT},
@@ -247,7 +229,7 @@ async def run_chat(
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = False  # 예산 추적을 단순하게 유지
 
-        response = await _create_with_retry(**kwargs)
+        response = await create_completion(**kwargs)
         message = response.choices[0].message
 
         if not message.tool_calls:

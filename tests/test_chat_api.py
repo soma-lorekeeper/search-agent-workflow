@@ -232,7 +232,10 @@ def stub_llm(monkeypatch):
             choices=[SimpleNamespace(message=SimpleNamespace(content="답변", tool_calls=None))]
         )
 
-    monkeypatch.setattr(chat_agent, "_create_with_retry", _stub)
+    # 채팅이 자기 클라이언트를 들고 있던 시절에는 `_create_with_retry`를 막았다. 지금은
+    # 공용 관문(src/common/openai_client.create_completion)을 쓰므로 그 이름을 막는다 —
+    # agent 모듈에 바인딩된 이름이라 다른 서비스(extract_service 등)와 방식이 같다.
+    monkeypatch.setattr(chat_agent, "create_completion", _stub)
     return seen
 
 
