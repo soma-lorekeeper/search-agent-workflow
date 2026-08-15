@@ -12,13 +12,13 @@ Cypher(MERGE)로 만든다.
 
 from __future__ import annotations
 
-from neo4j_graphrag.embeddings import OpenAIEmbeddings
 from neo4j_graphrag.experimental.components.embedder import TextChunkEmbedder
 from neo4j_graphrag.experimental.components.kg_writer import Neo4jWriter
 from neo4j_graphrag.experimental.components.lexical_graph import LexicalGraphBuilder
 from neo4j_graphrag.experimental.components.types import TextChunk, TextChunks
 from neo4j_graphrag.indexes import create_vector_index
 
+from src.common.graphrag import MeteredEmbedder
 from src.common.tenant import Tenant
 from src.config import EMBEDDING_MODEL
 
@@ -60,7 +60,9 @@ async def write_chunk_layer(driver, database: str, tenant: Tenant, chapter: int,
     # 임베더는 여기서 만든다. 예전에는 인덱싱 파이프라인의 build_embedder()를 빌려 썼지만,
     # 그러면 repository가 service를 올려다보게 된다(레이어 방향 역전). 생성자 한 줄이라
     # 공유해서 얻는 것도 없다.
-    embedder = TextChunkEmbedder(embedder=OpenAIEmbeddings(model=EMBEDDING_MODEL))
+    # 라이브러리 기본 embedder 대신 계량판을 쓴다 — 원본은 응답에서 벡터만 꺼내고
+    # 원본 HTTP 응답을 버려서 x-ratelimit-* 헤더에 닿을 방법이 없다.
+    embedder = TextChunkEmbedder(embedder=MeteredEmbedder(model=EMBEDDING_MODEL))
     embedded = await embedder.run(TextChunks(chunks=chunks))
     chunk_graph = (await LexicalGraphBuilder().run(embedded)).graph
     await Neo4jWriter(

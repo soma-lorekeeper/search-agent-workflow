@@ -19,9 +19,9 @@ Cypher(`MATCH (e:Event)`)와 스키마는 전부 그대로 동작한다.
 
 from __future__ import annotations
 
-from neo4j_graphrag.embeddings import OpenAIEmbeddings
 from neo4j_graphrag.indexes import create_vector_index
 
+from src.common.graphrag import MeteredEmbedder
 from src.common.tenant import Tenant
 from src.config import EMBEDDING_MODEL
 from src.repository.neo4j.chunk import EMBEDDING_DIMENSIONS
@@ -70,7 +70,9 @@ def ensure_fact_layer(driver, database: str, tenant: Tenant) -> int:
         tenant.params(),
         database_=database,
     )
-    embedder = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    # 사실 하나당 한 번씩 부른다(아래 루프) — 회차가 커지면 호출 수가 그만큼 늘어난다.
+    # 토큰보다 RPM이 먼저 걸리는 경로라 계량판을 쓴다.
+    embedder = MeteredEmbedder(model=EMBEDDING_MODEL)
     embedded = 0
     for r in records:
         text = _fact_text(r["name"], r["description"])

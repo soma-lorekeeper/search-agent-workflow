@@ -25,8 +25,8 @@ from neo4j_graphrag.experimental.components.resolver import EntityResolver
 from neo4j_graphrag.experimental.components.schema import SchemaBuilder
 from neo4j_graphrag.experimental.components.text_splitters.base import TextSplitter
 from neo4j_graphrag.experimental.pipeline import Pipeline
-from neo4j_graphrag.llm import OpenAILLM
 
+from src.common.graphrag import MeteredLLM
 from src.common.tenant import Tenant
 from src.config import EMBEDDING_MODEL, EXTRACTION_MODEL
 from src.repository.neo4j.kg_writer import TenantTaggingWriter
@@ -36,41 +36,20 @@ from src.service.index.extractor import KoreanWebNovelERTemplate, NovelContextEx
 PROMPT_CACHE_KEY = "lorekeeper-extract"
 
 
-class TokenCountingLLM(OpenAILLM):
-    """
-    ainvoke 호출마다 응답 usage를 누적해 변형별 총 토큰 사용량을 집계하는 OpenAILLM.
-
-    extractor는 청크마다 llm.ainvoke를 호출하지만 응답의 usage를 버린다. 여기서 usage를
-    가로채 누적한다. build_llm이 변형마다 새 인스턴스를 만들므로 카운터는 0에서 시작한다.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.total_request_tokens = 0   # 입력(프롬프트) 토큰 누적
-        self.total_response_tokens = 0  # 출력(완성) 토큰 누적
-        self.total_tokens = 0           # 합계 누적
-        self.call_count = 0             # ainvoke 호출 횟수(= 추출 LLM 호출 수)
-
-    async def ainvoke(self, *args, **kwargs):
-        resp = await super().ainvoke(*args, **kwargs)
-        self.call_count += 1
-        # usage는 Optional. 모델이 usage를 안 주면 건너뛴다.
-        if resp.usage:
-            self.total_request_tokens += resp.usage.request_tokens or 0
-            self.total_response_tokens += resp.usage.response_tokens or 0
-            self.total_tokens += resp.usage.total_tokens or 0
-        return resp
-
-
-def build_llm(reasoning_effort: str | None = None) -> TokenCountingLLM:
-    """추출용 OpenAI LLM 인스턴스. prompt_cache_key를 model_params로 넣어 모든 호출 경로에 전달한다.
+def build_llm(reasoning_effort: str | None = None) -> MeteredLLM:
+    """추출용 LLM 인스턴스. prompt_cache_key를 model_params로 넣어 모든 호출 경로에 전달한다.
 
     reasoning_effort를 주면 model_params에 함께 실어 전달한다(gpt-5 계열 추론 강도 조절).
+
+    예전에는 인스턴스마다 토큰을 세는 TokenCountingLLM이었다. 그런데 이 함수는 부를 때마다
+    새 인스턴스를 만들고(추출·회차 요약·전역 요약·description 병합이 각자 부른다) 카운터를
+    읽는 곳은 추출 것 하나뿐이라, 나머지 세 곳의 토큰은 아무도 세지 않았다. 지금은 호출이
+    전부 공용 관문을 지나며 **모델 버킷에** 적립되므로 인스턴스가 몇 개든 합산된다.
     """
     params = {"prompt_cache_key": PROMPT_CACHE_KEY}
     if reasoning_effort:
         params["reasoning_effort"] = reasoning_effort
-    return TokenCountingLLM(
+    return MeteredLLM(
         model_name=EXTRACTION_MODEL,
         model_params=params,
     )
@@ -85,11 +64,12 @@ def build_pipeline(
     reasoning_effort: str | None = None,
     novel_context: str = "",
     clean_db: bool = True,
-) -> tuple[Pipeline, TokenCountingLLM]:
+) -> Pipeline:
     """
-    변형별 splitter/resolver를 받아 인덱싱 DAG를 조립해 (pipeline, llm)을 반환한다.
+    변형별 splitter/resolver를 받아 인덱싱 DAG를 조립해 pipeline을 반환한다.
 
-    llm을 함께 반환하는 이유: 호출측(harness)이 실행 후 llm의 누적 토큰 카운터를 읽어야 한다.
+    예전에는 llm을 함께 돌려줬지만 그 값을 읽던 곳(누적 토큰 출력)이 사라졌다 —
+    토큰은 이제 모델별 미터가 센다.
 
     novel_context: 회차 누적 인덱싱에서 각 청크 프롬프트에 주입할 배경 컨텍스트
     (그래프 덤프 + rolling summary). 빈 문자열이면 배경 없이 추출한다.
@@ -110,7 +90,7 @@ def build_pipeline(
     pipe.add_component(SchemaBuilder(), "schema")
     pipe.add_component(
         # 한국어 웹소설용 커스텀 프롬프트 + novel_context 주입 extractor.
-        # V2 structured output 사용(OpenAILLM은 supports_structured_output=True).
+        # V2 structured output 사용(MeteredLLM은 supports_structured_output=True).
         # on_error=RAISE: 한 청크의 추출 실패를 조용히 빈 그래프로 삼키지 않고 드러낸다.
         # create_lexical_graph=False: 라이브러리 자동 lexical graph(회차 통째 Chunk +
         # FROM_CHUNK + 임베딩)를 끈다 — Chunk 노드는 indexing의 KSS 근거 레이어가 전담한다.
@@ -151,4 +131,4 @@ def build_pipeline(
     # resolver는 입력이 없어 데이터 매핑 없이 순서만 강제(writer 완료 후 실행).
     pipe.connect("writer", "resolver", {})
 
-    return pipe, llm
+    return pipe

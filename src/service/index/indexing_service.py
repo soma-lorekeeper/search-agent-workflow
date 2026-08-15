@@ -123,7 +123,7 @@ async def indexing(tenant: Tenant, chapter: int, text: str) -> dict:
 
         # 5. 추출 파이프라인 실행(회차 통째 단일 청크, DB 누적). resolver는 라벨별 전략
         #    (Character=fuzzy / Item·Location·Organization=정규화 exact / CharacterState·Event=무병합).
-        pipe, llm = build_pipeline(
+        pipe = build_pipeline(
             WholeTextSplitter(),
             PerLabelResolver(driver=driver, tenant=tenant, neo4j_database=database),
             driver,
@@ -172,21 +172,14 @@ async def indexing(tenant: Tenant, chapter: int, text: str) -> dict:
         print(f"\n=== {chapter}화 인덱싱 완료 (누적) ===")
         print(f"    라벨: {labels}")
         print(f"    관계: {rels}")
-        print(
-            f"    추출 토큰(req/resp/total): {llm.total_request_tokens}/"
-            f"{llm.total_response_tokens}/{llm.total_tokens} "
-            f"(LLM 호출 {llm.call_count}회)"
-        )
+        # 토큰 사용량은 여기서 찍지 않는다. 이 자리의 카운터는 추출 인스턴스 것만 세서
+        # 회차 요약·전역 요약·description 병합이 쓴 토큰이 빠져 있었다. 지금은 모든 호출이
+        # 공용 관문을 지나며 모델별 미터에 적립된다(src/common/llm_limit.snapshot()).
         print(f"    이 회차 요약:\n{summary}")
         return {
             "chapter": chapter,
             "labels": labels,
             "rels": rels,
-            "tokens": {
-                "request": llm.total_request_tokens,
-                "response": llm.total_response_tokens,
-                "total": llm.total_tokens,
-            },
             "summary": summary,
         }
     finally:

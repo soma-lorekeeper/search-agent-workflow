@@ -39,8 +39,7 @@ import re
 
 import neo4j
 
-# 외부 라이브러리 — retriever/임베더/도구 타입.
-from neo4j_graphrag.embeddings import OpenAIEmbeddings
+# 외부 라이브러리 — retriever/도구 타입.
 from neo4j_graphrag.retrievers import HybridCypherRetriever
 from neo4j_graphrag.retrievers.base import Retriever
 from neo4j_graphrag.types import RawSearchResult, RetrieverResultItem
@@ -49,6 +48,7 @@ from neo4j_graphrag.types import RawSearchResult, RetrieverResultItem
 from src.repository.neo4j.chunk import CHUNK_FULLTEXT_INDEX, CHUNK_VECTOR_INDEX
 from src.repository.neo4j.client import DATABASE, get_driver
 from src.repository.neo4j.fact import FACT_FULLTEXT_INDEX, FACT_VECTOR_INDEX
+from src.common.graphrag import MeteredEmbedder
 from src.common.tenant import Tenant
 from src.config import EMBEDDING_MODEL
 
@@ -60,7 +60,7 @@ from src.config import EMBEDDING_MODEL
 # 모듈 레벨 lazy singleton 캐시. retriever/인덱스 헬퍼가 매번 새 드라이버를 만들지 않도록
 # 최초 호출 시 한 번만 만들어 재사용한다.
 _DRIVER: neo4j.Driver | None = None
-_EMBEDDER: OpenAIEmbeddings | None = None
+_EMBEDDER: MeteredEmbedder | None = None
 
 
 def _driver() -> neo4j.Driver:
@@ -71,18 +71,22 @@ def _driver() -> neo4j.Driver:
     return _DRIVER
 
 
-def _embedder() -> OpenAIEmbeddings:
+def _embedder() -> MeteredEmbedder:
     """
     질의 텍스트를 임베딩할 embedder(lazy singleton).
 
     ⚠️ chunk.py의 TextChunkEmbedder는 청킹 전용이라 retriever에는
     쓸 수 없다(embed_query 인터페이스가 아님). retriever가 요구하는 embed_query를 가진
-    OpenAIEmbeddings를 직접 만들어야 한다. 임베딩 모델은 인덱싱 때 Chunk를 임베딩한 모델과
+    embedder를 직접 만들어야 한다. 임베딩 모델은 인덱싱 때 Chunk를 임베딩한 모델과
     같아야(EMBEDDING_MODEL) 벡터 공간이 일치한다.
+
+    이 경로가 임베딩 호출의 최대 발생원이다 — 탐지가 claim 하나당 최대 4채널을 던지고
+    채널마다 질의 임베딩이 한 번씩 나가므로, claim 100개면 400 요청이다. 계량이 가장
+    필요한 자리라 MeteredEmbedder를 쓴다.
     """
     global _EMBEDDER
     if _EMBEDDER is None:
-        _EMBEDDER = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+        _EMBEDDER = MeteredEmbedder(model=EMBEDDING_MODEL)
     return _EMBEDDER
 
 

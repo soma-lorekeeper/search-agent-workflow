@@ -27,7 +27,6 @@ from typing import List, Optional
 import neo4j
 import numpy as np
 
-from neo4j_graphrag.embeddings import OpenAIEmbeddings
 from neo4j_graphrag.experimental.components.resolver import (
     BasePropertySimilarityResolver,
     EntityResolver,
@@ -35,6 +34,7 @@ from neo4j_graphrag.experimental.components.resolver import (
 )
 from neo4j_graphrag.experimental.components.types import ResolutionStats
 
+from src.common.graphrag import MeteredEmbedder
 from src.common.tenant import Tenant
 
 # 병합 시 속성 처리 전략(APOC apoc.refactor.mergeNodes의 properties 옵션).
@@ -160,7 +160,10 @@ class OpenAIEmbeddingResolver(BasePropertySimilarityResolver):
             similarity_threshold=similarity_threshold,
             neo4j_database=neo4j_database,
         )
-        self.embeddings = OpenAIEmbeddings(model=embedding_model)
+        # 이 resolver는 현재 인덱싱 경로에서 쓰이지 않는다(PerLabelResolver가 fuzzy와
+        # 정규화 exact만 조립한다). 그래도 계량판을 쓰는 이유는, 누군가 이걸 다시 배선하는
+        # 순간 임베딩 호출이 미터 밖으로 새기 때문이다 — 그때 알아차릴 방법이 없다.
+        self.embeddings = MeteredEmbedder(model=embedding_model)
         # 텍스트 → 임베딩 벡터 캐시. 동일 텍스트의 중복 임베딩 호출을 막는다.
         self._cache: dict[str, np.ndarray] = {}
 
