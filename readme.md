@@ -136,7 +136,6 @@ curl localhost:8000/api/health | python3 -m json.tool
 ## 남은 작업 (다음 단계)
 
 - `lorekeeper.indexing()`을 실제로 호출하는 인덱싱 진입점 (원고 접수 페이지와 연결)
-- `build_retrieval_tools()` 기반 LangGraph Q&A 에이전트 재구현 (archive의 `agent.py` 대체)
 - lorekeeper 스키마(`Character/Location/Event/CharacterState/Organization/Item`) 위에서
   동작하는 설정 오류 탐지 파이프라인 재구현 (archive의 `contradiction_check.py` 대체,
   `entity_state_history` 리트리버 활용 검토)

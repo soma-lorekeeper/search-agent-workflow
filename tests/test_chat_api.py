@@ -11,6 +11,7 @@ LLM·Neo4j·PostgreSQL은 전부 스텁이라 실제 비용이 들지 않는다.
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from fastapi.testclient import TestClient
 from src import webapp
 from src.chat import agent as chat_agent
 from src.chat import kg_scope
+from src.chat.tools import ChatTool, build_chat_tools
 
 # KG에 인덱싱돼 있다고 보는 작품. 실제 값은 환경변수라서 테스트에서 고정한다.
 WORK_ID = 1
@@ -305,3 +307,210 @@ def test_run_chat_그래프_조회가_실패해도_대화는_계속된다(monkey
 
     assert result["content"] == "답변"
     assert "하나도 없다" in stub_llm[0][0]["content"]
+
+
+# ---------- 에이전트 루프(LangGraph)의 통제 장치 ----------
+# 여기부터는 "루프가 무엇을 절대 하지 않는가"를 검사한다. 구현이 손수 루프에서 그래프로
+# 바뀌어도 아래 성질은 그대로여야 한다 — 이건 구조가 아니라 안전장치에 대한 계약이다.
+
+
+def _tool_call(name: str, arguments: dict, call_id: str = "call_1") -> SimpleNamespace:
+    """OpenAI 응답의 tool_call 한 건(모델이 도구를 부르겠다고 말한 모양)."""
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=json.dumps(arguments, ensure_ascii=False)),
+    )
+
+
+def _response(content: str | None = None, tool_calls: list | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))]
+    )
+
+
+@pytest.fixture
+def loop_harness(monkeypatch):
+    """도구 1종짜리 가짜 레지스트리 + LLM 스텁을 끼운다.
+
+    반환: (seen_kwargs, tool_runs, set_replies) — 모델에 실제로 넘어간 요청 kwargs 목록,
+    도구가 실행된 인자 목록, 그리고 턴별 응답을 지정하는 함수.
+    """
+    seen: list[dict] = []
+    runs: list[tuple] = []
+    replies: list[SimpleNamespace] = []
+
+    def _run(work_id: int, query_text: str = "") -> tuple[str, str]:
+        runs.append((work_id, query_text))
+        return f"결과({query_text})", f"가짜 조회 · {query_text}"
+
+    fake_tool = ChatTool(
+        name="fake_search",
+        description="테스트용 도구",
+        parameters={
+            "type": "object",
+            "properties": {"query_text": {"type": "string"}},
+            "required": ["query_text"],
+        },
+        run=_run,
+    )
+    schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": fake_tool.name,
+                "description": fake_tool.description,
+                "parameters": fake_tool.parameters,
+            },
+        }
+    ]
+
+    async def _stub(**kwargs):
+        seen.append(kwargs)
+        # 지정된 응답이 떨어지면 마지막 응답을 계속 반복한다(예산·턴 상한 검사용).
+        return replies[len(seen) - 1] if len(seen) <= len(replies) else replies[-1]
+
+    monkeypatch.setattr(chat_agent, "build_chat_tools", lambda: (schemas, {fake_tool.name: fake_tool}))
+    monkeypatch.setattr(chat_agent, "fetch_indexed_episodes", lambda work_id: [1, 2])
+    monkeypatch.setattr(chat_agent, "_create_with_retry", _stub)
+
+    def set_replies(*responses: SimpleNamespace) -> None:
+        replies.extend(responses)
+
+    return seen, runs, set_replies
+
+
+def _run_one_turn(work_id: int = 1) -> dict:
+    return asyncio.run(
+        chat_agent.run_chat(
+            work_id=work_id,
+            session_id=1,
+            # 첫 턴이 아니게 만들어 제목 생성 호출이 끼어들지 않게 한다(루프만 검사한다).
+            messages=[
+                {"role": "user", "content": "안녕"},
+                {"role": "assistant", "content": "네"},
+                {"role": "user", "content": "카엘 상태 알려줘"},
+            ],
+            context=None,
+        )
+    )
+
+
+def test_예산을_다_쓰면_도구_목록_자체를_보내지_않는다(loop_harness):
+    """예산 소진은 "부르지 마라"는 부탁이 아니라 **부를 수단을 없애는 것**이어야 한다.
+
+    프롬프트로만 말리면 모델은 태연히 계속 부른다. tools 파라미터가 요청에서 빠져야
+    부를 방법 자체가 사라진다.
+    """
+    seen, runs, set_replies = loop_harness
+    # 모델이 매 턴 도구를 부르려 든다(예산이 끝나도 멈추지 않는 최악의 경우).
+    set_replies(_response(tool_calls=[_tool_call("fake_search", {"query_text": "카엘"})]))
+
+    result = _run_one_turn()
+
+    # 1) 예산(5회)만큼만 tools가 실려 나가고, 그 뒤로는 아예 빠진다.
+    with_tools = [i for i, kwargs in enumerate(seen) if "tools" in kwargs]
+    assert with_tools == [0, 1, 2, 3, 4]
+    assert all("tool_choice" not in kwargs for kwargs in seen[chat_agent.MAX_TOOL_CALLS :])
+    # 2) 도구는 예산 횟수만큼만 실제로 실행된다.
+    assert len(runs) == chat_agent.MAX_TOOL_CALLS
+    assert len(result["tool_calls"]) == chat_agent.MAX_TOOL_CALLS
+    # 3) 턴 상한은 예산과 별개의 안전판이다 — 예산이 0이 된 뒤로도 모델이 계속 도구를
+    #    부르려 하지만 MAX_TURNS에서 끊긴다.
+    assert len(seen) == chat_agent.MAX_TURNS
+    assert "시간이 너무 오래 걸렸" in result["content"]
+    # 4) 예산 초과 호출도 tool 메시지로 답을 돌려준다(안 돌려주면 다음 요청이 400이 된다).
+    over_budget = [
+        m
+        for kwargs in seen
+        for m in kwargs["messages"]
+        if m.get("role") == "tool" and "예산" in m["content"]
+    ]
+    assert over_budget
+
+
+def test_병렬_도구_호출은_꺼둔다(loop_harness):
+    """예산 회계를 정확히 유지하려고 한 번에 하나씩만 부르게 한다."""
+    seen, _runs, set_replies = loop_harness
+    set_replies(_response(content="답변"))
+
+    _run_one_turn()
+
+    assert seen[0]["parallel_tool_calls"] is False
+
+
+def test_도구가_실패해도_대화는_끝나지_않는다(loop_harness, monkeypatch):
+    """도구 실패는 "근거 부족"이지 대화의 끝이 아니다.
+
+    오류 문자열을 도구 결과로 돌려줘야 모델이 "확인하지 못했다"고 답할 수 있다. 예외를 그대로
+    올리면 작가에게는 답변 대신 에러 말풍선만 남는다.
+    """
+    seen, _runs, set_replies = loop_harness
+
+    def _boom(work_id: int, query_text: str = "") -> tuple[str, str]:
+        raise RuntimeError("Neo4j 연결 실패")
+
+    schemas, _ = chat_agent.build_chat_tools()  # loop_harness가 끼운 가짜 스키마
+    monkeypatch.setattr(
+        chat_agent,
+        "build_chat_tools",
+        lambda: (schemas, {"fake_search": ChatTool("fake_search", "d", {}, _boom)}),
+    )
+    set_replies(
+        _response(tool_calls=[_tool_call("fake_search", {"query_text": "카엘"})]),
+        _response(content="확인하지 못했습니다."),
+    )
+
+    result = _run_one_turn()
+
+    # 1) 대화는 정상 종료되고 모델은 한 번 더 답할 기회를 얻는다.
+    assert result["content"] == "확인하지 못했습니다."
+    # 2) 실패는 UI에 FAILED로 남는다(무엇을 찾다 실패했는지 작가가 봐야 한다).
+    assert result["tool_calls"] == [
+        {"name": "fake_search", "summary": "fake_search 조회 실패", "status": "FAILED"}
+    ]
+    # 3) 오류 문자열이 도구 결과로 모델에게 전달된다.
+    tool_messages = [m for m in seen[1]["messages"] if m.get("role") == "tool"]
+    assert "도구 실행 오류: Neo4j 연결 실패" in tool_messages[0]["content"]
+
+
+def test_work_id는_스키마에_없지만_도구에는_전달된다(loop_harness):
+    """조회 대상 작품은 서버가 정하는 값이지 모델이 고를 값이 아니다.
+
+    스키마에 넣으면 모델이 작품 번호를 지어내 남의 작품을 읽으려 드는 경로가 생긴다.
+    그래서 모델에게는 감추고, 실행 시점에 요청의 값을 주입한다.
+    """
+    _seen, runs, set_replies = loop_harness
+    set_replies(
+        _response(tool_calls=[_tool_call("fake_search", {"query_text": "카엘"})]),
+        _response(content="답변"),
+    )
+
+    result = _run_one_turn(work_id=42)
+
+    assert result["tool_calls"][0]["status"] == "DONE"
+    assert runs == [(42, "카엘")]  # 모델이 준 인자에는 없던 work_id가 실행 시점에 주입됐다
+
+
+def test_실제_도구_스키마에는_work_id가_없다():
+    """가짜 도구가 아니라 진짜 6종 스키마에 대한 검사 — 모델이 볼 수 있는 전체 표면을 훑는다."""
+    schemas, tools = build_chat_tools()
+
+    assert "work_id" not in json.dumps(schemas, ensure_ascii=False)
+    # 반대로 실행기는 전부 work_id를 첫 인자로 받는다(작품 격리 전제를 인터페이스에 박아둔 것).
+    for tool in tools.values():
+        assert tool.run.__code__.co_varnames[0] == "work_id"
+
+
+def test_모델이_work_id를_지어내도_주입값을_덮어쓰지_못한다(loop_harness):
+    """스키마에 없어도 모델은 없는 인자를 만들어 낼 수 있다 — 그때 조용히 먹히면 안 된다."""
+    _seen, runs, set_replies = loop_harness
+    set_replies(
+        _response(tool_calls=[_tool_call("fake_search", {"query_text": "카엘", "work_id": 999})]),
+        _response(content="확인하지 못했습니다."),
+    )
+
+    result = _run_one_turn(work_id=1)
+
+    # 위조된 work_id로 실행되는 대신 호출이 실패하고, 대화는 계속된다.
+    assert runs == []
+    assert result["tool_calls"][0]["status"] == "FAILED"

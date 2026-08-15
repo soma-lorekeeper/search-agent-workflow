@@ -3,9 +3,12 @@
 -e ./lorekeeper-poc/poc
 
 # 우리 쪽 오케스트레이션(에이전트 루프, API 서버)
+# langgraph: 채팅 에이전트의 루프를 그래프(model 노드 ↔ tools 노드)로 돌린다.
+# openai: 모델 호출은 langchain-openai를 거치지 않고 SDK로 직접 한다 — 예산이 떨어지면 tools를
+#         빼고, prompt_cache_key를 걸고, parallel_tool_calls를 끄는 통제가 요청 본문을 우리가
+#         조립해야 확실해서다(src/chat/agent.py 참고). 그래서 langchain-core·langchain-openai는
+#         직접 쓰지 않아 선언에서 뺐다(langchain-core는 langgraph가 전이 의존성으로 끌고 온다).
 langgraph
-langchain-core
-langchain-openai
 openai
 python-dotenv
 fastapi
