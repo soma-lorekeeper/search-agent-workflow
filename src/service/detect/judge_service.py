@@ -17,7 +17,7 @@ import logging
 import re
 
 from src.common.openai_client import create_completion
-from src.config import OPENAI_MODEL
+from src.config import EXTRACTION_MODEL
 from src.service.detect import prompts
 from src.service.detect.docstore import build_docstore, render_claim_refs, render_docstore
 
@@ -160,7 +160,7 @@ async def judge(claims: list[dict], evidence: dict) -> list[dict]:
     user = render_claim_refs(store, claims)
 
     response = await create_completion(
-        model=OPENAI_MODEL,
+        model=EXTRACTION_MODEL,
         response_format={"type": "json_object"},
         prompt_cache_key=_CACHE_KEY,
         messages=[

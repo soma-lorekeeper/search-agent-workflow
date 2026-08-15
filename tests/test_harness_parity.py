@@ -113,6 +113,56 @@ def test_확정_구성값이_하네스와_같다():
     assert judge_service.ERROR_THRESHOLD == 7
 
 
+def test_탐지가_하네스와_같은_모델로_돈다():
+    """프롬프트가 같아도 모델이 다르면 잰 수치를 물려받지 못한다.
+
+    실제로 서비스는 한동안 OPENAI_MODEL(채팅용)로 탐지를 돌렸다. 파리티 테스트가
+    프롬프트·조각 크기·임계값만 대조하고 **모델은 안 봤기 때문에** 그 어긋남이
+    드러나지 않았다. 이 구멍을 막는 자리다.
+    """
+    from src.config import EXTRACTION_MODEL
+
+    assert EXTRACTION_MODEL == eval_claims.EXTRACT_MODEL
+
+
+def test_탐지가_추론_강도를_넘기지_않는다(monkeypatch):
+    """하네스 기본은 reasoning_effort **미지정**이다(scripts/eval_claims.py:53).
+
+    값을 넘기면 다른 구성이 되는데, 응답은 멀쩡히 오고 결과도 그럴듯해서 눈에 띄지 않는다.
+    추출·판정 두 경로 모두 kwargs에 그 키가 없어야 한다.
+    """
+    import asyncio
+    import json
+
+    from src.service.detect import extract_service, judge_service
+
+    seen: list[dict] = []
+
+    class _FakeResponse:
+        def __init__(self, content):
+            message = type("_M", (), {"content": content})()
+            self.choices = [type("_C", (), {"message": message})()]
+
+    async def _fake(**kwargs):
+        seen.append(kwargs)
+        return _FakeResponse(json.dumps({"claims": [], "verdicts": []}))
+
+    monkeypatch.setattr(extract_service, "create_completion", _fake)
+    monkeypatch.setattr(judge_service, "create_completion", _fake)
+    monkeypatch.setattr(extract_service, "_build_system", lambda tenant, ch: "시스템")
+    monkeypatch.setattr(extract_service, "split_lines", lambda text: [text])
+    monkeypatch.setattr(extract_service, "number_lines", lambda lines: "L1: " + lines[0])
+
+    asyncio.run(extract_service.extract("원고 한 줄", tenant=None, up_to_chapter=5))
+    with pytest.raises(RuntimeError):
+        # 판정 응답이 비면 "오류 0건"이 아니라 실패다 — 여기서는 kwargs만 보면 된다.
+        asyncio.run(judge_service.judge([{"id": "P1", "quote": "q"}], {"records": []}))
+
+    assert seen, "두 경로 모두 호출돼야 한다"
+    for kwargs in seen:
+        assert "reasoning_effort" not in kwargs, kwargs
+
+
 def test_라우팅이_하네스와_같은_채널을_연다():
     """어떤 질의를 어느 채널에 던지는지가 검색 도달률을 정한다."""
     from src.service.detect.routing import route_qav

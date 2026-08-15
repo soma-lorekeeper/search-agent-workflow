@@ -16,7 +16,7 @@ import json
 from src.common import usage
 from src.common.openai_client import create_completion
 from src.common.tenant import Tenant
-from src.config import OPENAI_MODEL
+from src.config import EXTRACTION_MODEL
 from src.service.detect import entity_nodes, prompts
 from src.service.detect.lines import number_lines, split_lines
 
@@ -73,7 +73,7 @@ def _build_system(tenant: Tenant, up_to_chapter: int | None) -> str:
 async def _extract_one(system: str, unit: str) -> tuple[list[dict], dict]:
     """조각 하나에서 claim을 뽑는다."""
     response = await create_completion(
-        model=OPENAI_MODEL,
+        model=EXTRACTION_MODEL,
         response_format={"type": "json_object"},
         prompt_cache_key=_CACHE_KEY,
         messages=[

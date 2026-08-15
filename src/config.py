@@ -9,6 +9,9 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+# **채팅 전용** 모델. 예전에는 탐지(추출·판정)도 이 값을 썼는데, 탐지 성능 수치는
+# 평가 하네스가 EXTRACTION_MODEL로 잰 것이라 서비스가 다른 모델로 돌면 그 수치를
+# 물려받지 못한다. 지금은 탐지가 EXTRACTION_MODEL을 쓰고 여기는 채팅만 본다.
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-terra")
 
 DATA_DIR = ROOT_DIR / "data"
@@ -20,6 +23,12 @@ DATA_DIR = ROOT_DIR / "data"
 #
 # 추출용 모델은 GPT-5 계열이라 temperature/top_p 같은 샘플링 파라미터를 넘기지 않는다
 # (비기본 temperature는 400으로 거부된다).
+#
+# **탐지(추출·판정)도 이 모델을 쓴다.** 이름은 인덱싱 추출에서 왔지만, 둘 다 "정해진
+# 구조를 채우는 기계적 판정"이라는 같은 성격이고 무엇보다 평가 하네스가 이 모델로
+# 검출 22/25를 쟀다(scripts/eval_claims.py의 EXTRACT_MODEL). 서비스가 다른 모델로 돌면
+# 그 수치는 근거를 잃는다. 추론 강도는 용도별로 다르다 — 인덱싱은 high, 탐지는 미지정
+# (하네스 기본값).
 EXTRACTION_MODEL = os.environ.get("LOREKEEPER_MODEL") or "gpt-5.6-luna"
 # 청크·사실 임베딩 모델. 인덱싱이 쓰는 것과 검색이 쓰는 것이 반드시 같아야 한다 —
 # 다르면 같은 공간의 벡터가 아니라 검색 결과가 조용히 무의미해진다.
