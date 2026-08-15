@@ -18,10 +18,12 @@ import threading
 import time
 import uuid
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from src import app as app_module
+from src.common import llm_limit
 from src.common.tenant import Tenant
 from src.service.index import job_service as index_job_service
 from conftest import RecordingDict  # tests/에 __init__.py가 없어 pytest가 경로에 넣어준다
@@ -60,7 +62,9 @@ def client(monkeypatch, tmp_path):
     키로 하는 dict이므로 빈 dict가 "아무 화도 큐에 넣은 적 없음"이다.
     """
     index_job_service._index_jobs.clear()
-    index_job_service._tpm_window.clear()
+    # 미터도 비운다 — 접수 게이트의 마지막 안전망이 모델 버킷 잔량을 보므로, 앞 테스트가
+    # 남긴 값이 남아 있으면 엉뚱한 429가 난다.
+    monkeypatch.setattr(llm_limit, "_buckets", {})
     monkeypatch.setattr(index_job_service, "_index_queue", asyncio.Queue())
     monkeypatch.setattr(index_job_service, "_max_queued_episode_no", {})
     # 기본값은 "아직 인덱싱 안 됨" — 마커가 있는 경우는 해당 테스트에서 따로 뒤집는다.
@@ -110,7 +114,9 @@ def test_submit_returns_201_contract(client, stub_indexing):
     assert body["userId"] == USER_ID
     assert body["workId"] == WORK_ID
     assert body["episodeIds"] == [101, 102]
-    assert body["remainingTpm"] < index_job_service.INDEX_TPM_LIMIT  # 추정치만큼 창에서 깎였다
+    # remainingTpm 은 이제 미터가 헤더로 관측한 실제 잔량이다. 테스트에서는 호출이 없어
+    # 콜드 스타트 가정값이 그대로 나온다 — 음수나 None 이 아니면 계약은 지켜진 것이다.
+    assert body["remainingTpm"] >= 0
     assert re.match(RFC3339_UTC, body["requestedAt"])
 
 
@@ -248,46 +254,79 @@ def test_already_indexed_resubmit_is_not_blocked_by_watermark(client, stub_index
     assert stub_indexing == [7]  # 3·4화는 실제로 인덱싱되지 않았다
 
 
-def test_rejected_request_does_not_raise_the_watermark(client, stub_indexing, monkeypatch):
+def test_rejected_request_does_not_raise_the_watermark(client, monkeypatch):
     """429로 거절한 요청은 없던 일이어야 한다 — 워터마크만 올려두면 재시도가 400으로 막힌다."""
-    monkeypatch.setattr(index_job_service, "INDEX_TPM_LIMIT", 20000)
-    index_job_service._tpm_window.append((time.monotonic(), 19000))  # 여유를 거의 없애 429를 유도
+    monkeypatch.setattr(index_job_service, "INDEX_MAX_WAIT_SECONDS", 120)  # = 1화
+    release = threading.Event()
+
+    async def _blocking(tenant, episode_no, text):
+        await asyncio.to_thread(release.wait, 5)
+        return {"chapter": episode_no}
+
+    monkeypatch.setattr(index_job_service, "run_indexing", _blocking)
+
+    # 1화를 넣어 큐를 채운다 → 다음 요청은 큐 혼잡으로 429
+    assert _submit(client, [{"episodeId": 105, "episodeNo": 5, "text": "5화"}]).status_code == 201
     assert _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화"}]).status_code == 429
-    index_job_service._tpm_window.clear()
+
+    # 큐가 빠지면 같은 화가 다시 통과해야 한다(워터마크가 올라가 있으면 400이 된다).
+    release.set()
+    _wait_until(client, _job_ids()[0], _terminal)
     assert _submit(client, [{"episodeId": 106, "episodeNo": 6, "text": "6화"}]).status_code == 201
 
 
-# ---------- TPM(429) ----------
+def _job_ids() -> list[str]:
+    return list(index_job_service._index_jobs)
 
 
-def test_tpm_exhausted_returns_429_and_stores_nothing(client, stub_indexing, monkeypatch):
-    """한도 안에는 들어가지만 "지금" 여유가 없는 요청 — 기다리면 통과하므로 429가 맞다.
+# ---------- 접수 게이트(429) ----------
 
-    (한도 자체를 넘어 영영 통과할 수 없는 요청은 429가 아니라 400이다. 위 테스트 참고.)
+
+def test_queue_backlog_returns_429_and_stores_nothing(client, stub_indexing, monkeypatch):
+    """큐가 밀리면 429 — 기다리면 빠지므로 400이 아니라 429가 맞다.
+
+    예전에는 이 자리에서 TPM(글자수 추정 토큰)을 봤다. 지금은 **대기 화 수**를 본다:
+    지키려던 자원이 OpenAI 한도가 아니라 워커 처리량이었기 때문이다(접수 7화/분 vs
+    처리 0.5화/분으로 14배 어긋나 있었다).
     """
-    monkeypatch.setattr(index_job_service, "INDEX_TPM_LIMIT", 20000)
-    index_job_service._tpm_window.append((time.monotonic(), 19000))  # 방금 19,000을 썼다고 가정
-    res = _submit(client, [{"episodeId": 101, "episodeNo": 6, "text": "6화 원고"}])
+    # 화당 120초, 상한 240초 = 2화. 이미 2화가 큐에 있으면 다음 요청은 거절된다.
+    monkeypatch.setattr(index_job_service, "INDEX_MAX_WAIT_SECONDS", 240)
+
+    # 워커를 붙들어 큐에 남겨둔다 — 스텁이 즉시 끝나면 접수하자마자 큐가 비어버린다.
+    release = threading.Event()
+
+    async def _blocking(tenant, episode_no, text):
+        await asyncio.to_thread(release.wait, 5)
+        return {"chapter": episode_no}
+
+    monkeypatch.setattr(index_job_service, "run_indexing", _blocking)
+
+    assert _submit(
+        client,
+        [
+            {"episodeId": 101, "episodeNo": 1, "text": "1화"},
+            {"episodeId": 102, "episodeNo": 2, "text": "2화"},
+        ],
+    ).status_code == 201
+
+    res = _submit(client, [{"episodeId": 103, "episodeNo": 3, "text": "3화"}])
     assert res.status_code == 429
-    assert res.headers["Retry-After"] == "60"  # 방금 기록이라 창이 다 흐르려면 60초
     body = res.json()
-    assert body["detail"] == "TPM limit exceeded. Retry after the Retry-After period."
-    assert body["remainingTpm"] == 1000
+    assert body["detail"] == "Indexing queue is full. Retry after the Retry-After period."
+    assert body["queuedEpisodes"] >= 1
+    assert body["estimatedWaitSeconds"] > 240
+    assert int(res.headers["Retry-After"]) > 0
     # 거절된 요청은 작업 기록에 남지 않는다.
-    assert _index_job_count() == 0
-    assert stub_indexing == []
+    assert _index_job_count() == 1  # 첫 요청만
+    release.set()
 
 
 def test_bundle_larger_than_the_whole_limit_is_400_not_429(client, stub_indexing, monkeypatch):
-    """한도 자체를 넘는 묶음은 기다린다고 통과하지 못한다 — 429는 끝나지 않는 재시도 루프다."""
-    monkeypatch.setattr(index_job_service, "INDEX_TPM_LIMIT", 20000)
-    # 회차당 고정 비용 15,000 × 2 = 30,000 > 20,000. 창이 텅 비어 있어도 절대 못 들어간다.
+    """묶음 하나가 대기 상한을 넘으면 기다린다고 통과하지 못한다 — 429는 끝나지 않는 재시도 루프다."""
+    monkeypatch.setattr(index_job_service, "INDEX_MAX_WAIT_SECONDS", 240)  # = 2화
     res = _submit(
         client,
-        [
-            {"episodeId": 106, "episodeNo": 6, "text": "6화"},
-            {"episodeId": 107, "episodeNo": 7, "text": "7화"},
-        ],
+        [{"episodeId": 100 + n, "episodeNo": n, "text": f"{n}화"} for n in range(1, 4)],  # 3화
     )
     assert res.status_code == 400
     detail = res.json()["detail"]
@@ -297,10 +336,10 @@ def test_bundle_larger_than_the_whole_limit_is_400_not_429(client, stub_indexing
 
 
 def test_many_small_episodes_are_400_too(client, stub_indexing):
-    """길이와 무관하게 화 수만으로 한도를 넘는 경우(고정 비용 15,000/화 × 14화 > 200,000)."""
+    """원고 길이와 무관하게 **화 수**만으로 상한을 넘는 경우(기본 상한 2400초 = 20화)."""
     res = _submit(
         client,
-        [{"episodeId": 100 + n, "episodeNo": n, "text": "짧은 원고"} for n in range(1, 15)],
+        [{"episodeId": 100 + n, "episodeNo": n, "text": "짧은 원고"} for n in range(1, 22)],
     )
     assert res.status_code == 400
     assert "never be accepted" in res.json()["detail"]
@@ -465,15 +504,18 @@ def test_marker_is_looked_up_within_the_requesting_tenant(client, stub_indexing,
     assert seen == ["7:3"]
 
 
-def test_fully_indexed_resubmit_costs_no_tpm(client, stub_indexing, monkeypatch):
-    """전부 이미 인덱싱된 재제출은 TPM을 전혀 쓰지 않는다 — 안 그러면 재제출이 429로 막힌다."""
+def test_fully_indexed_resubmit_is_not_gated(client, stub_indexing, monkeypatch):
+    """전부 이미 인덱싱된 재제출은 큐를 쓰지 않으므로 게이트에 걸리지 않는다.
+
+    걸리면 "안전한 재제출"이라는 스펙의 전제가 깨진다 — 아무 일도 안 하는 요청이
+    429를 받고 영원히 재시도한다.
+    """
     monkeypatch.setattr(
         index_job_service, "_already_indexed", lambda tenant, episode_nos: set(episode_nos)
     )
-    monkeypatch.setattr(index_job_service, "INDEX_TPM_LIMIT", 1000)
+    monkeypatch.setattr(index_job_service, "INDEX_MAX_WAIT_SECONDS", 0)  # 어떤 대기도 불허
     res = _submit(client, [{"episodeId": 101, "episodeNo": 6, "text": "6화" * 5000}])
     assert res.status_code == 201
-    assert res.json()["remainingTpm"] == 1000
     body = _wait_until(client, res.json()["jobId"], _terminal)
     assert body["episodes"][0]["status"] == "DONE"
     assert stub_indexing == []
@@ -510,3 +552,74 @@ def test_inflight_resubmit_is_not_blocked_by_watermark(client, monkeypatch):
         assert _submit(client, episodes).status_code == 201
     finally:
         release.set()
+
+
+def test_인덱싱은_429를_자체_재시도하지_않고_즉시_실패한다(client, monkeypatch):
+    """429 재시도는 관문(src/common/openai_client.py)이 호출 단위로만 한다.
+
+    예전에는 이 자리에 회차 단위 재시도가 있었다(3회, 20/40/80초). 지운 이유는 재시도가
+    회차 전체를 다시 돌리는데, 라이브러리 노드 쓰기가 upsert가 아니라 CREATE이고
+    Event·CharacterState는 resolver가 일부러 병합하지 않아서 **재시도할 때마다 사건과
+    인물 상태가 한 벌씩 더 쌓이기** 때문이다. 예외도 안 나고 검색 결과에만 조용히 중복으로
+    잡힌다.
+
+    그래서 여기서는 "빨리 실패하는 것"이 올바른 동작이다. 누가 편의로 재시도를 다시
+    넣으면 이 테스트가 깨진다 — 그때 위 이유를 다시 읽어야 한다.
+    """
+    from openai import RateLimitError
+
+    호출 = []
+
+    async def _429(tenant, episode_no, text):
+        호출.append(episode_no)
+        response = httpx.Response(
+            429, request=httpx.Request("POST", "https://api.openai.com/v1")
+        )
+        raise RateLimitError("rate limited", response=response, body={})
+
+    monkeypatch.setattr(index_job_service, "run_indexing", _429)
+
+    시작 = time.monotonic()
+    body = _submit(client, [{"episodeId": 101, "episodeNo": 1, "text": "1화 원고"}]).json()
+    상태 = _wait_until(client, body["jobId"], _terminal)
+    걸린 = time.monotonic() - 시작
+
+    assert 상태["episodes"][0]["status"] == "ERROR"
+    assert len(호출) == 1, f"회차를 다시 돌렸다({len(호출)}회) — 그래프에 중복이 쌓인다"
+    assert 걸린 < 5, f"{걸린:.1f}초 걸렸다 — 백오프 대기가 남아 있다"
+
+
+def test_모델_한도가_바닥이면_큐가_한가해도_거절한다(client, stub_indexing, monkeypatch):
+    """마지막 안전망 — 탐지가 같은 모델 버킷을 비웠을 수 있다.
+
+    인덱싱과 탐지는 같은 EXTRACTION_MODEL 을 쓴다(6번 커밋 이후). 큐 깊이만 보면 "우리는
+    한가하다"고 판단해 접수하는데, 정작 OpenAI 쪽이 바닥이면 시작해봐야 429만 맞는다.
+    """
+    from src.config import EXTRACTION_MODEL
+
+    llm_limit.observe(
+        EXTRACTION_MODEL,
+        {
+            "x-ratelimit-limit-tokens": "200000",
+            "x-ratelimit-remaining-tokens": "100",  # 한도의 0.05% — 임계(10%) 아래
+            "x-ratelimit-reset-tokens": "30s",
+        },
+    )
+
+    res = _submit(client, [{"episodeId": 101, "episodeNo": 1, "text": "1화"}])
+    assert res.status_code == 429
+    assert "rate limit" in res.json()["detail"].lower()
+    assert int(res.headers["Retry-After"]) > 0
+    assert _index_job_count() == 0
+    assert stub_indexing == []
+
+
+def test_여유가_충분하면_안전망은_통과시킨다(client, stub_indexing):
+    """임계 위면 막지 않는다 — 안전망이 정상 흐름을 막으면 안 된다."""
+    from src.config import EXTRACTION_MODEL
+
+    llm_limit.observe(
+        EXTRACTION_MODEL,
+        {"x-ratelimit-limit-tokens": "200000", "x-ratelimit-remaining-tokens": "190000"},
+    )
+    assert _submit(client, [{"episodeId": 101, "episodeNo": 1, "text": "1화"}]).status_code == 201

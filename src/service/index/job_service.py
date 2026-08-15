@@ -19,7 +19,8 @@ Spring은 201 응답으로 받은 jobId로 진행 상황을 조회한다.
 
 작업 상태는 이 프로세스 메모리에만 있다. 재시작하면 상태가 사라지고 진행 중이던 인덱싱도
 함께 끊긴다 — 스펙이 인정하는 정상 시나리오다(Spring은 조회에서 404를 보면 다시 POST한다).
-그렇게 다시 보내도 안전한 근거는 _already_indexed의 완료 마커다.
+다시 보내도 **끝난 화를 두 번 일하지 않는** 근거가 _already_indexed의 완료 마커다.
+(끊긴 화를 다시 도는 것 자체는 아직 안전하지 않다 — 아래 완료 마커 절의 경고 참고.)
 
 job 한 건의 모양:
   {"user_id": 42, "work_id": 7, "tenant_id": "42:7", "requested_at": "2026-08-11T03:11:00Z",
@@ -31,18 +32,17 @@ text를 상태에 함께 들고 있는 건 워커가 나중에 꺼내 쓰기 때
 
 import asyncio
 import logging
-import math
 import os
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
-from openai import RateLimitError
 
+from src.common import admission, llm_limit
 from src.dto.index_dto import IndexAccepted, IndexEpisodeStatus, IndexJobStatus, IndexRequest
+from src.config import EXTRACTION_MODEL
 from src.repository.neo4j.client import get_driver
 
 from src.service.index.indexing_service import DATABASE as LOREKEEPER_DATABASE
@@ -142,7 +142,7 @@ async def _run_index_job(job_id: str) -> None:
                 episode["episode_id"],
                 episode["episode_no"],
             )
-            await _run_indexing_with_retry(tenant, episode["episode_no"], episode["text"])
+            await run_indexing(tenant, episode["episode_no"], episode["text"])
             # 원고를 놓아준다. 워커가 꺼내 쓰려고 상태에 담아 둔 것인데 다 썼고, 작업
             # 기록은 재시작 전까지 지워지지 않는다 — 회차당 수만 자가 프로세스가 뜬 내내
             # 남아 쌓인다. 조회 응답에는 애초에 나가지 않는 필드다.
@@ -161,35 +161,31 @@ async def _run_index_job(job_id: str) -> None:
             failed_no = episode["episode_no"]
 
 
-# 접수 시점의 TPM 계산은 어디까지나 추정이라, 201을 받은 요청도 실제 호출에서 순간적으로
-# 한도에 걸릴 수 있다. 그건 Spring에 돌려줘봐야 똑같은 요청을 다시 만들 뿐이므로 여기서
-# 삼키고 재시도한다(스펙 6절: "서버가 내부적으로 백오프 재시도, Spring은 관여하지 않는다").
-_RATE_LIMIT_RETRIES = 3
-_RATE_LIMIT_BACKOFF_SECONDS = 20  # 20초 → 40초 → 80초. TPM 창이 60초라 한 번 쉬면 대개 회복된다.
-
-
-async def _run_indexing_with_retry(tenant: Tenant, episode_no: int, text: str) -> dict:
-    """lorekeeper 인덱싱을 부르되, OpenAI의 rate limit(429)만 백오프 재시도한다.
-
-    다른 예외는 재시도해도 결과가 달라지지 않으므로(원고 파싱 실패, DB 연결 끊김 등)
-    그대로 올려보내 화 상태를 error로 만든다.
-    """
-    for attempt in range(_RATE_LIMIT_RETRIES + 1):
-        try:
-            return await run_indexing(tenant, episode_no, text)
-        except RateLimitError:
-            if attempt == _RATE_LIMIT_RETRIES:
-                raise
-            delay = _RATE_LIMIT_BACKOFF_SECONDS * (2**attempt)
-            logger.warning(
-                "OpenAI rate limit — %d초 후 재시도 | episodeNo=%s (%d/%d)",
-                delay,
-                episode_no,
-                attempt + 1,
-                _RATE_LIMIT_RETRIES,
-            )
-            await asyncio.sleep(delay)
-    raise AssertionError("unreachable")
+# ---------- 429 재시도는 여기서 하지 않는다 ----------
+#
+# 예전에는 이 자리에 회차 단위 백오프 재시도가 있었다(3회, 20/40/80초). 지운 이유는
+# **재시도의 단위가 잘못됐기 때문**이다.
+#
+# indexing()은 8단계짜리이고 그중 네 곳이 LLM 호출이다. 마지막 요약에서 429가 나도 재시도는
+# 1단계부터 다시 도는데, 라이브러리 Neo4jWriter의 노드 쓰기는 upsert가 아니라 **CREATE**다
+# (neo4j_queries.upsert_node_query: `CREATE (n:__KGBuilder__ {__tmp_internal_id: row.id})`).
+# 중복은 그 뒤 resolver가 이름으로 병합해 없애는데, PerLabelResolver는 Character와
+# Item/Location/Organization만 병합하고 **Event·CharacterState는 일부러 병합하지 않는다**
+# (서술형 이름이라 유사도 병합이 숫자·부위 차이를 뭉갠다). 그래서 재시도할 때마다 사건과
+# 인물 상태가 한 벌씩 더 쌓인다 — 예외도 안 나고 검색 결과에만 조용히 중복으로 잡힌다.
+#
+# 즉 이 층은 "회차를 살리려다 그래프를 오염시키는" 교환이었다. 지금 429 재시도는
+# **호출 단위로만** 한다(src/common/openai_client.py, 5회 지수 백오프 + 지터) — 그쪽은
+# 그 호출만 다시 보내므로 그래프에 아무것도 남기지 않는다. 스펙 6절의 "서버가 내부적으로
+# 백오프 재시도하고 Spring은 관여하지 않는다"는 계약은 그대로 지켜진다. 재시도의 위치만
+# 바뀌었다.
+#
+# 대가: 관문의 재시도(약 17초)를 넘겨 429가 올라오면 그 화가 ERROR가 되고, 같은 작업의 뒤
+# 화들은 연쇄 스킵된다. Spring이 재제출하는 것이 복구 경로다.
+#
+# ⚠️ 재제출도 미완 산출물 위에 다시 쓰는 것은 마찬가지다. "재인덱싱 전에 그 회차의 미완
+# 산출물을 지우는" 정리 단계가 아직 없다 — 재시도와 무관하게 남아 있는 문제이고 별도
+# 작업으로 다룬다. 아래 완료 마커 주석의 "전부 upsert라 수렴한다"도 그래서 부정확하다.
 
 
 # ---------- 완료 마커 ----------
@@ -200,9 +196,20 @@ async def _run_indexing_with_retry(tenant: Tenant, episode_no: int, text: str) -
 #
 # 그래서 접수 시점에 화마다 이 마커를 확인한다:
 #   - 있으면 → 일하지 않고 즉시 done
-#   - 없으면 → 처음부터 다시 인덱싱(중간까지 쓰다 만 결과 위에 다시 돌려도 Neo4jWriter가
-#     전부 upsert라 같은 값으로 수렴한다)
-# 재시작으로 진행 상태가 날아가 Spring이 같은 화를 다시 보내도 안전한 이유가 이것이다.
+#   - 없으면 → 처음부터 다시 인덱싱
+# 재시작으로 진행 상태가 날아가 Spring이 같은 화를 다시 보내도 **일을 두 번 하지 않는**
+# 이유가 이것이다.
+#
+# ⚠️ 다만 "다시 돌려도 같은 값으로 수렴한다"고는 말할 수 없다. 여기 있던 예전 설명은
+# "Neo4jWriter가 전부 upsert"라고 적었는데 사실이 아니다 — 라이브러리의 노드 쓰기는
+# `CREATE (n:__KGBuilder__ ...)`이고, 중복 제거는 그 뒤 resolver가 이름으로 병합해 한다.
+# 그런데 PerLabelResolver는 Character·Item·Location·Organization만 병합하고
+# **Event·CharacterState는 일부러 병합하지 않으므로**, 중간까지 쓰다 만 회차를 다시 돌리면
+# 그 둘이 한 벌씩 더 쌓인다.
+#
+# 그래서 마커가 보장하는 것은 "완료된 화를 두 번 일하지 않는다"까지이고, "미완 화를 다시
+# 돌려도 안전하다"는 아니다. 미완 산출물을 지우고 시작하는 정리 단계가 필요한데 아직 없다
+# (별도 작업).
 #
 # 마커는 테넌트 안에서만 유효하다. 예전에는 화 번호만 보고 판정해서 소설 B의 6화가 소설 A의
 # 6화 마커에 걸려 "이미 인덱싱됨"으로 보고됐다(아무 일도 안 하고 done — 조용한 데이터 유실).
@@ -238,53 +245,40 @@ def _already_indexed(tenant: Tenant, episode_nos: list[int]) -> set[int]:
     return {r["chapter"] for r in records}
 
 
-# ---------- TPM(분당 토큰) ----------
-# 한 화를 인덱싱하면 LLM을 여러 번 부른다(추출 + 회차 요약 + 전역 요약 …). 조직 단위 분당
-# 토큰 한도를 넘기면 OpenAI가 429를 돌려주는데, 그건 이미 절반쯤 일한 뒤라 되돌리기 어렵다.
-# 그래서 접수 시점에 "이 요청이 대략 몇 토큰을 쓸지"를 추정해 남은 여유와 비교하고, 모자라면
-# 아예 받지 않는다(429 + Retry-After). 받지 않은 요청은 어디에도 저장하지 않는다.
+# ---------- 접수 게이트: 큐가 얼마나 밀렸는가 ----------
 #
-# 추정 휴리스틱 — 정확할 필요는 없고 과소추정만 피하면 된다:
-#   화당 토큰 ≈ 원고 글자수 / _CHARS_PER_TOKEN * _PASSES_PER_EPISODE + _CONTEXT_TOKENS_PER_EPISODE
-#   - _CHARS_PER_TOKEN=1.5: 한국어는 대략 1.5자에 1토큰(o200k 기준 경험값).
-#   - _PASSES_PER_EPISODE=4: 원고 전문이 프롬프트/응답에 실리는 횟수 — 추출 입력, 추출 결과
-#     (그래프 JSON), 회차 요약 입력, 전역 요약 입력. 원고가 몇 번 왕복하는지의 대략치다.
-#   - _CONTEXT_TOKENS_PER_EPISODE=15000: 원고 길이와 무관하게 매 화 깔리는 고정 비용
-#     (그래프 덤프 + 누적 요약 + few-shot 예시).
+# 예전에는 여기서 TPM(분당 토큰)을 봤다. 접수 시점에 원고 글자수로 "이 요청이 몇 토큰을
+# 쓸지"를 추정해 60초 창의 여유와 비교하는 방식이었는데, 실측해보니 두 가지가 틀렸다.
 #
-# 이 값은 예약이 아니라 추정이다: 201을 받은 요청도 실제 호출에서 순간 한도에 걸릴 수 있고,
-# 그때는 워커가 백오프로 알아서 재시도한다(_run_indexing_with_retry).
-INDEX_TPM_LIMIT = int(os.environ.get("INDEX_TPM_LIMIT", "200000"))
-_TPM_WINDOW_SECONDS = 60
-_CHARS_PER_TOKEN = 1.5
-_PASSES_PER_EPISODE = 4
-_CONTEXT_TOKENS_PER_EPISODE = 15000
+# 1. **모델이 실제와 다르다.** OpenAI의 한도는 60초 슬라이딩 창이 아니라 **연속 충전
+#    버킷**이다(응답 헤더의 reset이 3ms로 오는 것이 그 증거 — "만수위 복귀까지"의 뜻이라
+#    조금만 쓰면 즉시 찬다). 창 모델은 그걸 흉내 낸 근사였다.
+#
+# 2. **지키려는 자원이 이미 다른 층에서 지켜진다.** 게이트웨이 세마포어(모델당 4)와 단일
+#    워커 때문에 인덱싱은 구조적으로 TPM을 넘길 수 없다 — 실측 소비율 1,600 토큰/초로
+#    충전율 3,333/초의 48%다.
+#
+# 정작 부족한 자원은 **워커 처리량**인데 그건 아무도 안 봤다. 접수는 분당 7화까지 받고
+# 처리는 분당 0.5화라 14배 어긋난 채로 큐가 자랐다.
+#
+# 그래서 게이트가 재는 것을 토큰에서 **대기 시간**으로 바꾼다. 큐에 밀린 화 수는 정확히
+# 셀 수 있고(추정이 아니다), 화당 처리 시간은 스펙이 명시한 값이다.
+INDEX_EPISODE_SECONDS = int(os.environ.get("INDEX_EPISODE_SECONDS", "120"))
+INDEX_MAX_WAIT_SECONDS = int(os.environ.get("INDEX_MAX_WAIT_SECONDS", "2400"))  # 40분 = 20화
 
-# (기록 시각(monotonic), 추정 토큰). 최근 _TPM_WINDOW_SECONDS초치만 남기는 슬라이딩 윈도우다.
-_tpm_window: deque[tuple[float, int]] = deque()
 
+def _queued_episode_count() -> int:
+    """아직 처리되지 않은 화 수.
 
-def _estimate_tokens(texts: list[str]) -> int:
-    """인덱싱할 원고들이 쓸 토큰 추정치(위 휴리스틱)."""
+    **테넌트를 가리지 않고 전부 센다.** 워커가 하나뿐이라 큐도 전역이고, 소설 A의 대기열
+    뒤에 소설 B가 서면 B도 그만큼 기다린다 — 대기 시간을 예측하려면 전체를 봐야 한다.
+    """
     return sum(
-        int(len(text) / _CHARS_PER_TOKEN * _PASSES_PER_EPISODE) + _CONTEXT_TOKENS_PER_EPISODE
-        for text in texts
+        1
+        for job in _index_jobs.values()
+        for episode in job["episodes"]
+        if episode["status"] in ("QUEUED", "RUNNING")
     )
-
-
-def _tpm_remaining(now: float) -> int:
-    """창을 흘려보내고 남은 여유 토큰을 돌려준다(음수는 0으로 자른다)."""
-    while _tpm_window and now - _tpm_window[0][0] >= _TPM_WINDOW_SECONDS:
-        _tpm_window.popleft()
-    used = sum(tokens for _, tokens in _tpm_window)
-    return max(0, INDEX_TPM_LIMIT - used)
-
-
-def _tpm_retry_after(now: float) -> int:
-    """가장 오래된 기록이 창 밖으로 나가 여유가 생기기까지 남은 초."""
-    if not _tpm_window:
-        return _TPM_WINDOW_SECONDS
-    return max(1, math.ceil(_TPM_WINDOW_SECONDS - (now - _tpm_window[0][0])))
 
 
 def _now_rfc3339() -> str:
@@ -358,40 +352,60 @@ async def submit(req: IndexRequest):
             ),
         )
 
-    now = time.monotonic()
-    remaining = _tpm_remaining(now)
-    estimated = _estimate_tokens([e.text or "" for e in pending])
-    # 한도 자체를 넘는 묶음은 지금 여유가 아무리 생겨도 통과할 수 없다. 그런데도 429를 주면
+    # 이 묶음 하나만으로 상한을 넘으면 큐가 아무리 비어도 통과할 수 없다. 그런데도 429를 주면
     # 호출자는 Retry-After만큼 기다렸다 똑같은 묶음을 영원히 다시 보낸다 — 끝나지 않는 재시도
-    # 루프다. 회차당 고정 비용(_CONTEXT_TOKENS_PER_EPISODE)만으로도 14화쯤이면 여기 걸리므로
-    # 드문 경우도 아니다. "기다려라"가 아니라 "쪼개서 다시 보내라"고 말해야 한다.
-    if estimated > INDEX_TPM_LIMIT:
+    # 루프다. "기다려라"가 아니라 "쪼개서 다시 보내라"고 말해야 한다.
+    own_wait = len(pending) * INDEX_EPISODE_SECONDS
+    if own_wait > INDEX_MAX_WAIT_SECONDS:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"estimated {estimated} tokens exceeds the per-minute limit "
-                f"({INDEX_TPM_LIMIT}) on its own — this bundle can never be accepted. "
-                f"Split it into smaller requests."
+                f"{len(pending)} episodes need about {own_wait}s to index, which exceeds "
+                f"the maximum queue wait ({INDEX_MAX_WAIT_SECONDS}s) on its own — this "
+                f"bundle can never be accepted. Split it into smaller requests."
             ),
         )
-    if estimated > remaining:
+
+    # 큐가 얼마나 밀렸는가. 이미 인덱싱된 화(pending에서 빠진 것)는 일하지 않으므로 세지
+    # 않는다 — 재제출뿐인 요청이 429로 거절당하면 "안전한 재제출"이라는 스펙의 전제가 깨진다.
+    queued = _queued_episode_count()
+    estimated_wait = (queued + len(pending)) * INDEX_EPISODE_SECONDS
+    if estimated_wait > INDEX_MAX_WAIT_SECONDS:
         logger.warning(
-            "TPM 부족으로 인덱싱 요청 거절 | userId=%s workId=%s 추정=%d 여유=%d",
+            "큐 혼잡으로 인덱싱 요청 거절 | userId=%s workId=%s 대기=%d화 예상=%d초",
             req.user_id,
             req.work_id,
-            estimated,
-            remaining,
+            queued,
+            estimated_wait,
         )
         return JSONResponse(
             status_code=429,
-            headers={"Retry-After": str(_tpm_retry_after(now))},
+            headers={"Retry-After": str(estimated_wait - INDEX_MAX_WAIT_SECONDS)},
             content={
-                "detail": "TPM limit exceeded. Retry after the Retry-After period.",
-                "remainingTpm": remaining,
+                "detail": "Indexing queue is full. Retry after the Retry-After period.",
+                "queuedEpisodes": queued,
+                "estimatedWaitSeconds": estimated_wait,
             },
         )
-    if estimated:
-        _tpm_window.append((now, estimated))
+
+    # 마지막 안전망 — 탐지가 같은 모델 버킷을 비웠는지 본다(둘 다 EXTRACTION_MODEL을 쓴다).
+    # 큐가 한가해도 OpenAI 쪽이 바닥이면 시작해봐야 429만 맞는다.
+    retry_after = admission.budget_retry_after(EXTRACTION_MODEL)
+    if retry_after is not None:
+        logger.warning(
+            "모델 한도 부족으로 인덱싱 요청 거절 | userId=%s workId=%s 재시도=%d초",
+            req.user_id,
+            req.work_id,
+            retry_after,
+        )
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            content={
+                "detail": "Model rate limit is nearly exhausted. Retry after the Retry-After period.",
+                "remainingTpm": llm_limit.remaining(EXTRACTION_MODEL).remaining or 0,
+            },
+        )
 
     job_id = str(uuid.uuid4())
     requested_at = _now_rfc3339()
@@ -425,7 +439,9 @@ async def submit(req: IndexRequest):
         work_id=req.work_id,
         episode_ids=[e.episode_id for e in req.episodes],
         requested_at=requested_at,
-        remaining_tpm=_tpm_remaining(now),
+        # 미터가 헤더로 관측한 **실제** 잔량이다. 예전에는 글자수 추정에서 뺀 값이라
+        # 이름과 달리 TPM이 아니었다.
+        remaining_tpm=llm_limit.remaining(EXTRACTION_MODEL).remaining or 0,
     )
 
 
