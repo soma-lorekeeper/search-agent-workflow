@@ -16,15 +16,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 
+from src.common import admission, llm_limit
+from src.config import EXTRACTION_MODEL
 from src.dto.detect_dto import DetectRequest, DetectStatus, JobAck
 from src.repository.postgres import detection
 from src.service.detect import extract_service, judge_service, retrieve_service
 from src.service.kg_scope import kg_scope
 
 logger = logging.getLogger("detect")
+
+# 동시에 돌릴 검사 수. 게이트웨이의 LLM 세마포어와 같은 값으로 잡는다 — 그보다 많이 받아도
+# 어차피 그 앞에서 줄을 서므로 지연만 늘고 메모리만 더 쓴다.
+#
+# 검사 하나가 판정 단계에서 27k 토큰짜리 호출을 한 번 하는데, 그게 여럿 겹치면 버킷을
+# 빠르게 먹는다. 동시 검사 수를 묶는 것이 그 겹침을 제한하는 가장 직접적인 수단이다.
+MAX_CONCURRENT_DETECTS = int(os.environ.get("MAX_CONCURRENT_DETECTS", "4"))
+
+# 429의 Retry-After로 쓸 검사 1건의 대략적 소요 시간. 슬롯이 하나 나기까지의 추정치다.
+# 실제 소요는 회차 길이에 따라 달라지므로 관측으로 조정한다.
+DETECT_JOB_SECONDS = int(os.environ.get("DETECT_JOB_SECONDS", "90"))
 
 # job_id -> {"status", "phase", "claim_count", "contradiction_count", "findings", "detail"}
 _detect_jobs: dict[str, dict] = {}
@@ -33,6 +48,16 @@ _detect_jobs: dict[str, dict] = {}
 # 않으면 GC가 실행 도중에 가져갈 수 있다 — 그러면 그 job은 예외 한 줄 없이 QUEUED에
 # 영원히 머문다. 끝나면 콜백이 스스로 빼낸다.
 _running: set[asyncio.Task] = set()
+
+
+def _running_detect_count() -> int:
+    """아직 끝나지 않은 검사 수.
+
+    `_running`(task 집합)이 아니라 상태를 세는 이유: task는 완료 콜백이 도는 시점에
+    빠지는데, 그 사이 잠깐 실제보다 크게 보인다. 상태는 _run_detect가 끝나면서 DONE/ERROR로
+    확정되므로 더 정확하다.
+    """
+    return sum(1 for s in _detect_jobs.values() if s["status"] in ("QUEUED", "RUNNING"))
 
 
 async def _run_detect(
@@ -78,12 +103,44 @@ async def _run_detect(
         await asyncio.to_thread(detection.mark_error, job_id, str(exc))
 
 
-async def submit(req: DetectRequest) -> JobAck:
-    """검사를 백그라운드로 시작하고 즉시 응답한다."""
+async def submit(req: DetectRequest):
+    """검사를 백그라운드로 시작하고 즉시 응답한다. 여유가 없으면 429로 거절한다."""
     known = _detect_jobs.get(req.job_id)
     if known is not None:
         # 중복 제출 방어. 회차 하나 검사에 LLM을 수십 번 부르므로 중복 실행 비용이 크다.
+        #
+        # **게이트보다 먼저 본다.** 이미 접수한 검사를 다시 물어보는 것은 자원을 쓰지
+        # 않으므로 거절할 이유가 없다. 뒤에 두면 서버가 바쁠 때 진행 중인 검사의 상태
+        # 조회조차 429가 되어, 호출자가 결과를 영영 못 받는다.
         return JobAck(job_id=req.job_id, status=known["status"])
+
+    # 진행 중인 검사가 너무 많으면 받지 않는다. 인덱싱과 달리 탐지는 큐가 없고 전부
+    # 동시에 돌아서(create_task) 밀리는 게 아니라 한꺼번에 터진다 — 그래서 "대기 시간"이
+    # 아니라 "동시 실행 수"로 잰다.
+    running = _running_detect_count()
+    if running >= MAX_CONCURRENT_DETECTS:
+        logger.warning("동시 검사 상한으로 탐지 요청 거절 | job_id=%s 진행중=%d", req.job_id, running)
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(DETECT_JOB_SECONDS)},
+            content={
+                "detail": "Too many detections in progress. Retry after the Retry-After period.",
+                "runningDetections": running,
+            },
+        )
+
+    # 마지막 안전망 — 인덱싱이 같은 모델 버킷을 비웠는지 본다(둘 다 EXTRACTION_MODEL).
+    retry_after = admission.budget_retry_after(EXTRACTION_MODEL)
+    if retry_after is not None:
+        logger.warning("모델 한도 부족으로 탐지 요청 거절 | job_id=%s 재시도=%d초", req.job_id, retry_after)
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            content={
+                "detail": "Model rate limit is nearly exhausted. Retry after the Retry-After period.",
+                "remainingTpm": llm_limit.remaining(EXTRACTION_MODEL).remaining or 0,
+            },
+        )
 
     _detect_jobs[req.job_id] = {
         "status": "QUEUED",

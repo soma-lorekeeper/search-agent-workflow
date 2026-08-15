@@ -32,6 +32,7 @@ from conftest import RecordingDict  # tests/에 __init__.py가 없어 pytest가 
 from fastapi.testclient import TestClient
 
 from src import app as app_module
+from src.common import llm_limit
 from src.common.tenant import Tenant
 from src.repository.postgres import detection
 from src.service.detect import extract_service, judge_service, retrieve_service
@@ -82,6 +83,8 @@ def detect_client(monkeypatch):
     기록 리스트를 클라이언트에 달아 두어 테스트가 "무엇이 불렸는지"를 볼 수 있게 한다.
     """
     detect_job_service._detect_jobs.clear()
+    # 접수 게이트의 마지막 안전망이 모델 버킷 잔량을 보므로 미터도 비운다.
+    monkeypatch.setattr(llm_limit, "_buckets", {})
 
     calls: list[tuple] = []
     monkeypatch.setattr(detection, "mark_running", lambda job_id: calls.append(("mark_running", job_id)))
@@ -453,3 +456,82 @@ def test_error_never_appears_without_a_reason(monkeypatch):
 
     assert state["status"] == "ERROR" and state["detail"] == "그래프 접속 실패"
     assert [s for s in state.snapshots if s["status"] == "ERROR" and not s.get("detail")] == []
+
+
+# ---------- 접수 게이트(429) ----------
+
+
+def test_동시_검사_상한을_넘으면_429(detect_client, monkeypatch):
+    """탐지는 큐 없이 전부 동시에 돈다(create_task) — 밀리는 게 아니라 한꺼번에 터진다.
+
+    그래서 인덱싱처럼 "대기 시간"이 아니라 **동시 실행 수**로 잰다. 상한이 없으면 검사
+    10건이 겹쳐 LLM 수십 콜 + 임베딩 수천 콜이 한꺼번에 나간다.
+    """
+    monkeypatch.setattr(detect_job_service, "MAX_CONCURRENT_DETECTS", 2)
+
+    gate = threading.Event()
+
+    async def _blocking_extract(text, tenant, up_to_chapter):
+        await asyncio.to_thread(gate.wait, 5)
+        return [], [], {}
+
+    monkeypatch.setattr(extract_service, "extract", _blocking_extract)
+
+    for n in range(2):
+        assert _start(detect_client, job_id=f"job-{n}").status_code == 202
+
+    res = _start(detect_client, job_id="job-overflow")
+    assert res.status_code == 429
+    body = res.json()
+    assert body["detail"] == "Too many detections in progress. Retry after the Retry-After period."
+    assert body["runningDetections"] == 2
+    assert int(res.headers["Retry-After"]) > 0
+    # 거절된 검사는 상태에 남지 않는다 — 남으면 폴링이 영원히 QUEUED를 본다.
+    assert "job-overflow" not in detect_job_service._detect_jobs
+
+    gate.set()
+
+
+def test_이미_접수한_검사의_재제출은_게이트를_통과한다(detect_client, monkeypatch):
+    """중복 제출 방어가 게이트보다 **먼저** 와야 한다.
+
+    뒤에 두면 서버가 바쁠 때 진행 중인 검사의 상태 조회조차 429가 되어, 호출자가 결과를
+    영영 못 받는다. 재제출은 자원을 쓰지 않으므로 거절할 이유가 없다.
+    """
+    monkeypatch.setattr(detect_job_service, "MAX_CONCURRENT_DETECTS", 1)
+
+    gate = threading.Event()
+
+    async def _blocking_extract(text, tenant, up_to_chapter):
+        await asyncio.to_thread(gate.wait, 5)
+        return [], [], {}
+
+    monkeypatch.setattr(extract_service, "extract", _blocking_extract)
+
+    assert _start(detect_client, job_id="job-1").status_code == 202
+    # 상한이 1이라 새 검사는 429지만, 같은 jobId 재제출은 통과해야 한다.
+    assert _start(detect_client, job_id="job-2").status_code == 429
+    again = _start(detect_client, job_id="job-1")
+    assert again.status_code == 202
+    assert again.json()["jobId"] == "job-1"
+
+    gate.set()
+
+
+def test_모델_한도가_바닥이면_탐지도_거절한다(detect_client, monkeypatch):
+    """인덱싱이 같은 EXTRACTION_MODEL 버킷을 비웠을 수 있다 — 공통 안전망이 그걸 본다."""
+    from src.config import EXTRACTION_MODEL
+
+    llm_limit.observe(
+        EXTRACTION_MODEL,
+        {
+            "x-ratelimit-limit-tokens": "200000",
+            "x-ratelimit-remaining-tokens": "100",
+            "x-ratelimit-reset-tokens": "30s",
+        },
+    )
+
+    res = _start(detect_client, job_id="job-budget")
+    assert res.status_code == 429
+    assert "rate limit" in res.json()["detail"].lower()
+    assert "job-budget" not in detect_job_service._detect_jobs
