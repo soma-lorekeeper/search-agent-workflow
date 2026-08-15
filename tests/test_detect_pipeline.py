@@ -766,3 +766,83 @@ def test_empty_verdicts_object_also_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="판정 응답을 읽지 못했다"):
         asyncio.run(judge_service.judge(claims, {"records": []}))
+
+
+# ---------- 검색 스레드풀 ----------
+
+
+def test_검색_스레드가_검사_수만큼_늘어나지_않는다(monkeypatch):
+    """풀은 프로세스 전역이라 동시 검사가 몇 건이든 스레드 총량이 고정이다.
+
+    예전에는 검사마다 새 풀을 만들어서 `_WORKERS=8`이 "검사 하나 안에서 8개"라는 뜻이었다
+    — 동시 검사 10건이면 스레드 80개다. 게이트웨이 세마포어는 OpenAI 호출만 세므로 이 축을
+    못 막는다(여기 스레드는 Neo4j 쿼리도 돌리고 드라이버 커넥션도 함께 쓴다).
+    """
+    import threading
+
+    from src.service.detect import retrieve_service
+
+    monkeypatch.setattr(retrieve_service, "build_retrieval_tools", lambda tenant: [])
+
+    본_스레드: set[str] = set()
+    잠금 = threading.Lock()
+
+    def _느린_조회(claim, tools, up_to_chapter):
+        with 잠금:
+            본_스레드.add(threading.current_thread().name)
+        threading.Event().wait(0.01)
+        return {"claim": claim, "channels": []}
+
+    monkeypatch.setattr(retrieve_service, "_retrieve_one", _느린_조회)
+
+    claims = [{"id": f"P{i}", "axis": "축", "value": "값"} for i in range(12)]
+
+    async def 세_검사_동시에():
+        await asyncio.gather(*[retrieve_service.retrieve(claims, tenant=None) for _ in range(3)])
+
+    asyncio.run(세_검사_동시에())
+
+    assert len(본_스레드) <= retrieve_service._WORKERS, (
+        f"검사 3건인데 스레드가 {len(본_스레드)}개 — 풀이 검사마다 새로 만들어지고 있다"
+    )
+
+
+def test_공유_풀에서도_결과_순서가_입력_순서와_같다(monkeypatch):
+    """문서고의 claim_index가 이 순서에 묶여 있다.
+
+    공유 풀이면 다른 검사의 작업과 섞여 실행되지만, map은 이 호출이 제출한 future만
+    순서대로 거둬들인다. 어긋나면 claim이 남의 근거를 가리키는데 예외는 안 난다.
+    """
+    from src.service.detect import retrieve_service
+
+    monkeypatch.setattr(retrieve_service, "build_retrieval_tools", lambda tenant: [])
+
+    def _역순으로_느리게(claim, tools, up_to_chapter):
+        # 앞쪽 claim일수록 오래 걸리게 해서 완료 순서를 입력 순서와 반대로 만든다.
+        threading.Event().wait(0.01 * (5 - int(claim["id"][1:])))
+        return {"claim": claim, "channels": []}
+
+    import threading
+
+    monkeypatch.setattr(retrieve_service, "_retrieve_one", _역순으로_느리게)
+
+    claims = [{"id": f"P{i}"} for i in range(5)]
+    결과 = asyncio.run(retrieve_service.retrieve(claims, tenant=None))
+
+    assert [r["claim"]["id"] for r in 결과["records"]] == [f"P{i}" for i in range(5)]
+
+
+def test_풀은_한_번_쓰고_죽지_않는다(monkeypatch):
+    """`with ThreadPoolExecutor(...)`로 감싸면 첫 검사 후 shutdown되어 두 번째가
+    RuntimeError로 죽는다. 전역 풀에 with를 다시 붙이는 실수를 막는다."""
+    from src.service.detect import retrieve_service
+
+    monkeypatch.setattr(retrieve_service, "build_retrieval_tools", lambda tenant: [])
+    monkeypatch.setattr(
+        retrieve_service, "_retrieve_one", lambda c, t, u: {"claim": c, "channels": []}
+    )
+
+    claims = [{"id": "P1"}]
+    for _ in range(3):
+        결과 = asyncio.run(retrieve_service.retrieve(claims, tenant=None))
+        assert len(결과["records"]) == 1

@@ -26,7 +26,25 @@ logger = logging.getLogger("detect.retrieve")
 # 채널당 가져올 결과 수. 하네스가 3으로 확정했다.
 TOP_K = 3
 # claim들을 동시에 조회할 스레드 수. retriever가 동기 API라 스레드로 병렬화한다.
-_WORKERS = 8
+#
+# 임베딩 세마포어(_EMBEDDING_CONCURRENCY)와 **같은 값이어야 한다.** 이 스레드가 하는 일이
+# 임베딩 + Neo4j 조회인데 임베딩이 그 세마포어를 지나므로, 스레드만 늘리면 세마포어 앞에
+# 줄만 길어지고 처리량은 그대로다(둘이 직렬로 걸려 있다).
+#
+# 24인 근거(실측, 2026-08-16): 임베딩 처리량이 36.7/초로 RPM 충전율 50/초 아래라 지속
+# 가능하다. 자세한 산정은 src/common/llm_limit.py의 _EMBEDDING_CONCURRENCY 주석 참고.
+# 다른 축도 여유롭다 — Neo4j 드라이버 풀 기본 100 중 24개(24%)를 쓴다.
+_WORKERS = 24
+
+# 풀은 **프로세스 전역**이다. 예전에는 검사마다 `with ThreadPoolExecutor(...)`로 새로
+# 만들었는데, 그러면 `_WORKERS`가 "검사 하나 안에서 8개"라는 뜻이 되어 동시 검사 10건이면
+# 스레드가 80개가 된다. 게이트웨이 세마포어는 OpenAI 호출만 세므로 이 축을 못 막는다
+# (여기 스레드는 임베딩만이 아니라 Neo4j 쿼리도 돌린다 — 드라이버 커넥션도 함께 쓴다).
+#
+# ⚠️ `with`로 감싸지 말 것. ThreadPoolExecutor.__exit__이 shutdown(wait=True)을 부르고,
+# 한 번 shutdown된 executor는 되살릴 수 없어 두 번째 검사부터 RuntimeError가 난다.
+# 같은 이유로 shutdown()도 부르지 않는다 — 프로세스가 끝날 때 atexit이 정리한다.
+_POOL = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="detect-retrieve")
 
 _WS = re.compile(r"\s+")
 
@@ -111,9 +129,10 @@ async def retrieve(
 
     def run() -> list[dict]:
         # map은 입력 순서대로 결과를 돌려준다 — 문서고의 claim_index가 이 순서에 묶여
-        # 있어 as_completed로 바꾸면 claim↔노드 대응이 조용히 어긋난다.
-        with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
-            return list(pool.map(lambda c: _retrieve_one(c, tools, up_to_chapter), claims))
+        # 있어 as_completed로 바꾸면 claim↔노드 대응이 조용히 어긋난다. 공유 풀이라
+        # 다른 검사의 작업과 섞여 실행되지만, map은 **이 호출이 제출한** future들을
+        # 순서대로 거둬들이므로 순서 계약은 그대로다.
+        return list(_POOL.map(lambda c: _retrieve_one(c, tools, up_to_chapter), claims))
 
     # retriever가 동기 API(Neo4j 드라이버)라 이벤트 루프를 막지 않도록 스레드로 뺀다.
     records = await asyncio.to_thread(run)
