@@ -12,7 +12,11 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 # **채팅 전용** 모델. 예전에는 탐지(추출·판정)도 이 값을 썼는데, 탐지 성능 수치는
 # 평가 하네스가 EXTRACTION_MODEL로 잰 것이라 서비스가 다른 모델로 돌면 그 수치를
 # 물려받지 못한다. 지금은 탐지가 EXTRACTION_MODEL을 쓰고 여기는 채팅만 본다.
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-terra")
+#
+# env 키는 역할이 드러나는 CHAT_MODEL이 정본이다. OPENAI_MODEL은 프로덕션 배포
+# (mvp-infra-iac가 SSM에서 agent.env를 만든다)가 아직 쓰는 구키라 과도기 fallback으로만
+# 남겨둔다 — 인프라의 키 교체가 끝나면 제거한다.
+CHAT_MODEL = os.environ.get("CHAT_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-5.6-terra"
 
 DATA_DIR = ROOT_DIR / "data"
 
@@ -27,9 +31,14 @@ DATA_DIR = ROOT_DIR / "data"
 # **탐지(추출·판정)도 이 모델을 쓴다.** 이름은 인덱싱 추출에서 왔지만, 둘 다 "정해진
 # 구조를 채우는 기계적 판정"이라는 같은 성격이고 무엇보다 평가 하네스가 이 모델로
 # 검출 22/25를 쟀다(scripts/eval_claims.py의 EXTRACT_MODEL). 서비스가 다른 모델로 돌면
-# 그 수치는 근거를 잃는다. 추론 강도는 용도별로 다르다 — 인덱싱은 high, 탐지는 미지정
-# (하네스 기본값).
-EXTRACTION_MODEL = os.environ.get("LOREKEEPER_MODEL") or "gpt-5.6-luna"
+# 그 수치는 근거를 잃는다. 추론 강도는 용도별로 다르다 — 인덱싱은 high(하드코딩),
+# 탐지는 미지정(하네스 기본값).
+#
+# env 키는 상수명과 같은 EXTRACTION_MODEL이 정본이고, LOREKEEPER_MODEL은 프로덕션
+# 배포가 아직 쓰는 구키라 과도기 fallback이다(CHAT_MODEL 주석 참고).
+EXTRACTION_MODEL = (
+    os.environ.get("EXTRACTION_MODEL") or os.environ.get("LOREKEEPER_MODEL") or "gpt-5.6-luna"
+)
 # 청크·사실 임베딩 모델. 인덱싱이 쓰는 것과 검색이 쓰는 것이 반드시 같아야 한다 —
 # 다르면 같은 공간의 벡터가 아니라 검색 결과가 조용히 무의미해진다.
 EMBEDDING_MODEL = "text-embedding-3-small"

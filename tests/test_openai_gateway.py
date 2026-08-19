@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai import RateLimitError
+from openai import APIConnectionError, APIStatusError, RateLimitError
 
 from src.common import llm_limit, openai_client
 
@@ -64,11 +64,13 @@ class _FakeRaw:
 
 
 def _fake_client(create):
-    """`_client.chat.completions.with_raw_response.create` 경로만 갖춘 가짜 클라이언트."""
+    """관문이 쓰는 두 경로(chat.completions / responses)의 with_raw_response.create만 갖춘
+    가짜 클라이언트. 두 관문 함수가 같은 몸통(_request)을 쓰므로 같은 create를 물린다."""
     return SimpleNamespace(
         chat=SimpleNamespace(
             completions=SimpleNamespace(with_raw_response=SimpleNamespace(create=create))
-        )
+        ),
+        responses=SimpleNamespace(with_raw_response=SimpleNamespace(create=create)),
     )
 
 
@@ -108,6 +110,42 @@ def test_파싱된_응답을_돌려준다_코루틴이_아니라(monkeypatch):
 
     assert not asyncio.iscoroutine(response)
     assert response.choices[0].message.content == "정상 응답"
+
+
+def test_responses_관문도_헤더를_미터에_반영한다(monkeypatch):
+    """채팅이 쓰는 responses 경로도 같은 몸통(_request)을 지나야 한다 — 여기서 계량이
+    빠지면 채팅 호출만 미터 밖에서 돌아 admission 판단이 어긋난다."""
+
+    async def create(**kwargs):
+        return _FakeRaw("답", _HEADERS)
+
+    monkeypatch.setattr(openai_client, "_client", _fake_client(create))
+    response = asyncio.run(openai_client.create_response(model=MODEL, input=[]))
+
+    # 동기 parse 계약(코루틴 아님)도 responses 경로에서 함께 성립해야 한다.
+    assert not asyncio.iscoroutine(response)
+    assert llm_limit.remaining(MODEL).remaining == 123456
+
+
+def test_responses_관문도_혼잡_429를_재시도한다(monkeypatch):
+    """재시도 정책이 경로별로 갈라지면 한쪽만 고쳐지는 사고가 난다 — 몸통 공유의 계약."""
+    calls = {"n": 0}
+
+    async def create(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _rate_limit_error(_HEADERS, {"error": {"type": "rate_limit_exceeded"}})
+        return _FakeRaw("성공", _HEADERS)
+
+    async def _no_backoff(attempt):
+        return None
+
+    monkeypatch.setattr(openai_client, "_client", _fake_client(create))
+    monkeypatch.setattr(openai_client, "_backoff", _no_backoff)
+    response = asyncio.run(openai_client.create_response(model=MODEL, input=[]))
+
+    assert calls["n"] == 2
+    assert response.choices[0].message.content == "성공"
 
 
 def test_429의_헤더도_미터에_반영된다(monkeypatch):
@@ -173,6 +211,64 @@ def test_재시도_뒤_성공하면_그_응답을_돌려준다(monkeypatch):
 
     response = asyncio.run(openai_client.create_completion(model=MODEL, messages=[]))
     assert response.choices[0].message.content == "두 번째에 성공"
+
+
+def _status_error(status: int) -> APIStatusError:
+    """SDK가 4xx/5xx에서 던지는 것과 같은 모양의 예외. status_code는 응답에서 읽힌다."""
+    response = httpx.Response(
+        status, request=httpx.Request("POST", "https://api.openai.com/v1")
+    )
+    return APIStatusError("server error", response=response, body=None)
+
+
+def test_5xx는_상한까지_재시도한다(monkeypatch):
+    """SDK 자체 재시도를 껐으므로(max_retries=0) 일시적 서버 오류는 관문이 다시 보내야
+    한다 — 안 그러면 인덱싱에서 502 한 번이 잡 전체를 쓰러뜨린다."""
+    calls = []
+
+    async def create(**kwargs):
+        calls.append(1)
+        raise _status_error(502)
+
+    monkeypatch.setattr(openai_client, "_client", _fake_client(create))
+    monkeypatch.setattr(openai_client.asyncio, "sleep", _즉시)
+
+    with pytest.raises(APIStatusError):
+        asyncio.run(openai_client.create_completion(model=MODEL, messages=[]))
+
+    assert len(calls) == openai_client._MAX_ATTEMPTS
+
+
+def test_4xx는_재시도하지_않는다(monkeypatch):
+    """잘못된 요청은 다시 보내도 같은 결과다. 재시도하면 확정 실패로 백오프 시간만 태운다."""
+    calls = []
+
+    async def create(**kwargs):
+        calls.append(1)
+        raise _status_error(400)
+
+    monkeypatch.setattr(openai_client, "_client", _fake_client(create))
+    with pytest.raises(APIStatusError):
+        asyncio.run(openai_client.create_completion(model=MODEL, messages=[]))
+
+    assert len(calls) == 1
+
+
+def test_연결_오류는_재시도한다(monkeypatch):
+    """타임아웃(APITimeoutError)도 APIConnectionError의 하위 클래스라 같은 분기를 탄다."""
+    calls = []
+
+    async def create(**kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise APIConnectionError(request=httpx.Request("POST", "https://api.openai.com/v1"))
+        return _FakeRaw("재연결 성공", _HEADERS)
+
+    monkeypatch.setattr(openai_client, "_client", _fake_client(create))
+    monkeypatch.setattr(openai_client.asyncio, "sleep", _즉시)
+
+    response = asyncio.run(openai_client.create_completion(model=MODEL, messages=[]))
+    assert response.choices[0].message.content == "재연결 성공"
 
 
 async def _즉시(_seconds):

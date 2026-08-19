@@ -1,7 +1,8 @@
 """채팅 에이전트가 쓰는 도구 5종.
 
-KG 3종은 lorekeeper의 retriever를 그대로 실행기로 쓰고(src/service/retrieval_tools.py와 같은
-방식으로 OpenAI function-calling 스키마만 우리가 직접 명시한다), 나머지 2종은 PostgreSQL의
+KG 3종은 lorekeeper의 retriever를 그대로 실행기로 쓴다 — 이름과 파라미터 스키마도
+retrieval 쪽(src/service/retrieval_tools.py의 PARAMETER_SCHEMAS)과 동일하게 맞춘다.
+정의가 두 벌이면 retrieval이 바뀔 때 채팅만 낡은 스키마로 남는다. 나머지 2종은 PostgreSQL의
 원고/작품 테이블을 직접 읽는다. KG에는 요약·사실만 들어 있어 "16화 그 장면 원문 그대로"를
 답할 수 없으므로, 원고 조회는 그래프가 아니라 원본 DB에서 가져와야 한다.
 
@@ -27,7 +28,7 @@ from neo4j_graphrag.tool import Tool
 
 from src import config  # noqa: F401 — import 시점에 .env를 로드해 DATABASE_URL을 환경변수로 채운다
 from src.service.kg_scope import kg_scope
-from src.service.retrieval_tools import format_tool_result
+from src.service.retrieval_tools import PARAMETER_SCHEMAS, format_tool_result
 
 logger = logging.getLogger("chat.tools")
 
@@ -42,19 +43,19 @@ _SUMMARY_QUERY_CHARS = 24
 # 채팅 에이전트의 시스템 프롬프트에 그대로 삽입되는 도구 가이드. 도구 자체의 description과
 # 별개로, "작가와의 대화"라는 용도에서 어떤 질문에 어떤 도구를 먼저 골라야 하는지를 적는다.
 TOOL_GUIDE = """\
-1. kg_hybrid_search(query_text, top_k=5)
+1. hybrid_search(query_text, top_k=5)
    - 무엇: 질문과 의미가 가까운 원문 조각을 벡터+키워드로 찾고, 근거가 된 사건·상태와
      주변 그래프까지 함께 반환한다.
    - 언제: "이런 일이 있었나?", "이 인물은 어떤 상황이었지?" 같은 일반 질문. 무엇부터
      부를지 애매하면 이걸 먼저 부른다. 고유명사가 또렷하면 질의에 반드시 넣어라.
 
-2. kg_fact_search(query_text, top_k=5)
+2. fact_search(query_text, top_k=5)
    - 무엇: 원문이 아니라 **정제된 사실**(사건·인물 상태)을 검색한다. 각 사실에는 참가자와
      근거 원문이 함께 딸려온다.
    - 언제: "누가 무엇을 했나", "그때 상태가 어땠나"처럼 사건·상태 자체가 답인 질문.
      원문 조각보다 신호가 정제돼 있어 설정 확인에 유리하다.
 
-3. kg_entity_search(entity_name, up_to_chapter=null)
+3. entity_search(entity_name, up_to_chapter=null)
    - 무엇: 인물·아이템·조직·장소 하나를 이름/별칭으로 정확 조회해 프로필과 관련 사실을
      성립 회차 순으로 낸다. 자연어 문장이 아니라 "이름" 하나만 받는다.
    - 언제: "이 인물 지금 어떤 상태지?", "언제 이렇게 됐지?", "설정 정리해줘"처럼 대상이
@@ -104,7 +105,7 @@ def _short(text: str) -> str:
     return text if len(text) <= _SUMMARY_QUERY_CHARS else text[:_SUMMARY_QUERY_CHARS] + "…"
 
 
-def _kg_hybrid_search(
+def _hybrid_search(
     user_id: int, work_id: int, query_text: str, top_k: int = 5
 ) -> tuple[str, str]:
     tenant = kg_scope(user_id, work_id)
@@ -112,7 +113,7 @@ def _kg_hybrid_search(
     return format_tool_result(result), f"KG 검색 · «{_short(query_text)}»"
 
 
-def _kg_fact_search(
+def _fact_search(
     user_id: int, work_id: int, query_text: str, top_k: int = 5
 ) -> tuple[str, str]:
     tenant = kg_scope(user_id, work_id)
@@ -120,7 +121,7 @@ def _kg_fact_search(
     return format_tool_result(result), f"KG 사실 검색 · «{_short(query_text)}»"
 
 
-def _kg_entity_search(
+def _entity_search(
     user_id: int, work_id: int, entity_name: str, up_to_chapter: int | None = None
 ) -> tuple[str, str]:
     tenant = kg_scope(user_id, work_id)
@@ -218,59 +219,35 @@ class ChatTool:
 # 모델이 고를 값이 아니다 — 스키마에 넣으면 모델이 엉뚱한 작품 번호를 지어내 남의 작품을
 # 읽으려 드는 경로가 열린다. 에이전트가 실행 시점에 직접 주입한다(agent.py).
 _TOOLS: tuple[ChatTool, ...] = (
+    # KG 3종의 이름·파라미터는 retrieval 쪽과 동일하다(모듈 docstring 참고). description만
+    # 채팅 용도(작가와의 대화에서 언제 고를지)로 여기서 따로 쓴다 — lorekeeper Tool의
+    # description을 가져오려면 import 시점에 Neo4j 드라이버를 만들어야 해서 정적으로 둔다.
     ChatTool(
-        name="kg_hybrid_search",
+        name="hybrid_search",
         description=(
             "벡터 검색과 풀텍스트 검색을 결합해 원문 조각과 관련 그래프를 반환한다. "
             "인물명·아이템명·장소명 같은 고유명사가 들어간 질문에 유리하다."
         ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query_text": {
-                    "type": "string",
-                    "description": "검색할 자연어 질의(고유명사를 반드시 포함).",
-                },
-                "top_k": {"type": "integer", "description": "반환할 상위 결과 개수(기본 5)."},
-            },
-            "required": ["query_text"],
-        },
-        run=_kg_hybrid_search,
+        parameters=PARAMETER_SCHEMAS["hybrid_search"],
+        run=_hybrid_search,
     ),
     ChatTool(
-        name="kg_fact_search",
+        name="fact_search",
         description=(
             "원문이 아니라 정제된 사실(사건·인물 상태)을 검색한다. 각 사실에 참가자와 근거 "
             "원문이 함께 딸려온다. 사건·상태 자체가 답인 질문에 쓴다."
         ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query_text": {"type": "string", "description": "검색할 자연어 질의."},
-                "top_k": {"type": "integer", "description": "반환할 상위 결과 개수(기본 5)."},
-            },
-            "required": ["query_text"],
-        },
-        run=_kg_fact_search,
+        parameters=PARAMETER_SCHEMAS["fact_search"],
+        run=_fact_search,
     ),
     ChatTool(
-        name="kg_entity_search",
+        name="entity_search",
         description=(
             "인물·아이템·조직·장소 하나를 이름/별칭으로 정확 조회해 프로필과 관련 사실을 "
             "성립 회차 순으로 낸다. 이름 하나만 받는다."
         ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "entity_name": {"type": "string", "description": "조회할 대상의 이름 또는 별칭."},
-                "up_to_chapter": {
-                    "type": "integer",
-                    "description": "이 회차까지 성립한 사실만 조회한다(생략 시 전체 이력).",
-                },
-            },
-            "required": ["entity_name"],
-        },
-        run=_kg_entity_search,
+        parameters=PARAMETER_SCHEMAS["entity_search"],
+        run=_entity_search,
     ),
     ChatTool(
         name="episode_manuscript",
@@ -297,15 +274,18 @@ _TOOLS: tuple[ChatTool, ...] = (
 
 
 def build_chat_tools() -> tuple[list[dict[str, Any]], dict[str, ChatTool]]:
-    """채팅 도구 5종을 (OpenAI tools 스키마 리스트, 이름→ChatTool dict)로 반환한다."""
+    """채팅 도구 5종을 (OpenAI tools 스키마 리스트, 이름→ChatTool dict)로 반환한다.
+
+    스키마는 responses API의 평탄한 형태다({"type","name","description","parameters"}).
+    chat.completions의 중첩형({"type":"function","function":{...}})과 다르니 주의 —
+    채팅은 responses API를 쓴다(src/service/chat/agent.py).
+    """
     schemas = [
         {
             "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.parameters,
-            },
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
         }
         for tool in _TOOLS
     ]

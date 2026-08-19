@@ -22,17 +22,28 @@ import asyncio
 import logging
 import random
 
-from openai import AsyncOpenAI, RateLimitError
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI, RateLimitError
 
 from src.common import llm_limit
 from src.config import OPENAI_API_KEY
 
 logger = logging.getLogger("openai")
 
-_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+_client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    # SDK 자체 재시도를 끈다. 기본값(2회)을 켜두면 아래 루프와 **곱으로** 겹쳐 429 한 번의
+    # 장애에 HTTP 요청이 최대 5×3=15회 나가고, insufficient_quota 판별과 헤더 계량이 전부
+    # SDK가 재시도를 소진한 뒤에야 도달한다. 재시도 정책은 이 관문 한 층에만 둔다.
+    # 대신 SDK가 커버하던 연결 오류·5xx 재시도는 아래 루프가 인수한다.
+    max_retries=0,
+    # 기본값 600초는 죽은 요청이 세마포어 슬롯을 10분 붙드는 시간이다. 모든 호출이
+    # non-streaming이라 완결 응답 기준의 상한이면 충분하다. 넘기면 APITimeoutError
+    # (APIConnectionError의 하위 클래스)가 나서 아래 루프의 재시도 대상이 된다.
+    timeout=180.0,
+)
 
-# 429에 대한 지수 백오프. 판정은 한 호출에 27k 토큰을 쓰므로 몇 편만 겹쳐도 조직 TPM에
-# 순간적으로 몰린다 — 대개 몇 초 쉬면 풀린다.
+# 재시도 상한(429·연결 오류·5xx 공통). 판정은 한 호출에 27k 토큰을 쓰므로 몇 편만 겹쳐도
+# 조직 TPM에 순간적으로 몰린다 — 대개 몇 초 쉬면 풀린다.
 _MAX_ATTEMPTS = 5
 
 
@@ -47,7 +58,26 @@ def _headers_of(exc: Exception) -> dict:
 
 
 async def create_completion(**kwargs):
-    """chat.completions.create를 부르되, 계량·통제·재시도를 함께 한다.
+    """chat.completions.create — 추출·판정·인덱싱이 쓴다. 몸통은 _request 공용."""
+    return await _request(_client.chat.completions.with_raw_response.create, kwargs)
+
+
+async def create_response(**kwargs):
+    """responses.create — 채팅이 쓴다(도구 + 추론 조합이 chat/completions에서는
+    추론 기본 모델(gpt-5.6-luna 등)에 대해 400으로 거부되기 때문).
+
+    responses의 with_raw_response도 chat.completions와 같은 LegacyAPIResponse 래퍼라
+    헤더 계량·동기 parse() 계약이 그대로 성립한다 — 그래서 몸통을 공유할 수 있다.
+    """
+    return await _request(_client.responses.with_raw_response.create, kwargs)
+
+
+async def _request(create_raw, kwargs: dict):
+    """OpenAI 호출 한 번의 계량·통제·재시도 공통 몸통.
+
+    재시도 대상은 세 가지다: 혼잡성 429, 연결 오류·타임아웃, 5xx. SDK 자체 재시도는
+    꺼두었으므로(클라이언트 생성부 주석 참고) 이 목록이 재시도 정책의 전부다.
+    4xx는 다시 보내도 같은 결과라 즉시 올린다.
 
     **잔액 소진은 재시도하지 않는다.** OpenAI는 크레딧이 바닥나도 429를 주는데, 그건
     기다린다고 풀리지 않는다. 구분하지 않으면 이미 실패가 확정된 요청을 붙들고 5회를
@@ -65,7 +95,7 @@ async def create_completion(**kwargs):
             async with llm_limit.async_slot(model):
                 # with_raw_response 를 거쳐야 헤더가 남는다. 평범한 create()는 파싱된
                 # 객체만 돌려주고 원본 응답을 버린다.
-                raw = await _client.chat.completions.with_raw_response.create(**kwargs)
+                raw = await create_raw(**kwargs)
         except RateLimitError as exc:
             llm_limit.observe(model, _headers_of(exc))
             if _is_quota_exhausted(exc):
@@ -73,8 +103,28 @@ async def create_completion(**kwargs):
                 raise
             if attempt == _MAX_ATTEMPTS - 1:
                 raise
-            # 지터를 더해 동시에 깨어난 호출들이 다시 몰리는 것을 막는다.
-            await asyncio.sleep(min(2**attempt, 30) + random.uniform(0, 1))
+            await _backoff(attempt)
+            continue
+        except APIConnectionError:
+            # 연결 실패와 타임아웃(APITimeoutError는 APIConnectionError의 하위 클래스).
+            # SDK 재시도를 껐으므로 일시적 네트워크 문제는 여기서 다시 시도해야 한다 —
+            # 인덱싱은 한 화의 실패가 뒤 화 전부를 쓰러뜨리는 구조라 즉시 실패가 특히 아프다.
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            logger.warning("OpenAI 연결 실패 — 재시도한다 | attempt=%d", attempt + 1)
+            await _backoff(attempt)
+            continue
+        except APIStatusError as exc:
+            # 5xx만 재시도한다. 4xx(잘못된 요청, 인증 실패 등)는 다시 보내도 같은 결과라
+            # 그대로 올린다. 429는 위의 RateLimitError 분기가 먼저 잡으므로 여기 오지 않는다.
+            if exc.status_code < 500:
+                raise
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise
+            logger.warning(
+                "OpenAI 서버 오류 — 재시도한다 | status=%d attempt=%d", exc.status_code, attempt + 1
+            )
+            await _backoff(attempt)
             continue
 
         llm_limit.observe(model, raw.headers)
@@ -86,6 +136,11 @@ async def create_completion(**kwargs):
         return raw.parse()
 
     raise AssertionError("unreachable")
+
+
+async def _backoff(attempt: int) -> None:
+    """지수 백오프 + 지터. 지터는 동시에 깨어난 호출들이 다시 몰리는 것을 막는다."""
+    await asyncio.sleep(min(2**attempt, 30) + random.uniform(0, 1))
 
 
 def _is_quota_exhausted(exc: RateLimitError) -> bool:

@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import os
 
 from src.common.tenant import Tenant
 from src.repository.neo4j.chunk import write_chunk_layer
@@ -44,9 +43,10 @@ from src.repository.neo4j.tenant_bootstrap import ensure_tenant_indexes
 from src.service.index.splitters import KSSSentenceSplitter, WholeTextSplitter
 
 
-# 추출 LLM의 reasoning effort. 기본값 'high'(luna 기본 세팅).
-# LOREKEEPER_REASONING 환경변수로 덮어쓸 수 있다.
-_EXTRACT_REASONING = os.environ.get("LOREKEEPER_REASONING", "high")
+# 추출 LLM의 reasoning effort. env로 받지 않고 고정한다 — 추출 품질(스키마 준수·검출
+# 수치)이 high 기준으로 실측됐고, 요약·병합 경로(context_service, resolver)도 같은 값을
+# 하드코딩하고 있어 한 경로만 env로 낮아지면 품질이 조용히 갈라진다.
+_EXTRACT_REASONING = "high"
 
 def _label_counts(driver, database: str, tenant: Tenant) -> dict[str, int]:
     """메타 라벨을 제외한 라벨별 노드 수(간단한 결과 출력용). 이 소설 범위만 센다."""

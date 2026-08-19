@@ -15,10 +15,14 @@ import json
 import logging
 from typing import Any
 
-# 이름을 이 모듈에 바인딩해 부른다(`openai_client.create_completion(...)`처럼 정규화해
+# 이름을 이 모듈에 바인딩해 부른다(`openai_client.create_response(...)`처럼 정규화해
 # 부르지 않는다). 이 레포의 테스트는 정의처가 아니라 **소비 모듈**의 속성을 스텁으로
 # 갈아끼우는 방식이라, 그래야 다른 서비스와 같은 방법으로 LLM을 막을 수 있다.
-from src.common.openai_client import create_completion
+#
+# 채팅만 responses API를 쓴다. chat/completions는 추론이 기본인 모델(gpt-5.6-luna 등)에서
+# function tools + 추론 조합을 400으로 거부하는데(2026-08-19 E2E 버그②), responses에서는
+# 그 조합이 지원돼 어떤 gpt-5 계열 모델이 와도 도구와 추론을 함께 쓸 수 있다.
+from src.common.openai_client import create_response
 from src.service.chat.indexed import fetch_indexed_episodes
 from src.service.chat.prompts import (
     CHAT_CACHE_KEY,
@@ -27,7 +31,7 @@ from src.service.chat.prompts import (
     TITLE_SYSTEM_PROMPT,
 )
 from src.service.chat.tools import TOOL_GUIDE, build_chat_tools
-from src.config import OPENAI_MODEL
+from src.config import CHAT_MODEL
 
 logger = logging.getLogger("chat.agent")
 
@@ -163,19 +167,21 @@ def _to_openai_messages(messages: list[dict]) -> list[dict]:
 async def _suggest_title(user_text: str, answer: str) -> str | None:
     """대화 첫 턴에만 세션 제목을 짓는다. 실패해도 대화 자체는 성공이므로 None으로 삼킨다."""
     try:
-        response = await create_completion(
-            model=OPENAI_MODEL,
-            messages=[
+        response = await create_response(
+            model=CHAT_MODEL,
+            input=[
                 {"role": "system", "content": TITLE_SYSTEM_PROMPT},
                 {"role": "user", "content": f"[작가]\n{user_text}\n\n[AI]\n{answer}"},
             ],
             prompt_cache_key=TITLE_CACHE_KEY,
+            # 채팅 경로의 추론 강도는 high로 고정한다(대화 본문과 같은 정책 — env로 받지 않는다).
+            reasoning={"effort": "high"},
         )
     except Exception as exc:  # noqa: BLE001 — 제목은 부가 기능이라 실패가 답변을 막으면 안 된다
         logger.warning("세션 제목 생성 실패 | %s", exc)
         return None
 
-    title = (response.choices[0].message.content or "").strip().strip("\"'“”「」 .")
+    title = (response.output_text or "").strip().strip("\"'“”「」 .")
     if not title:
         return None
     # 모델이 20자 규칙을 어길 때가 있어 마지막에 우리가 한 번 더 자른다(사이드바가 깨지는 것보다 낫다).
@@ -218,48 +224,49 @@ async def run_chat(
     tool_calls_used = 0
     answer: str | None = None
 
+    # 첫 요청은 대화 전체를 싣고, 도구를 실행한 뒤에는 previous_response_id 체이닝으로
+    # 직전 응답에 도구 결과만 이어붙인다. responses API는 서버가 직전 응답(추론 항목 포함)을
+    # 들고 있어, chat/completions처럼 assistant tool_calls를 우리가 되돌려 실을 필요가 없다.
+    # 체이닝은 한 턴 안에서만 쓴다 — 턴 간 상태는 여전히 Spring의 대화 기록이 진실이다.
+    request_input: list[dict] = convo
+    previous_response_id: str | None = None
+
     for _turn in range(MAX_TURNS):
         kwargs: dict[str, Any] = {
-            "model": OPENAI_MODEL,
-            "messages": convo,
+            "model": CHAT_MODEL,
+            "input": request_input,
             "prompt_cache_key": CHAT_CACHE_KEY,
+            # 채팅 추론 강도는 high 고정(env로 받지 않는다). chat/completions와 달리
+            # responses에서는 tools와 함께 써도 어떤 gpt-5 계열 모델이든 거부되지 않는다.
+            "reasoning": {"effort": "high"},
         }
+        if previous_response_id is not None:
+            kwargs["previous_response_id"] = previous_response_id
         if tool_calls_used < MAX_TOOL_CALLS:
             kwargs["tools"] = tool_schemas
             kwargs["tool_choice"] = "auto"
             kwargs["parallel_tool_calls"] = False  # 예산 추적을 단순하게 유지
 
-        response = await create_completion(**kwargs)
-        message = response.choices[0].message
+        response = await create_response(**kwargs)
+        previous_response_id = response.id
 
-        if not message.tool_calls:
-            answer = message.content or ""
+        # output에는 reasoning/message/function_call 항목이 섞여 온다. 도구 호출이 없으면
+        # 이번 응답이 최종 답변이다(output_text가 message 항목의 텍스트를 이어 붙여 준다).
+        calls = [item for item in response.output if item.type == "function_call"]
+        if not calls:
+            answer = response.output_text or ""
             break
 
-        convo.append(
-            {
-                "role": "assistant",
-                "content": message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in message.tool_calls
-                ],
-            }
-        )
-
-        for tool_call in message.tool_calls:
-            name = tool_call.function.name
+        outputs: list[dict] = []
+        for tool_call in calls:
+            name = tool_call.name
             tool = tools_by_name.get(name)
             if tool is None or tool_calls_used >= MAX_TOOL_CALLS:
-                convo.append(
+                outputs.append(
                     {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": (
+                        "type": "function_call_output",
+                        "call_id": tool_call.call_id,
+                        "output": (
                             "(사용할 수 없는 도구이거나 호출 예산을 모두 사용했습니다. "
                             "지금까지 확인한 내용으로 답하세요.)"
                         ),
@@ -268,7 +275,7 @@ async def run_chat(
                 continue
 
             try:
-                args = json.loads(tool_call.function.arguments or "{}")
+                args = json.loads(tool_call.arguments or "{}")
                 # user_id·work_id는 스키마에 없어 모델이 채우지 않는다 — 요청에서 받은
                 # 값을 여기서 주입한다. 모델이 남의 작품을 조회하도록 값을 지어낼 여지를
                 # 없애는 것이 이 설계의 요점이다.
@@ -278,7 +285,7 @@ async def run_chat(
                 tool_records.append({"name": name, "summary": summary, "status": "DONE"})
             except Exception as exc:  # noqa: BLE001 — 도구 실패는 "근거 부족"으로 두고 대화를 계속한다
                 logger.warning(
-                    "도구 실행 실패 | tool=%s args=%s | %s", name, tool_call.function.arguments, exc
+                    "도구 실행 실패 | tool=%s args=%s | %s", name, tool_call.arguments, exc
                 )
                 result_text = f"도구 실행 오류: {exc}"
                 tool_records.append(
@@ -286,9 +293,11 @@ async def run_chat(
                 )
             tool_calls_used += 1
 
-            convo.append(
-                {"role": "tool", "tool_call_id": tool_call.id, "content": result_text}
+            outputs.append(
+                {"type": "function_call_output", "call_id": tool_call.call_id, "output": result_text}
             )
+
+        request_input = outputs
 
     if answer is None:
         logger.warning("채팅 턴 상한 도달 | work_id=%s session_id=%s", work_id, session_id)

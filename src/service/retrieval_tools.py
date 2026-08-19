@@ -28,7 +28,9 @@ from neo4j_graphrag.types import RetrieverResult
 # 명시한다(도구 실행 자체는 그대로 lorekeeper의 Tool.execute를 쓴다 — 스키마만 우리 것으로 대체).
 # **신규 도구를 추가하면 반드시 여기에도 등록해야 한다** — 빠지면 아래 폴백이 내부 파라미터를
 # 그대로 LLM에 노출한다.
-_PARAMETER_SCHEMAS: dict[str, dict[str, Any]] = {
+# 공개 이름이다 — 채팅 도구(src/service/chat/tools.py)도 같은 스키마를 쓴다. 정의가 두 벌이면
+# retrieval 쪽 파라미터가 바뀔 때 채팅만 낡은 스키마로 남는다.
+PARAMETER_SCHEMAS: dict[str, dict[str, Any]] = {
     "hybrid_search": {
         "type": "object",
         "properties": {
@@ -68,7 +70,7 @@ _PARAMETER_SCHEMAS: dict[str, dict[str, Any]] = {
 def _to_openai_schema(tool: Tool) -> dict[str, Any]:
     name = tool.get_name()
     # 새 도구가 추가돼 목록에 없으면, lorekeeper의 자동 추론 스키마로 폴백한다.
-    parameters = _PARAMETER_SCHEMAS.get(name) or tool.get_parameters() or {
+    parameters = PARAMETER_SCHEMAS.get(name) or tool.get_parameters() or {
         "type": "object",
         "properties": {},
     }

@@ -40,7 +40,7 @@ import pytest
 
 from src.common import graphrag, llm_limit
 from src.common.openai_client import create_completion
-from src.config import EMBEDDING_MODEL, EXTRACTION_MODEL, OPENAI_MODEL
+from src.config import CHAT_MODEL, EMBEDDING_MODEL, EXTRACTION_MODEL
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("LLM_SMOKE"),
@@ -126,17 +126,17 @@ def test_임베딩_응답에도_헤더가_실린다(capsys):
 
 
 def test_채팅_모델이_별도_버킷이면_그것도_잰다(capsys):
-    """OPENAI_MODEL과 EXTRACTION_MODEL이 다르면 버킷이 하나 더 있다.
+    """CHAT_MODEL과 EXTRACTION_MODEL이 다르면 버킷이 하나 더 있다.
     같으면 호출을 아끼려고 건너뛴다."""
-    if OPENAI_MODEL == EXTRACTION_MODEL:
-        pytest.skip(f"채팅이 같은 모델({OPENAI_MODEL})이라 이미 측정됐다")
+    if CHAT_MODEL == EXTRACTION_MODEL:
+        pytest.skip(f"채팅이 같은 모델({CHAT_MODEL})이라 이미 측정됐다")
 
     async def 한_번():
         return await create_completion(
-            model=OPENAI_MODEL,
+            model=CHAT_MODEL,
             messages=[{"role": "user", "content": "1+1? 한 글자로."}],
         )
 
     asyncio.run(한_번())
     with capsys.disabled():
-        _보고(f"채팅 버킷 — {OPENAI_MODEL}", llm_limit.snapshot()[OPENAI_MODEL])
+        _보고(f"채팅 버킷 — {CHAT_MODEL}", llm_limit.snapshot()[CHAT_MODEL])
