@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from neo4j_graphrag.experimental.components.kg_writer import KGWriterModel, Neo4jWriter
 from neo4j_graphrag.experimental.components.types import LexicalGraphConfig, Neo4jGraph
+from pydantic import validate_call
 
 from src.common.tenant import Tenant
 
@@ -36,6 +37,11 @@ class TenantTaggingWriter(Neo4jWriter):
         super().__init__(*args, **kwargs)
         self._tenant = tenant
 
+    # validate_call이 없으면 안 된다. 오케스트레이터는 앞 컴포넌트의 결과를 model_dump()한
+    # **dict**로 넘기고(orchestrator.py), 라이브러리의 Neo4jWriter.run도 이 데코레이터로
+    # dict를 Neo4jGraph로 되살린다. 오버라이드가 이를 빠뜨리면 graph.nodes에서 죽는다
+    # (2026-08-19 E2E에서 실제로 발생).
+    @validate_call
     async def run(
         self,
         graph: Neo4jGraph,
