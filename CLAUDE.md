@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **모든 코드에는 주석만 봐도 코드를 이해할 수 있을 정도로 상세히 작성한다.**
 
 - 클래스·메서드: 목적, 동작 흐름, 중요한 전제조건을 주석으로 설명
-- 복잡한 로직, NestJS/BullMQ/Prisma API의 비자명한 동작: 반드시 인라인 주석 추가
+- 복잡한 로직, 비자명한 동작: 반드시 인라인 주석 추가
 - 기존 코드 스타일을 보면 알 수 있듯이, 각 필드·옵션·분기의 의미를 짧은 줄 주석으로 설명
 
 ---
