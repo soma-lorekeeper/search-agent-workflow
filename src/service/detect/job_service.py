@@ -18,10 +18,8 @@ import asyncio
 import logging
 import os
 
-from fastapi import HTTPException
-from fastapi.responses import JSONResponse
-
 from src.common import admission, llm_limit
+from src.common.exceptions import NotFound, RateLimited
 from src.config import EXTRACTION_MODEL
 from src.dto.detect_dto import DetectRequest, DetectStatus, JobAck
 from src.repository.postgres import detection
@@ -103,8 +101,9 @@ async def _run_detect(
         await asyncio.to_thread(detection.mark_error, job_id, str(exc))
 
 
-async def submit(req: DetectRequest):
-    """검사를 백그라운드로 시작하고 즉시 응답한다. 여유가 없으면 429로 거절한다."""
+async def submit(req: DetectRequest) -> JobAck:
+    """검사를 백그라운드로 시작하고 즉시 응답한다. 여유가 없으면 RateLimited(→429)로
+    거절한다 — HTTP 변환은 error_handlers가 한다."""
     known = _detect_jobs.get(req.job_id)
     if known is not None:
         # 중복 제출 방어. 회차 하나 검사에 LLM을 수십 번 부르므로 중복 실행 비용이 크다.
@@ -120,26 +119,25 @@ async def submit(req: DetectRequest):
     running = _running_detect_count()
     if running >= MAX_CONCURRENT_DETECTS:
         logger.warning("동시 검사 상한으로 탐지 요청 거절 | job_id=%s 진행중=%d", req.job_id, running)
-        return JSONResponse(
-            status_code=429,
-            headers={"Retry-After": str(DETECT_JOB_SECONDS)},
-            content={
-                "detail": "Too many detections in progress. Retry after the Retry-After period.",
-                "runningDetections": running,
-            },
+        raise RateLimited(
+            "Too many detections in progress. Retry after the Retry-After period.",
+            retry_after=DETECT_JOB_SECONDS,
+            type="/errors/too-many-detections",
+            title="Too Many Detections",
+            # 확장 멤버는 응답 top-level 에 이 키 그대로 실린다(스펙의 camelCase).
+            extensions={"runningDetections": running},
         )
 
     # 마지막 안전망 — 인덱싱이 같은 모델 버킷을 비웠는지 본다(둘 다 EXTRACTION_MODEL).
     retry_after = admission.budget_retry_after(EXTRACTION_MODEL)
     if retry_after is not None:
         logger.warning("모델 한도 부족으로 탐지 요청 거절 | job_id=%s 재시도=%d초", req.job_id, retry_after)
-        return JSONResponse(
-            status_code=429,
-            headers={"Retry-After": str(retry_after)},
-            content={
-                "detail": "Model rate limit is nearly exhausted. Retry after the Retry-After period.",
-                "remainingTpm": llm_limit.remaining(EXTRACTION_MODEL).remaining or 0,
-            },
+        raise RateLimited(
+            "Model rate limit is nearly exhausted. Retry after the Retry-After period.",
+            retry_after=retry_after,
+            type="/errors/model-rate-limit",
+            title="Model Rate Limit Exhausted",
+            extensions={"remainingTpm": llm_limit.remaining(EXTRACTION_MODEL).remaining or 0},
         )
 
     _detect_jobs[req.job_id] = {
@@ -162,7 +160,7 @@ def get_status(job_id: str) -> DetectStatus:
     """검사 하나의 진행 상태와 결과. 모르는 job_id는 404다."""
     state = _detect_jobs.get(job_id)
     if state is None:
-        raise HTTPException(status_code=404, detail=f"'{job_id}' 탐지 작업 기록이 없습니다.")
+        raise NotFound(f"detection job '{job_id}' not found")
     # 검사는 이벤트 루프에서, 이 조회는 FastAPI의 스레드풀에서 돈다. 필드를 하나씩 읽으면
     # 읽는 도중 상태가 바뀌어 "status는 새 값, findings는 옛 값" 같은 조합을 볼 수 있다.
     snapshot = dict(state)

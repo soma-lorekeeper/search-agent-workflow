@@ -1,4 +1,4 @@
-"""인덱싱 API. 요청·응답 필드는 스펙대로 camelCase다(dto/common.CamelModel)."""
+"""인덱싱 API. 요청·응답 필드는 전 API 공통 규칙대로 camelCase다(dto/common.CamelModel)."""
 
 from fastapi import APIRouter
 
@@ -9,7 +9,7 @@ router = APIRouter()
 
 
 @router.post("/api/index", response_model=IndexAccepted, status_code=201)
-async def index_episodes(req: IndexRequest):
+async def index_episodes(req: IndexRequest) -> IndexAccepted:
     """여러 화를 한 작업으로 접수하고 즉시 응답한다(실제 처리는 백그라운드 워커)."""
     return await job_service.submit(req)
 

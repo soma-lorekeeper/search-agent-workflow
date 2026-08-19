@@ -4,7 +4,7 @@
 |---|---|
 | 버전 | v1 (2026-08-11) |
 | 대상 독자 | Spring 서버 개발팀 |
-| 범위 | **Indexing API만.** 충돌탐지(설정 오류 검사) API는 완성 후 별도 문서로 제공 |
+| 범위 | **Indexing API만.** 탐지는 `docs/detecting-api-spec.md`, 채팅은 `docs/chatting-api-spec.md` 참고 |
 
 ## 1. 개요
 
@@ -33,9 +33,40 @@ Spring이 수행하는 폴링은 **두 가지**이며 서로 다르다:
 - **소설 식별**: `userId` × `workId` 조합이 소설 한 편을 unique하게 구분한다
 - **`episodeId`**: Spring 측 회차 식별자. 파이썬은 의미를 해석하지 않고 상태 응답에 그대로 에코한다
 - **`episodeNo`**: 회차 순번(1화, 2화, …). 인덱싱은 이전 회차까지의 누적 컨텍스트 위에서 동작하므로 순번이 필수다 — `TBD: episodeId가 회차 순번과 동일하다면 이 필드는 제거 가능. Spring 팀 확인 필요`
+- **필드 표기**: camelCase — 요청·응답 전 필드. 이 서버의 모든 API(indexing·detecting·chat) 공통 규약이다
 - **시각**: RFC 3339 UTC (`2026-08-11T03:11:00Z`)
-- **에러 본문**: `{ "detail": "사유 문자열", ... }`
+- **에러 본문**: [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457) — 아래 2.1 참고
 - **인증**: 별도 인증 없음. Spring이 이미 인증을 마친 요청만 보내므로 파이썬은 이를 신뢰한다 (이 서버는 외부에 노출되지 않는 내부 서버라는 전제)
+
+### 2.1 에러 응답 (RFC 9457 Problem Details)
+
+> **신규/파괴적.** 이전 버전의 에러 본문은 `{ "detail": "사유 문자열", ... }`이었다. 이제 모든 에러 응답(4xx/5xx)이 아래 모양이고 `Content-Type: application/problem+json`으로 나간다. **Spring 쪽 에러 파싱 대응이 필요하다** — 상태코드와 `Retry-After` 헤더만 보는 로직은 영향이 없고, Spring Boot 3+의 `ProblemDetail`이 이 포맷의 표준 구현이다.
+
+```json
+{
+  "type": "/errors/queue-full",
+  "title": "Queue Full",
+  "status": 429,
+  "detail": "Indexing queue is full. Retry after the Retry-After period.",
+  "queuedEpisodes": 20,
+  "estimatedWaitSeconds": 2640
+}
+```
+
+| 필드 | 설명 |
+|---|---|
+| `type` | 에러 종류의 기계 판독용 식별자. 상태코드 이상의 의미가 없으면 `about:blank` |
+| `title` | 에러 종류의 짧은 요약 (`type`별로 고정) |
+| `status` | HTTP 상태코드 (응답 라인과 동일한 값) |
+| `detail` | 이 발생 건에 대한 사람이 읽는 설명 (영어) |
+| 그 외 | 사유별 확장 필드 — `queuedEpisodes`, `remainingTpm` 등 top-level camelCase 유지 |
+
+`type` 목록: `/errors/invalid-request`(400) · `/errors/not-found`(404) · `/errors/queue-full`, `/errors/model-rate-limit`(429) · `/errors/validation`(422) · `about:blank`(그 외 404/405, 500)
+
+**422와 500** (이전 버전에는 스키마가 없던 응답):
+
+- `422` — 요청 본문이 스키마와 다르다(필드 타입 오류, 필수 필드 누락). Spring 쪽 요청 조립 버그를 뜻하며, pydantic 오류 배열이 `errors` 확장 필드에 실린다.
+- `500` — 잡히지 않은 서버 오류. `detail`은 고정 문구 `"Internal server error"`이고 내부 예외 메시지는 노출되지 않는다(로그로만 남는다).
 
 ## 3. `POST /api/index` — 인덱싱 제출
 
@@ -112,9 +143,13 @@ Spring이 수행하는 폴링은 **두 가지**이며 서로 다르다:
 ```
 HTTP/1.1 429 Too Many Requests
 Retry-After: 240
+Content-Type: application/problem+json
 ```
 ```json
 {
+  "type": "/errors/queue-full",
+  "title": "Queue Full",
+  "status": 429,
   "detail": "Indexing queue is full. Retry after the Retry-After period.",
   "queuedEpisodes": 20,
   "estimatedWaitSeconds": 2640
@@ -125,6 +160,9 @@ Retry-After: 240
 
 ```json
 {
+  "type": "/errors/model-rate-limit",
+  "title": "Model Rate Limit Exhausted",
+  "status": 429,
   "detail": "Model rate limit is nearly exhausted. Retry after the Retry-After period.",
   "remainingTpm": 1200
 }
@@ -139,7 +177,12 @@ Retry-After: 240
 `episodes`가 빈 배열, `text` 누락, **회차 연속성 위반**(3장) 등. 재시도해도 같은 결과이므로 요청을 고쳐야 한다.
 
 ```json
-{ "detail": "episodes must not be empty" }
+{
+  "type": "/errors/invalid-request",
+  "title": "Invalid Request",
+  "status": 400,
+  "detail": "episodes must not be empty"
+}
 ```
 
 ## 4. `GET /api/index/jobs/{jobId}` — 진행 상태 조회
@@ -171,6 +214,15 @@ Retry-After: 240
 - **한 화가 실패하면 그 뒤의 화들은 처리하지 않고 `ERROR`로 표기된다** (`error: "Skipped due to preceding episode (6) failure"`). 누적 컨텍스트 의존 때문이다. 실패 원인 해소 후 **실패 화부터 재제출**하면 된다 — 실패한 화는 그래프에 들어가지 않았으므로 연속성 판정에서 여전히 "다음 화"다
 
 ### Response `404 Not Found` — 상태 소실
+
+```json
+{
+  "type": "/errors/not-found",
+  "title": "Not Found",
+  "status": 404,
+  "detail": "indexing job '550e8400-e29b-41d4-a716-446655440000' not found"
+}
+```
 
 진행 상태는 파이썬 서버 메모리에만 있다. **서버가 재시작되면 상태가 사라지고, 진행 중이던 작업도 함께 중단된다.** 이것은 계약에 포함된 정상 시나리오다:
 

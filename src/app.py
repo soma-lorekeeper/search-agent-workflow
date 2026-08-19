@@ -3,8 +3,8 @@
 이 서버의 API는 전부 API 서버(Spring)가 호출하는 내부 API다. 인증은 없다 —
 호출자가 Spring 하나뿐이고 이 서버는 127.0.0.1에만 떠 있어 외부에서 닿을 수 없다.
 작업형 API 둘은 작업 id 발급 주체가 서로 다르다: 인덱싱은 이 서버가 jobId를 발급하고
-(요청 하나가 여러 화를 묶는 단위라서), 설정 오류 탐지는 Spring이 발급한 job_id로 일한다.
-필드 표기도 그래서 다르다 — 인덱싱만 스펙대로 camelCase이고 나머지는 snake_case다.
+(요청 하나가 여러 화를 묶는 단위라서), 설정 오류 탐지는 Spring이 발급한 jobId로 일한다.
+요청·응답 필드 표기는 전 API 공통으로 camelCase다(LOREKEEPER-273에서 chat까지 통일).
 """
 
 import asyncio
@@ -16,6 +16,7 @@ from src import config  # noqa: F401 — import 시점에 .env를 로드해 NEO4
 from src.controller import (
     chat_controller,
     detect_controller,
+    error_handlers,
     health_controller,
     index_controller,
 )
@@ -38,6 +39,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# 에러 응답(RFC 9457)은 전부 이 핸들러들이 만든다 — service 는 도메인 예외를 던질 뿐이다.
+error_handlers.register(app)
 
 app.include_router(health_controller.router)
 app.include_router(index_controller.router)

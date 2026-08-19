@@ -4,7 +4,7 @@
 |---|---|
 | 버전 | v1 (2026-08-15) |
 | 대상 독자 | Spring 서버 개발팀 |
-| 범위 | **설정 오류 탐지 API만.** 인덱싱 API는 `docs/indexing-api-spec.md` 참고 |
+| 범위 | **설정 오류 탐지 API만.** 인덱싱은 `docs/indexing-api-spec.md`, 채팅은 `docs/chatting-api-spec.md` 참고 |
 
 ## 1. 개요
 
@@ -31,10 +31,11 @@ jobId를 Spring이 발급하는 이유는 검사 요청 하나가 회차 하나�
 
 - **소설 식별**: `userId` × `workId` 조합이 소설 한 편을 unique하게 구분한다(인덱싱과 같은 규약). 지식 그래프가 이 조합을 테넌트 키로 삼아 소설별로 격리돼 있으므로, **인덱싱할 때와 같은 값을 보내야 그 그래프를 찾는다.**
 - **`episodeNumber`**: 검사 대상 회차의 순번. 이 회차 **직전까지**의 설정만 대조 대상이 된다 — 없으면 회차가 자기 자신이 만든 사실과 대조돼 "일치"로 자평하고, 뒤에 나올 반전을 이미 심어둔 모순으로 읽는다.
-- **필드 표기**: camelCase
+- **필드 표기**: camelCase — 요청·응답 전 필드. 이 서버의 모든 API(indexing·detecting·chat) 공통 규약이다
 - **status 어휘**: `QUEUED` / `RUNNING` / `DONE` / `ERROR` (DB의 `detection_jobs.status`와 같은 값)
 - **시각**: RFC 3339 UTC
-- **에러 본문**: `{ "detail": "사유 문자열" }`
+- **에러 본문**: [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457) — `{ "type", "title", "status", "detail", ...확장 }` + `Content-Type: application/problem+json`. 상세 스키마와 `type` 목록은 `docs/indexing-api-spec.md` 2.1과 공통이다
+  - > **신규/파괴적.** 이전 버전은 `{ "detail": "사유 문자열" }`이었다(그리고 429는 문서와 달리 실제로 추가 필드를 실었다). **Spring 쪽 에러 파싱 대응이 필요하다** — 상태코드와 `Retry-After` 헤더만 보는 로직은 영향이 없다.
 - **인증**: 없음(인덱싱과 동일한 전제)
 
 ## 3. `POST /api/detect` — 검사 제출
@@ -82,9 +83,13 @@ jobId를 Spring이 발급하는 이유는 검사 요청 하나가 회차 하나�
 ```
 HTTP/1.1 429 Too Many Requests
 Retry-After: 90
+Content-Type: application/problem+json
 ```
 ```json
 {
+  "type": "/errors/too-many-detections",
+  "title": "Too Many Detections",
+  "status": 429,
   "detail": "Too many detections in progress. Retry after the Retry-After period.",
   "runningDetections": 4
 }
@@ -94,6 +99,9 @@ Retry-After: 90
 
 ```json
 {
+  "type": "/errors/model-rate-limit",
+  "title": "Model Rate Limit Exhausted",
+  "status": 429,
   "detail": "Model rate limit is nearly exhausted. Retry after the Retry-After period.",
   "remainingTpm": 1200
 }
@@ -187,7 +195,12 @@ Retry-After: 90
 ### Response `404 Not Found` — 상태 소실
 
 ```json
-{ "detail": "'8f2c1e6a-…' 탐지 작업 기록이 없습니다." }
+{
+  "type": "/errors/not-found",
+  "title": "Not Found",
+  "status": 404,
+  "detail": "detection job '8f2c1e6a-…' not found"
+}
 ```
 
 진행 상태는 파이썬 프로세스 메모리에만 있다. 재시작하면 사라지고 진행 중이던 검사도 함께 끊긴다. **404는 계약된 정상 시나리오다** — Spring은 자기 `detection_jobs` 행을 보거나, 같은 `jobId`로 다시 `POST`하면 된다(재실행이 이전 결과를 덮어쓴다).

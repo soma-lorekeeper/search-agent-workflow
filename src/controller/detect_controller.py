@@ -13,12 +13,12 @@ router = APIRouter()
 
 
 @router.post("/api/detect", response_model=JobAck, status_code=202)
-async def start_detect(req: DetectRequest):
+async def start_detect(req: DetectRequest) -> JobAck:
     """설정 오류 탐지를 백그라운드로 시작하고 즉시 응답한다.
 
-    여유가 없으면 429로 거절한다(동시 검사 상한 또는 모델 한도 소진). 반환 타입 주석을
-    JobAck으로 좁히지 않는 이유는 그때 JSONResponse를 그대로 돌려주기 때문이다 —
-    인덱싱 컨트롤러와 같은 방식이고, Response를 직접 반환하면 response_model을 우회한다.
+    여유가 없으면 429로 거절한다(동시 검사 상한 또는 모델 한도 소진) — service가
+    RateLimited를 던지고 error_handlers가 응답으로 바꾸므로, 이 함수는 항상 JobAck만
+    반환한다.
     """
     return await job_service.submit(req)
 

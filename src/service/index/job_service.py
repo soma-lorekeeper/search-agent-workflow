@@ -37,10 +37,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import HTTPException
-from fastapi.responses import JSONResponse
-
 from src.common import admission, llm_limit
+from src.common.exceptions import InvalidRequest, NotFound, RateLimited
 from src.dto.index_dto import IndexAccepted, IndexEpisodeStatus, IndexJobStatus, IndexRequest
 from src.config import EXTRACTION_MODEL
 from src.repository.neo4j.client import get_driver
@@ -296,7 +294,7 @@ def _now_rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-async def submit(req: IndexRequest):
+async def submit(req: IndexRequest) -> IndexAccepted:
     """여러 화를 한 작업으로 접수하고 즉시 응답한다.
 
     실제 처리(lorekeeper.indexing 호출)는 worker가 이 요청의 커넥션과 무관하게
@@ -304,32 +302,28 @@ async def submit(req: IndexRequest):
 
     접수 순서: 입력 검증 → 완료 마커·최대 화 조회 → 회차 연속성 확인 → 큐 여유 확인 →
     모델 한도 확인 → 저장·큐잉.
-    거절(400/429)당한 요청은 어디에도 남지 않아야 하므로, 상태 등록은 그 확인을 전부
-    통과한 뒤에 한다.
+    거절은 도메인 예외로 던진다(InvalidRequest→400, RateLimited→429 — HTTP 변환은
+    error_handlers가 한다). 거절당한 요청은 어디에도 남지 않아야 하므로, 상태 등록은
+    그 확인을 전부 통과한 뒤에 한다.
     """
     tenant = kg_scope(req.user_id, req.work_id)
 
     if not req.episodes:
-        raise HTTPException(status_code=400, detail="episodes must not be empty")
+        raise InvalidRequest("episodes must not be empty")
 
     previous_no: int | None = None
     for episode in req.episodes:
         if not episode.text:
-            raise HTTPException(
-                status_code=400, detail=f"episode {episode.episode_id} must have text"
-            )
+            raise InvalidRequest(f"episode {episode.episode_id} must have text")
         # 오름차순이 아니라 **빈틈 없이 이어질 것**을 요구한다. 부등식(오름차순)으로는
         # 역순만 막히고 [8, 10] 같은 구멍은 통과한다 — 9화 없이 10화를 추출하면 누적
         # 컨텍스트가 빈 채로 해석되어 그래프가 조용히 잘못 만들어진다(예외도 로그도 없다).
         # 같은 번호가 두 번 오는 것도 이 조건에 함께 걸린다.
         if previous_no is not None and episode.episode_no != previous_no + 1:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"episodeNo must be consecutive: {previous_no} is followed by "
-                    f"{episode.episode_no}. Episodes are indexed on top of the previous "
-                    f"chapter's context, so gaps are not allowed."
-                ),
+            raise InvalidRequest(
+                f"episodeNo must be consecutive: {previous_no} is followed by "
+                f"{episode.episode_no}. Episodes are indexed on top of the previous "
+                f"chapter's context, so gaps are not allowed."
             )
         previous_no = episode.episode_no
 
@@ -370,12 +364,9 @@ async def submit(req: IndexRequest):
         # 0 으로 두면 첫 화가 1 이어야 한다는 규칙이 자연스럽게 나온다.
         expected = max([latest_indexed or 0, *active]) + 1
         if fresh[0].episode_no != expected:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"expected episodeNo {expected} but got {fresh[0].episode_no}; "
-                    f"episodes must continue from the last known chapter without gaps"
-                ),
+            raise InvalidRequest(
+                f"expected episodeNo {expected} but got {fresh[0].episode_no}; "
+                f"episodes must continue from the last known chapter without gaps"
             )
 
     # 이 묶음 하나만으로 상한을 넘으면 큐가 아무리 비어도 통과할 수 없다. 그런데도 429를 주면
@@ -383,13 +374,10 @@ async def submit(req: IndexRequest):
     # 루프다. "기다려라"가 아니라 "쪼개서 다시 보내라"고 말해야 한다.
     own_wait = len(pending) * INDEX_EPISODE_SECONDS
     if own_wait > INDEX_MAX_WAIT_SECONDS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"{len(pending)} episodes need about {own_wait}s to index, which exceeds "
-                f"the maximum queue wait ({INDEX_MAX_WAIT_SECONDS}s) on its own — this "
-                f"bundle can never be accepted. Split it into smaller requests."
-            ),
+        raise InvalidRequest(
+            f"{len(pending)} episodes need about {own_wait}s to index, which exceeds "
+            f"the maximum queue wait ({INDEX_MAX_WAIT_SECONDS}s) on its own — this "
+            f"bundle can never be accepted. Split it into smaller requests."
         )
 
     # 큐가 얼마나 밀렸는가. 이미 인덱싱된 화(pending에서 빠진 것)는 일하지 않으므로 세지
@@ -404,14 +392,13 @@ async def submit(req: IndexRequest):
             queued,
             estimated_wait,
         )
-        return JSONResponse(
-            status_code=429,
-            headers={"Retry-After": str(estimated_wait - INDEX_MAX_WAIT_SECONDS)},
-            content={
-                "detail": "Indexing queue is full. Retry after the Retry-After period.",
-                "queuedEpisodes": queued,
-                "estimatedWaitSeconds": estimated_wait,
-            },
+        raise RateLimited(
+            "Indexing queue is full. Retry after the Retry-After period.",
+            retry_after=estimated_wait - INDEX_MAX_WAIT_SECONDS,
+            type="/errors/queue-full",
+            title="Queue Full",
+            # 확장 멤버는 응답 top-level 에 이 키 그대로 실린다(스펙의 camelCase).
+            extensions={"queuedEpisodes": queued, "estimatedWaitSeconds": estimated_wait},
         )
 
     # 마지막 안전망 — 탐지가 같은 모델 버킷을 비웠는지 본다(둘 다 EXTRACTION_MODEL을 쓴다).
@@ -424,13 +411,12 @@ async def submit(req: IndexRequest):
             req.work_id,
             retry_after,
         )
-        return JSONResponse(
-            status_code=429,
-            headers={"Retry-After": str(retry_after)},
-            content={
-                "detail": "Model rate limit is nearly exhausted. Retry after the Retry-After period.",
-                "remainingTpm": llm_limit.remaining(EXTRACTION_MODEL).remaining or 0,
-            },
+        raise RateLimited(
+            "Model rate limit is nearly exhausted. Retry after the Retry-After period.",
+            retry_after=retry_after,
+            type="/errors/model-rate-limit",
+            title="Model Rate Limit Exhausted",
+            extensions={"remainingTpm": llm_limit.remaining(EXTRACTION_MODEL).remaining or 0},
         )
 
     job_id = str(uuid.uuid4())
@@ -482,7 +468,7 @@ def get_status(job_id: str) -> IndexJobStatus:
     """
     job = _index_jobs.get(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail=f"'{job_id}' 인덱싱 작업 기록이 없습니다.")
+        raise NotFound(f"indexing job '{job_id}' not found")
     return IndexJobStatus(
         job_id=job_id,
         user_id=job["user_id"],
