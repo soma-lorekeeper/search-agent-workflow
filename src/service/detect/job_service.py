@@ -67,14 +67,15 @@ async def _run_detect(
     await asyncio.to_thread(detection.mark_running, job_id)
 
     try:
-        claims, _lines, _tokens = await extract_service.extract(text, tenant, episode_number)
+        # lines는 판정 결과의 줄 번호를 원문으로 되짚는 데 쓴다(judge에 그대로 넘긴다).
+        claims, lines, _tokens = await extract_service.extract(text, tenant, episode_number)
         # claim 수는 추출이 끝나야 알 수 있다. 여기서부터 조회가 진행률을 보여줄 수 있다.
         state.update({"phase": "RETRIEVE", "claim_count": len(claims)})
 
         evidence = await retrieve_service.retrieve(claims, tenant, episode_number)
         state["phase"] = "JUDGE"
 
-        findings = await judge_service.judge(claims, evidence)
+        findings = await judge_service.judge(claims, evidence, lines)
 
         # 결과와 상태를 한 번의 update로 쓴다. 조회는 다른 스레드에서 도는데 두 줄로 나눠
         # 쓰면 그 사이의 폴링이 status=DONE + findings=null을 보고, 호출자는 폴링을 멈춘 뒤

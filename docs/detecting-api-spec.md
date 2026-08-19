@@ -154,10 +154,16 @@ Content-Type: application/problem+json
       "quote": "이현우는 왼팔의 낙인을 문질렀다",
       "axis": "이현우의 왼팔 상태",
       "value": "낙인이 있음",
-      "lineIds": [91],
+      "lines": [{ "lineNo": 91, "text": "이현우는 왼팔의 낙인을 문질렀다." }],
       "isError": true,
       "reason": "3화에서 이현우는 왼팔을 잃었다(C012). 낙인을 문지를 팔이 없다.",
-      "cited": [{ "episodeNo": 3, "chunkIndex": 12 }]
+      "cited": [
+        {
+          "episodeNo": 3,
+          "chunkIndex": 12,
+          "text": "이현우의 왼팔이 어깨째 뜯겨 나갔다. 그는 비명조차 지르지 못했다."
+        }
+      ]
     }
   ],
   "detail": null
@@ -171,12 +177,16 @@ Content-Type: application/problem+json
 | `claimId` | `P1`~`PN`. 번호는 **원고 등장 순서**라 화면 정렬에 그대로 쓸 수 있다 |
 | `quote` | 원고에서 문제가 된 서술 그대로 |
 | `axis` / `value` | 무엇에 대한 주장이고 그 값이 무엇인지 |
-| `lineIds` | 원고 줄 번호. 화면이 본문 위에 하이라이트를 건다 |
+| `lines` | 문제가 된 **검사 회차**의 줄 `{lineNo, text}`. 화면이 본문 위에 하이라이트를 건다 |
 | `isError` | 지금은 항상 `true`. 임계값을 옮기거나 "의심" 등급을 더해도 계약이 안 바뀌도록 필드로 둔다 |
 | `reason` | 판정 근거 문장 |
-| `cited` | 근거 원문의 좌표 `{episodeNo, chunkIndex}`. 화면이 그 조각을 열 수 있다 |
+| `cited` | 판정의 근거가 된 **과거 회차**의 원문 `{episodeNo, chunkIndex, text}` |
 
 `contradictionCount`는 `findings`의 길이와 같다. 목록 화면이 상세를 받지 않고도 개수를 보여줄 수 있게 함께 싣는다.
+
+**두 좌표가 원문을 함께 싣는 이유.** `lineNo`도 `chunkIndex`도 **이 서버가 매긴 번호**다. 줄 번호는 KSS 문장 분리 → 개행 → 200자 분할로, 조각 번호는 KSS 청킹(100자 단위)으로 나온다. 받는 쪽은 그 분할을 재현할 수 없어 번호만으로는 91번 줄이 어느 문장이고 12번 조각이 무엇인지 알 방법이 없다. 그래서 번호와 원문을 함께 보낸다 — 번호는 어느 자리였는지 되짚는 좌표로 남기고, 화면에 보여줄 것은 `text`다.
+
+원문의 **위치**(문자 오프셋)를 대신 보내지 않는 것은 의도적이다. 회차가 나중에 수정되면 오프셋은 엉뚱한 구간을 조용히 가리키지만, 문자열은 못 찾으면 하이라이트만 실패한다. 판정 당시의 근거가 그대로 남는 쪽이 안전하다.
 
 ### Response `200 OK` — 실패
 
@@ -256,9 +266,16 @@ ALTER TABLE detection_findings
     ADD COLUMN line_ids jsonb        NOT NULL,
     ADD COLUMN cited    jsonb        NOT NULL DEFAULT '[]'::jsonb,
     ADD COLUMN score    integer;
+
+-- 근거에 원문을 싣게 되면서 line_ids의 값이 번호 배열이 아니라 객체 배열이 됐다
+-- ([91] → [{"lineNo": 91, "text": "…"}]). 이름이 값과 어긋나므로 함께 옮긴다.
+-- jsonb라 타입 변경은 없다. cited는 원래 객체 배열이라 키(text)만 늘어 DDL이 없다.
+ALTER TABLE detection_findings RENAME COLUMN line_ids TO lines;
 ```
 
 `score`는 내부 진단용이라 API 응답에는 싣지 않는다.
+
+**`lines` 개명 시 Spring 대응.** ① 위 `RENAME`을 적용한다. ② `lines`의 역직렬화를 정수 배열에서 객체 배열(`lineNo`/`text`)로 바꾸고, `cited` 쪽은 `text` 키를 받는다. ③ **마이그레이션 이전에 저장된 행은 옛 모양(`[91]`)으로 남는다** — 값을 뒤늦게 채울 방법이 없으므로(그 회차의 분할 결과가 남아 있지 않다) 방어적으로 읽거나, 필요하면 재검사한다. ④ 파이썬 서버만 먼저 배포하면 INSERT가 없는 컬럼을 가리켜 결과 저장이 실패한다 — **배포 순서를 맞춰야 한다.**
 
 ## 6. 검사 품질 (참고)
 

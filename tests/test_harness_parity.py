@@ -156,7 +156,7 @@ def test_탐지가_추론_강도를_넘기지_않는다(monkeypatch):
     asyncio.run(extract_service.extract("원고 한 줄", tenant=None, up_to_chapter=5))
     with pytest.raises(RuntimeError):
         # 판정 응답이 비면 "오류 0건"이 아니라 실패다 — 여기서는 kwargs만 보면 된다.
-        asyncio.run(judge_service.judge([{"id": "P1", "quote": "q"}], {"records": []}))
+        asyncio.run(judge_service.judge([{"id": "P1", "quote": "q"}], {"records": []}, []))
 
     assert seen, "두 경로 모두 호출돼야 한다"
     for kwargs in seen:

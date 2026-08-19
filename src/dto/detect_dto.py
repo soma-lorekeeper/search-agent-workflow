@@ -37,12 +37,18 @@ class DetectFinding(CamelModel):
     quote: str  # 원고에서 문제가 된 서술 그대로
     axis: str  # 무엇에 대한 주장인가(예: "서진우의 소속")
     value: str  # 원고가 주장하는 값
-    line_ids: list[int]  # 원고 줄 번호. 화면이 본문 위에 하이라이트를 건다.
+    # 근거가 된 원고 줄. `{lineNo, text}` 목록이다. 화면이 본문 위에 하이라이트를 건다.
+    # 번호만 보내던 것을 원문과 함께 보내도록 바꿨다 — 줄 번호는 이 서버의 분할
+    # (service/detect/lines.py)이 매긴 것이라, 받는 쪽은 그 분할을 재현할 수 없어
+    # 91번 줄이 어느 문장인지 알 방법이 없었다.
+    lines: list[dict]
     # 지금은 항상 true다(오류만 싣는다). 임계값을 옮기거나 "의심" 등급을 더해도 계약이
     # 안 바뀌도록 필드로 둔다.
     is_error: bool
     reason: str
-    # 근거 원문의 좌표. (회차, 조각 번호) 자연키라 화면이 그 조각을 바로 열 수 있다.
+    # 근거 원문. `{episodeNo, chunkIndex, text}` 목록이다. 좌표만으로는 받는 쪽이 몇 번
+    # 조각이 어느 문장인지 알 수 없어(lines와 같은 이유) 원문을 함께 싣는다. 좌표는
+    # 그래프의 어느 조각이었는지 되짚는 용도로 남긴다.
     cited: list[dict]
 
 

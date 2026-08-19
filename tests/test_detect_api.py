@@ -67,11 +67,11 @@ def _finding_for(claim: dict) -> dict:
         "quote": claim["quote"],
         "axis": claim["axis"],
         "value": claim["value"],
-        "lineIds": claim["lines"],
+        "lines": [{"lineNo": n, "text": f"{n}번째 줄."} for n in claim["lines"]],
         "isError": True,
         "score": 9,
         "reason": "3화에서 부러진 검을 다시 뽑아 들 수 없다.",
-        "cited": [{"episodeNo": 3, "chunkIndex": 1}],
+        "cited": [{"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."}],
     }
 
 
@@ -117,8 +117,8 @@ def _stub_pipeline(monkeypatch, *, claims=None, findings=None, evidence=None):
         captured["retrieve"] = {"claims": cs, "tenant": tenant, "up_to_chapter": up_to_chapter}
         return evidence
 
-    async def _judge(cs, ev):
-        captured["judge"] = {"claims": cs, "evidence": ev}
+    async def _judge(cs, ev, lines):
+        captured["judge"] = {"claims": cs, "evidence": ev, "lines": lines}
         return findings
 
     monkeypatch.setattr(extract_service, "extract", _extract)
@@ -216,6 +216,9 @@ def test_request_reaches_the_pipeline_with_tenant_and_episode(detect_client, mon
     assert captured["retrieve"]["up_to_chapter"] == 5
     # 판정은 추출이 뽑은 claim과 검색이 모은 근거를 그대로 받는다(중간에 갈아치우지 않는다).
     assert captured["judge"]["claims"] is captured["retrieve"]["claims"]
+    # 추출이 만든 원고 줄 목록도 판정까지 간다 — 판정이 고른 줄 번호를 원문으로 되짚는
+    # 통로다. 여기서 끊기면 findings의 lines에 text가 빈 채로 나간다.
+    assert captured["judge"]["lines"] == ["첫 줄", "둘째 줄"]
 
 
 # ---------- 완료 응답의 findings 계약 ----------
@@ -241,17 +244,18 @@ def test_done_response_carries_the_full_finding_contract(detect_client, monkeypa
     # 필드 집합을 통째로 못박는다. score가 응답에 끼면 여기서 걸린다 — 점수는 임계값을
     # 정하려고 만든 내부 값이고, 작가 화면에 "9점짜리 모순"을 보여줄 계약이 아니다.
     assert set(finding) == {
-        "claimId", "quote", "axis", "value", "lineIds", "isError", "reason", "cited",
+        "claimId", "quote", "axis", "value", "lines", "isError", "reason", "cited",
     }
     assert finding["claimId"] == "P1"  # 추출 순서 = 원고 등장 순서라 화면 정렬에 그대로 쓴다
     assert finding["quote"] == CLAIMS[0]["quote"]
     assert finding["axis"] == CLAIMS[0]["axis"]
     assert finding["value"] == CLAIMS[0]["value"]
-    assert finding["lineIds"] == CLAIMS[0]["lines"]  # 화면이 본문 위에 하이라이트를 거는 좌표
+    # 줄 번호에 원문이 딸려 온다 — 번호만으로는 받는 쪽이 어느 문장인지 알 수 없다.
+    assert finding["lines"] == [{"lineNo": n, "text": f"{n}번째 줄."} for n in CLAIMS[0]["lines"]]
     assert finding["isError"] is True
     assert finding["reason"]
-    # cited는 (회차, 조각 번호) 자연키 목록이라 화면이 근거 조각을 바로 열 수 있다.
-    assert finding["cited"] == [{"episodeNo": 3, "chunkIndex": 1}]
+    # cited도 좌표에 근거 원문이 함께 실린다(같은 이유).
+    assert finding["cited"] == [{"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."}]
 
 
 def test_no_error_found_is_an_empty_list_not_null(detect_client, monkeypatch):
@@ -292,7 +296,7 @@ def test_phase_advances_through_the_three_stages(detect_client, monkeypatch):
         await _hold("RETRIEVE")
         return {"records": []}
 
-    async def _judge(cs, ev):
+    async def _judge(cs, ev, lines):
         await _hold("JUDGE")
         return []
 

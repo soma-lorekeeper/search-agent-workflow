@@ -473,19 +473,30 @@ def _store(chunks: dict, facts: dict) -> dict:
     return {"chunks": chunks, "facts": facts, "entities": {}, "refs": []}
 
 
-def test_cited_chunk_alias_becomes_a_natural_key():
-    """C### 별칭은 (회차, 조각 번호)로 펼쳐진다 — 화면이 그 조각을 바로 연다."""
+def test_cited_chunk_alias_becomes_a_natural_key_with_its_text():
+    """C### 별칭은 (회차, 조각 번호) + **원문**으로 펼쳐진다.
+
+    좌표만 보내면 받는 쪽이 이 서버의 청킹을 재현할 수 없어 몇 번 조각이 어느 문장인지
+    알 수 없다. 원문을 함께 실어야 화면이 근거를 그대로 보여줄 수 있다.
+    """
     store = _store(
         {
-            "e-c1": {"eid": "e-c1", "alias": "C001", "chapter": 3, "index": 1, "text": "..."},
-            "e-c2": {"eid": "e-c2", "alias": "C002", "chapter": 4, "index": 0, "text": "..."},
+            "e-c1": {
+                "eid": "e-c1", "alias": "C001", "chapter": 3, "index": 1,
+                "text": "카엘의 검은 부러졌다.",
+            },
+            "e-c2": {
+                "eid": "e-c2", "alias": "C002", "chapter": 4, "index": 0,
+                "text": "카엘은 빈손으로 관문에 섰다.",
+            },
         },
         {},
     )
 
     assert _resolve_cited(["C002", "C001"], store) == [
-        {"episodeNo": 4, "chunkIndex": 0},
-        {"episodeNo": 3, "chunkIndex": 1},  # 인용 순서를 그대로 지킨다
+        {"episodeNo": 4, "chunkIndex": 0, "text": "카엘은 빈손으로 관문에 섰다."},
+        # 인용 순서를 그대로 지킨다
+        {"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."},
     ]
 
 
@@ -500,8 +511,14 @@ def test_cited_fact_alias_expands_to_its_evidence_chunks():
     """
     store = _store(
         {
-            "e-c1": {"eid": "e-c1", "alias": "C001", "chapter": 2, "index": 0, "text": "..."},
-            "e-c2": {"eid": "e-c2", "alias": "C002", "chapter": 3, "index": 1, "text": "..."},
+            "e-c1": {
+                "eid": "e-c1", "alias": "C001", "chapter": 2, "index": 0,
+                "text": "검날에 금이 갔다.",
+            },
+            "e-c2": {
+                "eid": "e-c2", "alias": "C002", "chapter": 3, "index": 1,
+                "text": "카엘의 검은 부러졌다.",
+            },
         },
         {
             "e-f1": {
@@ -515,16 +532,22 @@ def test_cited_fact_alias_expands_to_its_evidence_chunks():
         },
     )
 
+    # 사실을 거쳐 와도 청크와 똑같이 원문이 붙는다 — 근거를 볼 수 있어야 한다는 이유가 같다.
     assert _resolve_cited(["F001"], store) == [
-        {"episodeNo": 2, "chunkIndex": 0},
-        {"episodeNo": 3, "chunkIndex": 1},
+        {"episodeNo": 2, "chunkIndex": 0, "text": "검날에 금이 갔다."},
+        {"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."},
     ]
 
 
 def test_hallucinated_aliases_are_dropped_and_duplicates_collapse():
     """문서고에 없는 별칭은 버린다 — 지어낸 인용을 내보내면 화면이 없는 자리를 가리킨다."""
     store = _store(
-        {"e-c1": {"eid": "e-c1", "alias": "C001", "chapter": 3, "index": 1, "text": "..."}},
+        {
+            "e-c1": {
+                "eid": "e-c1", "alias": "C001", "chapter": 3, "index": 1,
+                "text": "카엘의 검은 부러졌다.",
+            }
+        },
         {
             "e-f1": {
                 "eid": "e-f1",
@@ -538,7 +561,10 @@ def test_hallucinated_aliases_are_dropped_and_duplicates_collapse():
     )
 
     # C999는 문서고에 없고, F001은 C001과 같은 좌표로 풀린다(중복은 한 번만 남는다).
-    assert _resolve_cited(["C001", "F001", "C999"], store) == [{"episodeNo": 3, "chunkIndex": 1}]
+    # 원문이 붙어도 중복 판정은 좌표로 하므로 같은 조각이 두 벌 실리지 않는다.
+    assert _resolve_cited(["C001", "F001", "C999"], store) == [
+        {"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."}
+    ]
     assert _resolve_cited(["C999", "F999"], store) == []
 
 
@@ -564,6 +590,11 @@ def _evidence_for(claims: list[dict], items_per_claim: list[list[dict]]) -> dict
             for claim, items in zip(claims, items_per_claim)
         ]
     }
+
+
+# 검사 중인 회차의 원고 줄 목록(extract가 돌려주는 것). judge는 판정이 고른 줄 번호를
+# 이 목록으로 되짚어 findings에 원문을 싣는다. 번호는 1-base라 12번 줄은 인덱스 11이다.
+MANUSCRIPT_LINES = [f"{i}번째 줄." for i in range(1, 61)]
 
 
 def test_judge_returns_only_findings_at_or_above_the_threshold(monkeypatch):
@@ -597,21 +628,51 @@ def test_judge_returns_only_findings_at_or_above_the_threshold(monkeypatch):
 
     monkeypatch.setattr(judge_service, "create_completion", _fake_completion)
 
-    findings = asyncio.run(judge_service.judge(claims, evidence))
+    findings = asyncio.run(judge_service.judge(claims, evidence, MANUSCRIPT_LINES))
 
     # 문턱 이상만 남는다. 문턱 **이상**(>=)이라 딱 7점인 P1은 포함된다.
     assert [f["claimId"] for f in findings] == ["P1"]
     assert findings[0]["quote"] == claims[0]["quote"]
     assert findings[0]["axis"] == claims[0]["axis"]
     assert findings[0]["value"] == claims[0]["value"]
-    assert findings[0]["lineIds"] == [12]
+    # 줄 번호에 원문이 붙는다 — 받는 쪽은 이 서버의 줄 분할을 재현할 수 없다.
+    assert findings[0]["lines"] == [{"lineNo": 12, "text": "12번째 줄."}]
     assert findings[0]["isError"] is True
-    assert findings[0]["cited"] == [{"episodeNo": 3, "chunkIndex": 1}]
+    assert findings[0]["cited"] == [
+        {"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."}
+    ]
 
     # 판정은 claim마다 부르지 않고 **한 번의 배치**로 끝난다(문서고를 한 번만 싣는 근거).
     assert len(seen) == 1
     assert seen[0]["prompt_cache_key"] == "detect-judge"
     assert seen[0]["response_format"] == {"type": "json_object"}
+
+
+def test_line_numbers_outside_the_manuscript_are_dropped_not_crashed(monkeypatch):
+    """원고 범위를 벗어난 줄 번호는 조용히 버린다 — 예외도, 없는 자리 인용도 아니다.
+
+    번호는 추출기가 claim에 붙인 후보 줄에서 오므로 원고 길이를 넘을 수 있다. 그대로
+    인덱싱하면 IndexError로 판정 전체가 죽고, 음수는 파이썬 규칙상 **뒤에서부터** 세어
+    엉뚱한 문장을 근거라고 내보낸다. 둘 다 막는다.
+    """
+    claims = [{"quote": "카엘은 검을 뽑았다.", "axis": "카엘의 검 상태", "value": "온전함",
+               "lines": [-1, 0, 2, 999]}]
+    assign_claim_ids(claims)
+    raw = _verdict_json(
+        {"claimId": "P1", "score": ERROR_THRESHOLD, "cited": [], "reason": "r"}
+    )
+
+    async def _fake_completion(**kwargs):
+        return _FakeResponse(raw)
+
+    monkeypatch.setattr(judge_service, "create_completion", _fake_completion)
+
+    findings = asyncio.run(
+        judge_service.judge(claims, _evidence_for(claims, [[]]), ["첫 줄", "둘째 줄"])
+    )
+
+    # 범위 안(2)만 남는다. 0과 음수, 목록보다 큰 번호는 전부 빠진다.
+    assert findings[0]["lines"] == [{"lineNo": 2, "text": "둘째 줄"}]
 
 
 def test_judge_without_claims_calls_no_llm(monkeypatch):
@@ -622,7 +683,7 @@ def test_judge_without_claims_calls_no_llm(monkeypatch):
 
     monkeypatch.setattr(judge_service, "create_completion", _boom)
 
-    assert asyncio.run(judge_service.judge([], {"records": []})) == []
+    assert asyncio.run(judge_service.judge([], {"records": []}, [])) == []
 
 
 def test_retrieve_without_claims_touches_no_graph():
@@ -753,7 +814,7 @@ def test_unreadable_judge_response_raises_instead_of_reporting_zero_errors(monke
     claims = [{"id": "P1", "quote": "q", "axis": "a", "value": "v", "lines": [1]}]
 
     with pytest.raises(RuntimeError, match="판정 응답을 읽지 못했다"):
-        asyncio.run(judge_service.judge(claims, {"records": []}))
+        asyncio.run(judge_service.judge(claims, {"records": []}, []))
 
 
 def test_empty_verdicts_object_also_raises(monkeypatch):
@@ -765,7 +826,7 @@ def test_empty_verdicts_object_also_raises(monkeypatch):
     claims = [{"id": "P1", "quote": "q", "axis": "a", "value": "v", "lines": [1]}]
 
     with pytest.raises(RuntimeError, match="판정 응답을 읽지 못했다"):
-        asyncio.run(judge_service.judge(claims, {"records": []}))
+        asyncio.run(judge_service.judge(claims, {"records": []}, []))
 
 
 # ---------- 검색 스레드풀 ----------

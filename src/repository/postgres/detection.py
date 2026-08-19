@@ -47,7 +47,7 @@ def save_result(job_id: str, claim_count: int, findings: list[dict]) -> None:
             f.get("quote") or "",
             f.get("axis") or "",
             str(f.get("value") or ""),
-            json.dumps(f.get("lineIds") or []),
+            json.dumps(f.get("lines") or []),
             json.dumps(f.get("cited") or []),
             f.get("reason") or "",
             f.get("score"),
@@ -60,7 +60,7 @@ def save_result(job_id: str, claim_count: int, findings: list[dict]) -> None:
             if rows:
                 cur.executemany(
                     "INSERT INTO detection_findings "
-                    "(job_id, seq, quote, axis, value, line_ids, cited, reason, score) "
+                    "(job_id, seq, quote, axis, value, lines, cited, reason, score) "
                     "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     rows,
                 )

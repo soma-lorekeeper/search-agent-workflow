@@ -108,11 +108,16 @@ def parse_verdicts(
 
 
 def _resolve_cited(aliases: list[str], store: dict) -> list[dict]:
-    """문서고 별칭(C001/F003)을 (회차, 조각 번호) 자연키로 바꾼다.
+    """문서고 별칭(C001/F003)을 (회차, 조각 번호) 자연키 + 근거 원문으로 바꾼다.
 
     사실(F###)은 그 사실의 근거 청크로 펼친다 — 화면이 하이라이트할 수 있는 것은 원문
     조각이지 사실 노드가 아니다. 실측상 모든 사실이 근거 청크를 최소 하나 갖고 있어
     이 해소는 비어서 돌아오지 않는다.
+
+    좌표만이 아니라 **원문(text)도 함께 싣는다.** chunkIndex는 이 서버의 KSS 청킹이 매긴
+    번호라, 받는 쪽(Spring)은 그 분할을 재현할 수 없어 몇 번 조각이 어느 문장인지 알
+    방법이 없다. 원문을 붙이면 그 조각을 그대로 보여줄 수 있고, 회차가 나중에 수정돼도
+    판정 당시의 근거가 그대로 남는다.
 
     문서고에 없는 별칭은 버린다. 판정기가 지어낸 인용을 그대로 내보내면 화면이 없는
     자리를 가리키게 된다.
@@ -122,12 +127,12 @@ def _resolve_cited(aliases: list[str], store: dict) -> list[dict]:
 
     by_alias: dict[str, list[tuple]] = {}
     for c in chunks.values():
-        by_alias[c["alias"]] = [(c.get("chapter"), c.get("index"))]
+        by_alias[c["alias"]] = [(c.get("chapter"), c.get("index"), c.get("text"))]
     for f in facts.values():
         # 사실의 evidence는 **청크 eid 목록**이다 — build_docstore가 근거 원문을 청크
         # 사전으로 옮기고 키만 남기기 때문이다. 그 키로 청크를 되짚어야 좌표가 나온다.
         by_alias[f["alias"]] = [
-            (chunks[k].get("chapter"), chunks[k].get("index"))
+            (chunks[k].get("chapter"), chunks[k].get("index"), chunks[k].get("text"))
             for k in (f.get("evidence") or [])
             if k in chunks
         ]
@@ -135,22 +140,27 @@ def _resolve_cited(aliases: list[str], store: dict) -> list[dict]:
     out: list[dict] = []
     seen: set[tuple] = set()
     for alias in aliases:
-        for chapter, index in by_alias.get(alias, []):
+        for chapter, index, text in by_alias.get(alias, []):
             if chapter is None or index is None:
                 continue
+            # 중복 판정은 좌표로만 한다. 같은 조각을 판정기가 C001로도, 그 조각을 근거로
+            # 둔 F003으로도 인용하면 여기로 두 번 들어오는데, 화면에는 한 번만 보여야 한다.
             key = (chapter, index)
             if key in seen:
                 continue
             seen.add(key)
-            out.append({"episodeNo": chapter, "chunkIndex": index})
+            out.append({"episodeNo": chapter, "chunkIndex": index, "text": text or ""})
     return out
 
 
-async def judge(claims: list[dict], evidence: dict) -> list[dict]:
+async def judge(claims: list[dict], evidence: dict, lines: list[str]) -> list[dict]:
     """claim들을 문서고와 대조해 **오류로 판정된 것만** 돌려준다.
 
     한 번의 호출로 전부 판정한다 — 문서고가 한 번만 실리고, 판정기가 claim들 사이의
     관계까지 보면서 판단할 수 있다.
+
+    lines는 검사 중인 회차의 원고 줄 목록(extract가 돌려준 그것)이다. 판정이 고른 줄
+    **번호**를 원문으로 되짚는 데만 쓴다 — 판정 자체에는 관여하지 않는다.
     """
     if not claims:
         return []
@@ -203,7 +213,16 @@ async def judge(claims: list[dict], evidence: dict) -> list[dict]:
                 "quote": claim.get("quote") or "",
                 "axis": claim.get("axis") or "",
                 "value": str(claim.get("value") or ""),
-                "lineIds": v["line_ids"],
+                # 줄 번호를 원문과 함께 싣는다. 번호만 보내면 받는 쪽이 이 서버의 줄
+                # 분할(lines.split_lines)을 재현할 수 없어 91번 줄이 무엇인지 모른다.
+                # 번호는 number_lines가 1부터 매기므로 목록 인덱스로는 -1 한다.
+                # 범위 밖 번호는 버린다 — 문서고에 없는 별칭을 버리는 것과 같은 이유로,
+                # 지어낸 좌표를 내보내면 화면이 없는 자리를 가리킨다.
+                "lines": [
+                    {"lineNo": n, "text": lines[n - 1]}
+                    for n in v["line_ids"]
+                    if 1 <= n <= len(lines)
+                ],
                 "isError": True,
                 "score": v["score"],
                 "reason": v["reason"],
