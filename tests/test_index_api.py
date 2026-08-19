@@ -152,7 +152,9 @@ def test_submit_returns_201_contract(client, stub_indexing, graph):
 def test_empty_episodes_is_400(client, stub_indexing):
     res = _submit(client, [])
     assert res.status_code == 400
-    assert res.json() == {"detail": "episodes must not be empty"}
+    # 에러 본문은 RFC 9457 problem details 다. 모양 자체는 test_error_contract.py 가
+    # 전 경로에 대해 고정하므로, 여기서는 이 조건의 detail 만 확인한다.
+    assert res.json()["detail"] == "episodes must not be empty"
 
 
 def test_missing_text_is_400(client, stub_indexing):

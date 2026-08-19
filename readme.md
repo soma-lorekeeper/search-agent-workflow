@@ -15,7 +15,7 @@ lorekeeper-ai/
 │  ├─ config/                 # .env 로드, 모델·경로 상수
 │  ├─ common/                 # Tenant(소설 격리 키), OpenAI 호출 관문, 토큰 집계
 │  ├─ controller/             # 라우트와 상태 코드만 안다 (health/index/detect/chat)
-│  ├─ dto/                    # 와이어 포맷 (index·detect는 camelCase, chat만 snake_case)
+│  ├─ dto/                    # 와이어 포맷 (전 API 공통 camelCase)
 │  ├─ service/
 │  │  ├─ index/               # 인덱싱 — 작업 큐·워커·TPM + 추출 파이프라인·요약·병합
 │  │  ├─ detect/              # 설정 오류 탐지 — 추출 → 검색 → 판정 3단계
@@ -29,6 +29,7 @@ lorekeeper-ai/
 ├─ docs/
 │  ├─ indexing-api-spec.md    # Indexing API 스펙 (Spring 팀용)
 │  ├─ detecting-api-spec.md   # Detecting API 스펙 (Spring 팀용)
+│  ├─ chatting-api-spec.md    # Chatting API 스펙 (Spring 팀용)
 │  └─ claim-pipeline-eval-result.md  # 파이프라인 확정 근거(실측)
 ├─ data/                      # 원문(저작권상 미커밋)
 ├─ docker-compose.yml         # 로컬 Neo4j 2026.07 + PostgreSQL 17
@@ -135,8 +136,8 @@ curl localhost:8000/api/health | python3 -m json.tool
   "service": "agent",
   "status": "ok",
   "checks": {
-    "neo4j":    { "ok": true, "detail": { "uri": "bolt://..." },  "latency_ms": 10.1 },
-    "postgres": { "ok": true, "detail": { "server": "PostgreSQL 17.10", "target": "host:5432/db" }, "latency_ms": 13.6 }
+    "neo4j":    { "ok": true, "detail": { "uri": "bolt://..." },  "latencyMs": 10.1 },
+    "postgres": { "ok": true, "detail": { "server": "PostgreSQL 17.10", "target": "host:5432/db" }, "latencyMs": 13.6 }
   }
 }
 ```
@@ -158,7 +159,8 @@ curl localhost:8000/api/health | python3 -m json.tool
 
 ## 남은 작업
 
-- **Spring 계약 조율** — 탐지·채팅 요청에 `userId` 추가, 탐지는 camelCase 전환,
+- **Spring 계약 조율** — 탐지·채팅 요청에 `userId` 추가, 전 API가 camelCase로 통일됐다
+  (채팅 응답을 snake_case로 파싱하고 있다면 대응 필요).
   조회 경로가 `/api/detect/jobs/{jobId}`로 옮겨갔고 status 어휘가 대문자가 됐다.
   `detection_findings` 스키마 마이그레이션도 배포 전에 적용돼야 한다
   (`docs/detecting-api-spec.md` 5절).

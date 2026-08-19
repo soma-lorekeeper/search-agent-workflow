@@ -1,14 +1,19 @@
-"""AI 채팅 API의 요청·응답 모델. 이 API만 snake_case를 유지한다."""
+"""AI 채팅 API의 요청·응답 모델. 와이어 포맷은 다른 API와 같은 camelCase다.
 
-from pydantic import BaseModel
+과거에는 이 API만 snake_case를 유지했지만(LOREKEEPER-273에서 전환), 지금은 전 API가
+camelCase 하나로 통일됐다. CamelModel의 populate_by_name=True 덕에 전환 기간에는
+snake_case 입력도 그대로 수용된다 — camelCase는 정본 표기이지 입력 거부가 아니다.
+"""
+
+from src.dto.common import CamelModel
 
 
-class ChatMessage(BaseModel):
+class ChatMessage(CamelModel):
     role: str
     content: str
 
 
-class ChatEditingEpisode(BaseModel):
+class ChatEditingEpisode(CamelModel):
     """작가가 지금 고쳐 쓰고 있는 회차. 본문은 발췌가 아니라 **전문**이다.
 
     number가 없을 수 있다 — API 서버의 DRAFT는 화수가 확정되기 전이라 번호가 null이다.
@@ -20,7 +25,7 @@ class ChatEditingEpisode(BaseModel):
     text: str | None = None
 
 
-class ChatContext(BaseModel):
+class ChatContext(CamelModel):
     """이번 질문의 회차 컨텍스트.
 
     회차에 얽힌 개념은 셋인데 여기 실리는 건 둘뿐이다:
@@ -37,7 +42,7 @@ class ChatContext(BaseModel):
     viewing_episode_number: int | None = None
 
 
-class ChatRequest(BaseModel):
+class ChatRequest(CamelModel):
     # userId × workId가 KG 테넌트다. 인덱싱·탐지와 같은 키여야 같은 그래프를 본다.
     user_id: int
     work_id: int
@@ -46,13 +51,13 @@ class ChatRequest(BaseModel):
     context: ChatContext = ChatContext()
 
 
-class ChatToolCall(BaseModel):
+class ChatToolCall(CamelModel):
     name: str
     summary: str
     status: str
 
 
-class ChatResponse(BaseModel):
+class ChatResponse(CamelModel):
     content: str
     tool_calls: list[ChatToolCall] = []
     suggested_title: str | None = None

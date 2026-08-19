@@ -27,7 +27,9 @@ def _timed(fn):
         "ok": ok,
         "detail": detail,
         "error": error,
-        "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        # 키는 와이어 계약이라 camelCase다(전 API 공통 규칙). health는 DTO 없이 dict를
+        # 그대로 내보내므로 여기서 직접 지킨다.
+        "latencyMs": round((time.monotonic() - started) * 1000, 1),
     }
 
 
