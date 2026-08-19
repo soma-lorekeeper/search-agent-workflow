@@ -171,3 +171,4 @@ curl localhost:8000/api/health | python3 -m json.tool
   수치를 확인하는 편이 좋다.
 - **인덱싱의 이벤트 루프 블로킹** — `indexing()`이 async인데 내부는 동기 드라이버라,
   한 화 인덱싱(약 2분) 동안 서버 전체가 멈춘다. 예전부터 있던 문제다.
+- **프론트 4페이지를 mock에서 실제 API 연결로 전환**
