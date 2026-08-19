@@ -565,15 +565,26 @@ def build_fact_search_retriever(
 # 5) entity_search — 엔티티 정형 조회 (임베딩 없음)
 # ---------------------------------------------------------------------------
 # 쿼리 1: 이름/별칭으로 엔티티를 특정하고 프로필(속성·인물관계·상위 계층)을 낸다.
-#   aliases는 STRING(쉼표 나열)이라 `$name IN e.aliases`로는 못 찾는다 — 그건 리스트 속성일
-#   때의 문법이고, 문자열에 쓰면 부분 문자열 검사가 되어 '강철검제' 같은 별칭이 통째로
-#   누락된다. split+trim으로 원소를 만들어 정확히 비교한다.
+#   aliases는 저장 형식이 **셋이나 공존**한다(실측): 쉼표 나열 STRING, LIST<STRING>,
+#   그리고 리스트 원소 안에 또 쉼표 나열이 든 혼종(["독자님, 독자 씨", "독자님"]).
+#   문자열에 `$name IN e.aliases`를 쓰면 부분 문자열 검사가 되어 별칭이 통째로 누락되고,
+#   배열에 split()을 부르면 TypeError로 **쿼리 전체가 죽는다**(별칭 배열 엔티티가
+#   테넌트에 하나라도 있으면 무엇을 조회하든 실패 — 2026-08-19 E2E 버그③).
+#   그래서 형식을 리스트로 정규화한 뒤 원소마다 다시 split해 평탄화하고 trim으로 정확히
+#   비교한다 — 세 형식이 전부 같은 원소 집합이 된다.
 _ENTITY_PROFILE_QUERY = """
 MATCH (e)
 WHERE (e:Character OR e:Item OR e:Organization OR e:Location)
   AND e.tenant_id = $tenant_id
   AND (e.name = $entity_name
-       OR any(a IN split(coalesce(e.aliases, ''), ',') WHERE trim(a) = $entity_name))
+       OR any(a IN reduce(acc = [],
+                          el IN CASE
+                                  WHEN e.aliases IS NULL THEN []
+                                  WHEN e.aliases IS :: LIST<ANY> THEN e.aliases
+                                  ELSE [e.aliases]
+                                END
+                          | acc + split(toString(el), ','))
+               WHERE trim(a) = $entity_name))
 // 관계 상대. 인물 관계는 직접 간선이 아니라 상태를 거친다:
 //   (e)-[:HAS_STATE]->(rs:CharacterState)-[:ABOUT]->(oc:Character)
 // 상태 이름('진자강의 제자')이 예전 관계 간선의 type 자리를 대신한다 — 그쪽이 '사제' 같은
@@ -710,7 +721,12 @@ class EntitySearchRetriever(Retriever):
 
         line = f"[엔티티] ({label}) {record.get('name')}"
         if record.get("aliases"):
-            line += f" [별칭: {record.get('aliases')}]"
+            aliases = record.get("aliases")
+            # 저장 형식이 리스트/쉼표 문자열 두 가지라(쿼리 1 주석 참고) 표시도 맞춰 준다 —
+            # 리스트를 그대로 f-string에 넣으면 ['독자님', ...] 같은 파이썬 표기가 나간다.
+            if isinstance(aliases, list):
+                aliases = ", ".join(str(a).strip() for a in aliases)
+            line += f" [별칭: {aliases}]"
         if record.get("description"):
             line += f" — {record.get('description')}"
         if related:
