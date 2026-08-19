@@ -1,0 +1,7 @@
+# 테스트 전용 의존성. 운영 이미지에는 깔지 않는다.
+-r requirements.txt
+
+pytest
+# FastAPI의 TestClient가 내부적으로 쓴다. fastapi의 전이 의존성으로 딸려오지만,
+# 테스트가 그 우연에 기대지 않도록 직접 선언한다.
+httpx

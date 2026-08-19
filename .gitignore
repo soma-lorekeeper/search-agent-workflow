@@ -1,12 +1,10 @@
 # 비밀키
 .env
 
-# 소설 원문 (저작권) — requirements.txt는 예외
+# 소설 원문 (저작권) — 의존성 목록은 예외
 *.txt
 !requirements.txt
-
-# 다른 팀원의 별도 레포(클론) — 라이브러리로 import만 하고, 우리 레포엔 커밋하지 않는다
-lorekeeper-poc/
+!requirements-dev.txt
 
 # 가상환경
 .venv/
@@ -21,3 +19,14 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# IDE
+.idea/
+
+# 클로드 로컬 설정 (개인 권한 설정 — 팀 공유 대상 아님)
+.claude/settings.local.json
+
+# 평가 하네스 아티팩트 — LLM 응답 캐시·리포트라 수백 MB. 재실행으로 재생성 가능
+data/eval_claims/
+data/eval_retrieval/
+scratchpad_uvicorn.log

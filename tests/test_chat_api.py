@@ -11,22 +11,17 @@ LLM·Neo4j·PostgreSQL은 전부 스텁이라 실제 비용이 들지 않는다.
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
-from src import webapp
-from src.chat import agent as chat_agent
-from src.chat import kg_scope
-from src.chat.tools import ChatTool, build_chat_tools
-
-# KG에 인덱싱돼 있다고 보는 작품. 실제 값은 환경변수라서 테스트에서 고정한다.
-WORK_ID = 1
-OTHER_WORK_ID = WORK_ID + 1
+from src import app as app_module
+from src.service.chat import agent as chat_agent
 
 # ---------- /api/chat 요청 계약 ----------
+# 와이어 포맷은 전 API 공통으로 camelCase다. 아래 captured[...] assert들은 wire가 아니라
+# 컨트롤러가 서비스에 넘기는 파이썬 kwargs(내부 계약)라 snake_case가 맞다.
 
 
 @pytest.fixture
@@ -38,51 +33,33 @@ def captured_chat(monkeypatch):
         captured.update(kwargs)
         return {"content": "답", "tool_calls": [], "suggested_title": None}
 
-    monkeypatch.setattr(webapp, "run_chat", _stub)
-    monkeypatch.setattr(kg_scope, "KG_INDEXED_WORK_ID", WORK_ID)
-    with TestClient(webapp.app) as client:
+    # 컨트롤러가 agent 모듈을 통해 부르므로(agent.run_chat), 이름을 심을 곳도 agent 모듈이다.
+    monkeypatch.setattr(chat_agent, "run_chat", _stub)
+    with TestClient(app_module.app) as client:
         yield client, captured
 
 
-def test_chat_다른_작품의_질문은_400이다(captured_chat):
-    """KG에 작품 격리가 없어서, 다른 작품으로 물으면 남의 작품 그래프로 답하게 된다.
-
-    답이 그럴듯해 보이는 게 특히 나쁘다 — 작가는 자기 작품 설정으로 알고 그걸 근거로 글을 쓴다.
-    """
-    client, captured = captured_chat
-
-    response = client.post(
-        "/api/chat",
-        json={
-            "work_id": OTHER_WORK_ID,
-            "session_id": 7,
-            "messages": [{"role": "user", "content": "주인공이 누구야?"}],
-        },
-    )
-
-    assert response.status_code == 400
-    detail = response.json()["detail"]
-    assert str(OTHER_WORK_ID) in detail and str(WORK_ID) in detail
-    assert captured == {}  # 에이전트를 부르지도 않는다(LLM 비용 0)
-
-
 def test_chat_받은_회차_컨텍스트를_그대로_에이전트에_넘긴다(captured_chat):
+    """user_id × work_id는 KG 테넌트라 반드시 함께 에이전트로 내려가야 한다 —
+    둘 중 하나만 가면 남의 작품 그래프를 읽는다."""
     client, captured = captured_chat
 
     response = client.post(
         "/api/chat",
         json={
-            "work_id": 1,
-            "session_id": 7,
+            "userId": 42,
+            "workId": 1,
+            "sessionId": 7,
             "messages": [{"role": "user", "content": "이번 화 어때?"}],
             "context": {
-                "editing_episode": {"number": 5, "title": "결전", "text": "전문 원고"},
-                "viewing_episode_number": 3,
+                "editingEpisode": {"number": 5, "title": "결전", "text": "전문 원고"},
+                "viewingEpisodeNumber": 3,
             },
         },
     )
 
     assert response.status_code == 200
+    assert captured["user_id"] == 42
     assert captured["work_id"] == 1
     assert captured["session_id"] == 7
     assert captured["context"] == {
@@ -97,7 +74,12 @@ def test_chat_컨텍스트가_없어도_받는다(captured_chat):
 
     response = client.post(
         "/api/chat",
-        json={"work_id": 1, "session_id": 7, "messages": [{"role": "user", "content": "안녕"}]},
+        json={
+            "userId": 42,
+            "workId": 1,
+            "sessionId": 7,
+            "messages": [{"role": "user", "content": "안녕"}],
+        },
     )
 
     assert response.status_code == 200
@@ -111,10 +93,11 @@ def test_chat_집필_중인_회차의_화수는_없을_수_있다(captured_chat)
     response = client.post(
         "/api/chat",
         json={
-            "work_id": 1,
-            "session_id": 7,
+            "userId": 42,
+            "workId": 1,
+            "sessionId": 7,
             "messages": [{"role": "user", "content": "안녕"}],
-            "context": {"editing_episode": {"number": None, "title": "새 회차", "text": ""}},
+            "context": {"editingEpisode": {"number": None, "title": "새 회차", "text": ""}},
         },
     )
 
@@ -130,15 +113,76 @@ def test_chat_인덱싱된_회차는_요청으로_받지_않는다(captured_chat
     response = client.post(
         "/api/chat",
         json={
-            "work_id": 1,
-            "session_id": 7,
+            "userId": 42,
+            "workId": 1,
+            "sessionId": 7,
             "messages": [{"role": "user", "content": "안녕"}],
-            "context": {"indexed_episodes": [1, 2, 3], "viewing_episode_number": 2},
+            "context": {"indexedEpisodes": [1, 2, 3], "viewingEpisodeNumber": 2},
         },
     )
 
     assert response.status_code == 200
+    # 계약에 없는 필드는 어느 표기로도 컨텍스트에 실리지 않는다.
     assert "indexed_episodes" not in captured["context"]
+    assert "indexedEpisodes" not in captured["context"]
+
+
+# ---------- 와이어 포맷: 응답 키가 전부 camelCase인가 ----------
+
+
+def _snake_keys(value) -> list[str]:
+    """응답 JSON을 재귀 순회해 `_`가 들어간 키를 모은다 — 비면 camelCase 계약 준수다."""
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            if "_" in key:
+                found.append(key)
+            found.extend(_snake_keys(inner))
+    elif isinstance(value, list):
+        for inner in value:
+            found.extend(_snake_keys(inner))
+    return found
+
+
+def test_chat_응답_키는_camelCase다(monkeypatch):
+    """서비스가 내부 계약(snake_case dict)으로 결과를 줘도 wire에는 camelCase로 나가야 한다.
+    tool_calls가 비어 있으면 중첩 키 직렬화를 못 보므로 한 건 채워서 확인한다."""
+
+    async def _stub(**kwargs):
+        return {
+            "content": "답",
+            "tool_calls": [{"name": "hybrid_search", "summary": "검색함", "status": "DONE"}],
+            "suggested_title": "제목",
+        }
+
+    monkeypatch.setattr(chat_agent, "run_chat", _stub)
+    with TestClient(app_module.app) as client:
+        response = client.post(
+            "/api/chat",
+            json={
+                "userId": 42,
+                "workId": 1,
+                "sessionId": 7,
+                "messages": [{"role": "user", "content": "안녕"}],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["toolCalls"] == [{"name": "hybrid_search", "summary": "검색함", "status": "DONE"}]
+    assert body["suggestedTitle"] == "제목"
+    assert _snake_keys(body) == []
+
+
+def test_health_점검_결과_키는_camelCase다():
+    """health는 DTO 없이 dict를 그대로 내보내므로 alias 변환이 없다 — 점검 결과를 만드는
+    _timed가 키를 직접 camelCase로 지켜야 한다(실제 DB 없이 그 지점만 검증)."""
+    from src.service import health_service
+
+    result = health_service._timed(lambda: {"uri": "bolt://x"})
+
+    assert "latencyMs" in result
+    assert _snake_keys(result) == []
 
 
 # ---------- 시스템 프롬프트: 세 개념이 각각 다르게 제시되는가 ----------
@@ -184,7 +228,7 @@ def test_프롬프트_원고에_중괄호가_있어도_치환이_깨지지_않�
     )
 
     assert "그는 {tool_guide}라고 적었다." in prompt
-    assert "kg_vector_search" in prompt  # 진짜 도구 가이드는 제대로 채워졌다
+    assert "hybrid_search" in prompt  # 진짜 도구 가이드는 제대로 채워졌다
 
 
 def test_프롬프트_인덱싱_안_된_회차는_조회_불가라고_못_박는다():
@@ -240,30 +284,36 @@ def test_프롬프트_보고_있는_회차가_집필_중인_회차와_같으면_
 
 @pytest.fixture
 def stub_llm(monkeypatch):
-    """LLM 호출을 가로채 시스템 프롬프트를 기록한다(실제 API 호출 없음)."""
-    seen: list[list[dict]] = []
+    """LLM 호출을 가로채 요청 kwargs를 기록한다(실제 API 호출 없음).
+
+    채팅은 responses API를 쓰므로 가짜 응답도 그 형상(id/output/output_text)을 흉내낸다 —
+    output이 비면 도구 호출이 없다는 뜻이고 output_text가 최종 답변이다.
+    """
+    seen: list[dict] = []
 
     async def _stub(**kwargs):
-        seen.append(kwargs["messages"])
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="답변", tool_calls=None))]
-        )
+        seen.append(kwargs)
+        return SimpleNamespace(id="resp_test", output=[], output_text="답변")
 
-    monkeypatch.setattr(chat_agent, "_create_with_retry", _stub)
+    # 채팅이 자기 클라이언트를 들고 있던 시절에는 `_create_with_retry`를 막았다. 지금은
+    # 공용 관문(src/common/openai_client.create_response)을 쓰므로 그 이름을 막는다 —
+    # agent 모듈에 바인딩된 이름이라 다른 서비스(extract_service 등)와 방식이 같다.
+    monkeypatch.setattr(chat_agent, "create_response", _stub)
     return seen
 
 
 def test_run_chat_인덱싱된_회차를_요청이_아니라_그래프에서_읽는다(monkeypatch, stub_llm):
-    calls: list[int] = []
+    calls: list[tuple[int, int]] = []
 
-    def _fake_fetch(work_id: int) -> list[int]:
-        calls.append(work_id)
+    def _fake_fetch(user_id: int, work_id: int) -> list[int]:
+        calls.append((user_id, work_id))
         return [1, 2]
 
     monkeypatch.setattr(chat_agent, "fetch_indexed_episodes", _fake_fetch)
 
     result = asyncio.run(
         chat_agent.run_chat(
+            user_id=4,
             work_id=9,
             session_id=1,
             messages=[
@@ -279,10 +329,10 @@ def test_run_chat_인덱싱된_회차를_요청이_아니라_그래프에서_읽
     )
 
     assert result["content"] == "답변"
-    # 요청이 아니라 그래프에 물었고, 그 대상은 요청의 work_id다.
-    assert calls == [9]
+    # 요청이 아니라 그래프에 물었고, 그 대상은 요청의 테넌트(user_id × work_id)다.
+    assert calls == [(4, 9)]
 
-    system_prompt = stub_llm[0][0]["content"]
+    system_prompt = stub_llm[0]["input"][0]["content"]
     assert "1화, 2화" in system_prompt
     assert "원고 전문입니다" in system_prompt
     assert "1화를 화면에 열어 두고 있다" in system_prompt
@@ -290,10 +340,11 @@ def test_run_chat_인덱싱된_회차를_요청이_아니라_그래프에서_읽
 
 def test_run_chat_그래프_조회가_실패해도_대화는_계속된다(monkeypatch, stub_llm):
     """fetch가 빈 리스트를 돌려주는 상황(그래프 다운) — 죽지 않고 "조회 불가"로 답하게 만든다."""
-    monkeypatch.setattr(chat_agent, "fetch_indexed_episodes", lambda work_id: [])
+    monkeypatch.setattr(chat_agent, "fetch_indexed_episodes", lambda user_id, work_id: [])
 
     result = asyncio.run(
         chat_agent.run_chat(
+            user_id=42,
             work_id=1,
             session_id=1,
             messages=[
@@ -306,211 +357,33 @@ def test_run_chat_그래프_조회가_실패해도_대화는_계속된다(monkey
     )
 
     assert result["content"] == "답변"
-    assert "하나도 없다" in stub_llm[0][0]["content"]
+    assert "하나도 없다" in stub_llm[0]["input"][0]["content"]
 
 
-# ---------- 에이전트 루프(LangGraph)의 통제 장치 ----------
-# 여기부터는 "루프가 무엇을 절대 하지 않는가"를 검사한다. 구현이 손수 루프에서 그래프로
-# 바뀌어도 아래 성질은 그대로여야 한다 — 이건 구조가 아니라 안전장치에 대한 계약이다.
+def test_run_chat_요청이_responses_계약을_지킨다(monkeypatch, stub_llm):
+    """luna 500 회귀(버그②) 방지의 핵심 계약 — 채팅은 responses API로 나가며
+    추론 강도 high를 명시하고, tools는 responses의 평탄형 스키마여야 한다."""
+    monkeypatch.setattr(chat_agent, "fetch_indexed_episodes", lambda user_id, work_id: [1])
 
-
-def _tool_call(name: str, arguments: dict, call_id: str = "call_1") -> SimpleNamespace:
-    """OpenAI 응답의 tool_call 한 건(모델이 도구를 부르겠다고 말한 모양)."""
-    return SimpleNamespace(
-        id=call_id,
-        function=SimpleNamespace(name=name, arguments=json.dumps(arguments, ensure_ascii=False)),
-    )
-
-
-def _response(content: str | None = None, tool_calls: list | None = None) -> SimpleNamespace:
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))]
-    )
-
-
-@pytest.fixture
-def loop_harness(monkeypatch):
-    """도구 1종짜리 가짜 레지스트리 + LLM 스텁을 끼운다.
-
-    반환: (seen_kwargs, tool_runs, set_replies) — 모델에 실제로 넘어간 요청 kwargs 목록,
-    도구가 실행된 인자 목록, 그리고 턴별 응답을 지정하는 함수.
-    """
-    seen: list[dict] = []
-    runs: list[tuple] = []
-    replies: list[SimpleNamespace] = []
-
-    def _run(work_id: int, query_text: str = "") -> tuple[str, str]:
-        runs.append((work_id, query_text))
-        return f"결과({query_text})", f"가짜 조회 · {query_text}"
-
-    fake_tool = ChatTool(
-        name="fake_search",
-        description="테스트용 도구",
-        parameters={
-            "type": "object",
-            "properties": {"query_text": {"type": "string"}},
-            "required": ["query_text"],
-        },
-        run=_run,
-    )
-    schemas = [
-        {
-            "type": "function",
-            "function": {
-                "name": fake_tool.name,
-                "description": fake_tool.description,
-                "parameters": fake_tool.parameters,
-            },
-        }
-    ]
-
-    async def _stub(**kwargs):
-        seen.append(kwargs)
-        # 지정된 응답이 떨어지면 마지막 응답을 계속 반복한다(예산·턴 상한 검사용).
-        return replies[len(seen) - 1] if len(seen) <= len(replies) else replies[-1]
-
-    monkeypatch.setattr(chat_agent, "build_chat_tools", lambda: (schemas, {fake_tool.name: fake_tool}))
-    monkeypatch.setattr(chat_agent, "fetch_indexed_episodes", lambda work_id: [1, 2])
-    monkeypatch.setattr(chat_agent, "_create_with_retry", _stub)
-
-    def set_replies(*responses: SimpleNamespace) -> None:
-        replies.extend(responses)
-
-    return seen, runs, set_replies
-
-
-def _run_one_turn(work_id: int = 1) -> dict:
-    return asyncio.run(
+    asyncio.run(
         chat_agent.run_chat(
-            work_id=work_id,
+            user_id=1,
+            work_id=1,
             session_id=1,
-            # 첫 턴이 아니게 만들어 제목 생성 호출이 끼어들지 않게 한다(루프만 검사한다).
             messages=[
                 {"role": "user", "content": "안녕"},
                 {"role": "assistant", "content": "네"},
-                {"role": "user", "content": "카엘 상태 알려줘"},
+                {"role": "user", "content": "1화 요약"},
             ],
             context=None,
         )
     )
 
-
-def test_예산을_다_쓰면_도구_목록_자체를_보내지_않는다(loop_harness):
-    """예산 소진은 "부르지 마라"는 부탁이 아니라 **부를 수단을 없애는 것**이어야 한다.
-
-    프롬프트로만 말리면 모델은 태연히 계속 부른다. tools 파라미터가 요청에서 빠져야
-    부를 방법 자체가 사라진다.
-    """
-    seen, runs, set_replies = loop_harness
-    # 모델이 매 턴 도구를 부르려 든다(예산이 끝나도 멈추지 않는 최악의 경우).
-    set_replies(_response(tool_calls=[_tool_call("fake_search", {"query_text": "카엘"})]))
-
-    result = _run_one_turn()
-
-    # 1) 예산(5회)만큼만 tools가 실려 나가고, 그 뒤로는 아예 빠진다.
-    with_tools = [i for i, kwargs in enumerate(seen) if "tools" in kwargs]
-    assert with_tools == [0, 1, 2, 3, 4]
-    assert all("tool_choice" not in kwargs for kwargs in seen[chat_agent.MAX_TOOL_CALLS :])
-    # 2) 도구는 예산 횟수만큼만 실제로 실행된다.
-    assert len(runs) == chat_agent.MAX_TOOL_CALLS
-    assert len(result["tool_calls"]) == chat_agent.MAX_TOOL_CALLS
-    # 3) 턴 상한은 예산과 별개의 안전판이다 — 예산이 0이 된 뒤로도 모델이 계속 도구를
-    #    부르려 하지만 MAX_TURNS에서 끊긴다.
-    assert len(seen) == chat_agent.MAX_TURNS
-    assert "시간이 너무 오래 걸렸" in result["content"]
-    # 4) 예산 초과 호출도 tool 메시지로 답을 돌려준다(안 돌려주면 다음 요청이 400이 된다).
-    over_budget = [
-        m
-        for kwargs in seen
-        for m in kwargs["messages"]
-        if m.get("role") == "tool" and "예산" in m["content"]
-    ]
-    assert over_budget
-
-
-def test_병렬_도구_호출은_꺼둔다(loop_harness):
-    """예산 회계를 정확히 유지하려고 한 번에 하나씩만 부르게 한다."""
-    seen, _runs, set_replies = loop_harness
-    set_replies(_response(content="답변"))
-
-    _run_one_turn()
-
-    assert seen[0]["parallel_tool_calls"] is False
-
-
-def test_도구가_실패해도_대화는_끝나지_않는다(loop_harness, monkeypatch):
-    """도구 실패는 "근거 부족"이지 대화의 끝이 아니다.
-
-    오류 문자열을 도구 결과로 돌려줘야 모델이 "확인하지 못했다"고 답할 수 있다. 예외를 그대로
-    올리면 작가에게는 답변 대신 에러 말풍선만 남는다.
-    """
-    seen, _runs, set_replies = loop_harness
-
-    def _boom(work_id: int, query_text: str = "") -> tuple[str, str]:
-        raise RuntimeError("Neo4j 연결 실패")
-
-    schemas, _ = chat_agent.build_chat_tools()  # loop_harness가 끼운 가짜 스키마
-    monkeypatch.setattr(
-        chat_agent,
-        "build_chat_tools",
-        lambda: (schemas, {"fake_search": ChatTool("fake_search", "d", {}, _boom)}),
-    )
-    set_replies(
-        _response(tool_calls=[_tool_call("fake_search", {"query_text": "카엘"})]),
-        _response(content="확인하지 못했습니다."),
-    )
-
-    result = _run_one_turn()
-
-    # 1) 대화는 정상 종료되고 모델은 한 번 더 답할 기회를 얻는다.
-    assert result["content"] == "확인하지 못했습니다."
-    # 2) 실패는 UI에 FAILED로 남는다(무엇을 찾다 실패했는지 작가가 봐야 한다).
-    assert result["tool_calls"] == [
-        {"name": "fake_search", "summary": "fake_search 조회 실패", "status": "FAILED"}
-    ]
-    # 3) 오류 문자열이 도구 결과로 모델에게 전달된다.
-    tool_messages = [m for m in seen[1]["messages"] if m.get("role") == "tool"]
-    assert "도구 실행 오류: Neo4j 연결 실패" in tool_messages[0]["content"]
-
-
-def test_work_id는_스키마에_없지만_도구에는_전달된다(loop_harness):
-    """조회 대상 작품은 서버가 정하는 값이지 모델이 고를 값이 아니다.
-
-    스키마에 넣으면 모델이 작품 번호를 지어내 남의 작품을 읽으려 드는 경로가 생긴다.
-    그래서 모델에게는 감추고, 실행 시점에 요청의 값을 주입한다.
-    """
-    _seen, runs, set_replies = loop_harness
-    set_replies(
-        _response(tool_calls=[_tool_call("fake_search", {"query_text": "카엘"})]),
-        _response(content="답변"),
-    )
-
-    result = _run_one_turn(work_id=42)
-
-    assert result["tool_calls"][0]["status"] == "DONE"
-    assert runs == [(42, "카엘")]  # 모델이 준 인자에는 없던 work_id가 실행 시점에 주입됐다
-
-
-def test_실제_도구_스키마에는_work_id가_없다():
-    """가짜 도구가 아니라 진짜 6종 스키마에 대한 검사 — 모델이 볼 수 있는 전체 표면을 훑는다."""
-    schemas, tools = build_chat_tools()
-
-    assert "work_id" not in json.dumps(schemas, ensure_ascii=False)
-    # 반대로 실행기는 전부 work_id를 첫 인자로 받는다(작품 격리 전제를 인터페이스에 박아둔 것).
-    for tool in tools.values():
-        assert tool.run.__code__.co_varnames[0] == "work_id"
-
-
-def test_모델이_work_id를_지어내도_주입값을_덮어쓰지_못한다(loop_harness):
-    """스키마에 없어도 모델은 없는 인자를 만들어 낼 수 있다 — 그때 조용히 먹히면 안 된다."""
-    _seen, runs, set_replies = loop_harness
-    set_replies(
-        _response(tool_calls=[_tool_call("fake_search", {"query_text": "카엘", "work_id": 999})]),
-        _response(content="확인하지 못했습니다."),
-    )
-
-    result = _run_one_turn(work_id=1)
-
-    # 위조된 work_id로 실행되는 대신 호출이 실패하고, 대화는 계속된다.
-    assert runs == []
-    assert result["tool_calls"][0]["status"] == "FAILED"
+    kwargs = stub_llm[0]
+    assert kwargs["reasoning"] == {"effort": "high"}
+    assert "messages" not in kwargs and "input" in kwargs
+    # 평탄형: chat.completions의 중첩({"function": {...}})이 아니어야 한다.
+    first_tool = kwargs["tools"][0]
+    assert "function" not in first_tool
+    assert first_tool["name"] in {"hybrid_search", "fact_search", "entity_search",
+                                  "episode_manuscript", "work_settings"}

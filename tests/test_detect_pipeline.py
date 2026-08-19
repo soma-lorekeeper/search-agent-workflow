@@ -1,173 +1,909 @@
-"""설정 오류 탐지 파이프라인의 "회차 상한" 테스트.
+"""설정 오류 탐지 파이프라인의 단위 계약 테스트.
 
-검사 대상이 N화면 대조 기준은 N화 **직전**까지의 세계관이어야 한다. 상한이 없으면 두 가지가
-동시에 망가진다: N화를 N화 자신이 만든 사실과 대조해 "일치"라고 자평하고, 아직 나오지 않은
-N+1화 이후의 반전을 N화에 심어둔 모순으로 읽는다.
+**LLM·Neo4j·PostgreSQL을 부르지 않는다.** LLM이 필요한 자리는 유일한 관문인
+`create_completion`을 가짜로 바꿔 고정 JSON을 돌려주고, 그래프가 필요한 자리는 검색
+도구·검색 결과를 가짜 객체로 넣는다.
 
-Neo4j 드라이버는 가짜로 갈아끼운다(LLM·DB 비용 없음). 그래프 덤프 렌더러만은 진짜
-lorekeeper.context.dump_graph_text를 그대로 태워, 걸러낸 레코드로도 렌더가 깨지지 않는지까지
-함께 본다(관계 한쪽 끝만 사라지면 렌더러가 KeyError로 죽는다).
+여기 모인 것은 전부 **"틀려도 예외가 안 나는" 계약**이다. 줄 번호가 조각마다 1로 돌아가도,
+claim 번호가 뒤섞여도, 회차 상한이 반대로 걸려도, 폴백이 조용히 0점을 채워도 응답은
+멀쩡한 모양으로 나온다 — 그리고 작가는 그 그럴듯한 오답을 믿고 원고를 고친다. 그래서
+값 자체를 못박는다.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 
 import pytest
 
-from src.contradiction import pipeline
+from src.common.tenant import Tenant
+from src.service.detect import (
+    entity_nodes,
+    extract_service,
+    judge_service,
+    retrieve_service,
+    routing,
+)
+from src.service.detect.extract_service import CHUNK_SIZE, _cap_for, _chunk, assign_claim_ids
+from src.service.detect.judge_service import ERROR_THRESHOLD, _resolve_cited, parse_verdicts
+from src.service.detect.lines import number_lines, split_lines
+from src.service.detect.retrieve_service import TOP_K, _is_future, _norm, _retrieve_one
+from src.service.detect.routing import route_qav
 
-# --- 가짜 그래프: 3화의 사건 하나와 7화의 사건·상태 하나, 그리고 둘 다에 등장하는 인물 하나 ---
-NODE_RECORDS = [
-    {"id": "c1", "labels": ["Character", "__Entity__"], "props": {"name": "카엘"}},
-    {"id": "e3", "labels": ["Event"], "props": {"name": "카엘이 부상당한다", "chapter": 3.0}},
-    {"id": "e7", "labels": ["Event"], "props": {"name": "카엘이 죽는다", "chapter": 7.0}},
-    {"id": "s7", "labels": ["CharacterState"], "props": {"name": "사망"}},
-]
-REL_RECORDS = [
-    {"s": "c1", "t": "APPEARS_IN", "e": "e3", "props": {}},
-    {"s": "c1", "t": "APPEARS_IN", "e": "e7", "props": {}},
-    {"s": "c1", "t": "HAS_STATE", "e": "s7", "props": {}},
-    {"s": "s7", "t": "ESTABLISHED_IN", "e": "e7", "props": {}},
-]
-CHAPTER_SUMMARIES = [
-    {"number": 3, "summary": "카엘이 부상당한다."},
-    {"number": 5, "summary": "카엘이 검을 든다."},
-    {"number": 7, "summary": "카엘이 죽는다."},
-]
-# 5화 상한에서 걸러져야 할 노드 — 실제로는 _FUTURE_NODES_CYPHER가 그래프에서 뽑는다.
-FUTURE_IDS = [{"id": "e7"}, {"id": "s7"}]
+TENANT = Tenant.of(42, 1)
+
+# 조각이 두 개 이상 나오도록 CHUNK_SIZE(3000자)를 넘기는 원고. 문장이 마침표로 끝나서
+# kss가 문장 단위로 자르고, 문장 안에 순번이 박혀 있어 줄 번호와 내용을 대조할 수 있다.
+LONG_TEXT = "".join(
+    f"{i}번 장면에서 카엘은 낡은 검을 고쳐 쥐고 북쪽 성문을 향해 천천히 걸어갔다. "
+    for i in range(1, 101)
+)
+
+_L_PREFIX = re.compile(r"^L(\d+): ")
 
 
-class FakeDriver:
-    """dump_graph_text·load_summaries·파이프라인 쿼리에 정해진 레코드를 돌려주는 가짜 드라이버.
+# ---------------------------------------------------------------------------
+# LLM 관문을 대신할 가짜들
+# ---------------------------------------------------------------------------
 
-    어떤 쿼리인지는 그 쿼리에만 있는 조각으로 알아본다. 받은 파라미터를 그대로 기록해서,
-    회차 상한이 실제로 쿼리까지 내려갔는지 테스트가 확인할 수 있게 한다.
+
+class _FakeResponse:
+    """chat.completions 응답 흉내. `.choices[0].message.content`만 있으면 충분하다.
+
+    usage는 두지 않는다 — `usage.from_response`가 usage 없는 응답을 0으로 처리하므로
+    토큰 집계는 이 파일의 관심사에서 빠진다.
     """
 
-    def __init__(self):
-        self.calls: list[tuple[str, dict | None]] = []
-        self.closed = False
-
-    def execute_query(self, query, parameters_=None, database_=None, **kwargs):
-        self.calls.append((query, parameters_))
-        if "coalesce(n.chapter" in query:  # _FUTURE_NODES_CYPHER
-            return FUTURE_IDS, None, None
-        if "labels(n) AS labels" in query:  # 덤프: 노드
-            return list(NODE_RECORDS), None, None
-        if "type(rel) AS t" in query:  # 덤프: 관계
-            return list(REL_RECORDS), None, None
-        if "MATCH (s:CharacterState)" in query:  # 덤프: 상태의 성립 회차
-            return [{"id": "s7", "chapter": 7.0}], None, None
-        if "s:Story" in query:  # 전역 요약
-            return [{"summary": "전역 요약(7화까지 반영됨)"}], None, None
-        if "$up_to_chapter" in query:  # 우리 쪽 회차 요약(상한 적용 대상)
-            up_to = (parameters_ or {}).get("up_to_chapter")
-            rows = [r for r in CHAPTER_SUMMARIES if up_to is None or r["number"] < up_to]
-            return rows, None, None
-        if "LIMIT $window" in query:  # lorekeeper의 최근 회차 요약(파이프라인은 쓰지 않는다)
-            return [], None, None
-        raise AssertionError(f"예상하지 못한 쿼리: {query}")
-
-    def close(self):
-        self.closed = True
+    def __init__(self, content: str):
+        message = type("_M", (), {"content": content})()
+        self.choices = [type("_C", (), {"message": message})()]
 
 
-@pytest.fixture
-def fake_driver(monkeypatch):
-    driver = FakeDriver()
-    monkeypatch.setattr(pipeline, "get_driver", lambda: driver)
-    return driver
+class _FakeItem:
+    """retriever가 돌려주는 결과 항목 하나(neo4j_graphrag RetrieverResultItem 흉내)."""
+
+    def __init__(self, content: str, metadata: dict):
+        self.content = content
+        self.metadata = metadata
 
 
-# ---------- 상한이 걸린 배경 컨텍스트 ----------
+class _FakeTool:
+    """검색 도구 하나. 호출 인자를 기록하고 정해진 항목을 그대로 돌려준다."""
+
+    def __init__(self, items: list[_FakeItem]):
+        self._items = items
+        self.calls: list[dict] = []
+
+    def execute(self, **kwargs):
+        self.calls.append(kwargs)
+        return type("_R", (), {"items": list(self._items)})()
 
 
-def test_bounded_context_drops_future_chapters(fake_driver):
-    context = pipeline.background_context(up_to_chapter=5)
-
-    # 그래프: 3화 사건은 남고, 7화 사건과 거기서 성립한 상태는 사라진다.
-    assert "카엘이 부상당한다" in context
-    assert "카엘이 죽는다" not in context
-    assert "사망" not in context
-    # 인물 자체는 남는다 — 3화에 이미 나온 인물을 지우면 배경이 오히려 틀린다.
-    assert "카엘" in context
-
-    # 회차 요약: 5화 자신과 그 뒤(7화)는 빠진다. 자기 자신과 대조하면 늘 "일치"가 나온다.
-    assert "[3화]" in context
-    assert "[5화]" not in context
-    assert "[7화]" not in context
-
-    # 전역 요약은 전 회차를 한 문자열로 압축한 것이라 뒷부분만 덜어낼 수 없다 — 통째로 뺀다.
-    assert "전역 요약" not in context
+def _chunk_meta(eid: str, chapter: int, index: int, text: str) -> dict:
+    """hybrid_search가 청크를 물어왔을 때의 metadata 모양."""
+    return {"eid": eid, "kind": "chunk", "chapter": chapter, "chunk_index": index, "text": text}
 
 
-def test_bound_reaches_the_queries(fake_driver):
-    pipeline.background_context(up_to_chapter=5)
-    params = [p for q, p in fake_driver.calls if "coalesce(n.chapter" in q]
-    assert params == [{"up_to_chapter": 5}]
-    params = [p for q, p in fake_driver.calls if "c.summary IS NOT NULL" in q]
-    assert params == [{"up_to_chapter": 5}]
-    assert fake_driver.closed
+# ---------------------------------------------------------------------------
+# 1. 줄 번호는 원고 전역에 한 번만 부여된다
+# ---------------------------------------------------------------------------
 
 
-def test_unbounded_context_is_unchanged(fake_driver):
-    """회차 번호를 모르는 호출(CLI)은 예전 그대로 그래프 전체를 배경으로 쓴다."""
-    context = pipeline.background_context()
+def test_line_numbers_continue_across_chunks():
+    """조각을 나눠도 L번호는 원고 전역으로 이어져야 한다.
 
-    assert "카엘이 죽는다" in context
-    assert "전역 요약(7화까지 반영됨)" in context
-    assert "[3화]" in context and "[5화]" in context and "[7화]" in context
+    조각마다 1부터 다시 매기면 조각 2의 L5와 조각 1의 L5가 같은 이름이 된다. 그러면 합친
+    뒤에는 claim이 가리키는 줄을 특정할 수 없고, 화면은 엉뚱한 문장에 하이라이트를 건다.
+    예외는 나지 않는다 — 그냥 다른 문장이 빨갛게 칠해질 뿐이다.
+    """
+    units = _chunk(LONG_TEXT)
+    assert len(units) >= 2, "이 테스트는 조각이 둘 이상이어야 의미가 있다"
+
+    # 조각을 순서대로 이으면 L1부터 빠짐도 겹침도 없이 이어져야 한다.
+    numbers = [int(_L_PREFIX.match(line).group(1)) for u in units for line in u.split("\n")]
+    assert numbers == list(range(1, len(numbers) + 1))
+
+    # 둘째 조각의 첫 줄이 L1이면 조각마다 번호를 다시 매긴 것이다.
+    assert int(_L_PREFIX.match(units[1].split("\n")[0]).group(1)) > 1
 
 
-# ---------- 상한 드라이버 자체 ----------
+def test_chunk_boundaries_never_cut_a_line_in_half():
+    """경계는 줄에서만 끊는다 — 문장 중간에서 자르면 추출기가 반쪽 문장을 claim으로 뽑는다."""
+    lines = split_lines(LONG_TEXT)
+    numbered = number_lines(lines).split("\n")
+
+    produced = [line for u in _chunk(LONG_TEXT) for line in u.split("\n")]
+    # 조각들이 내놓은 줄이 전역 번호 매김의 줄과 **문자열 단위로 같아야** 한다.
+    assert produced == numbered
 
 
-def test_bounded_driver_drops_relationships_touching_removed_nodes(fake_driver):
-    """관계 한쪽 끝만 걸러내고 관계를 남기면 덤프 렌더러가 없는 노드를 찾다 죽는다."""
-    bounded = pipeline._ChapterBoundedDriver(fake_driver, "neo4j", 5)
+def test_a_single_line_longer_than_the_chunk_still_produces_one_chunk():
+    """한 줄이 조각 크기보다 길어도 빈 조각을 만들지 않는다(첫 줄은 무조건 담는다)."""
+    units = _chunk("가" * (CHUNK_SIZE + 500))
+    assert units and all(u.strip() for u in units)
 
-    nodes, _, _ = bounded.execute_query(
-        "MATCH (n) RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props"
+
+# ---------------------------------------------------------------------------
+# 2. 추출 상한은 설정값으로 계산한다(프롬프트 캐시가 깨지지 않는 근거)
+# ---------------------------------------------------------------------------
+
+
+def test_cap_is_computed_from_the_configured_chunk_size_not_the_actual_length():
+    """상한이 조각의 **실제 길이**를 따라가면 안 된다.
+
+    실제 길이로 계산하면 조각마다 system 프롬프트의 숫자가 달라지고, 그러면 매 호출이
+    새 프리픽스가 되어 프롬프트 캐시가 통째로 무효가 된다(비용은 조용히 몇 배가 된다).
+    """
+    assert _cap_for(CHUNK_SIZE) == max(20, CHUNK_SIZE // 30)
+
+    units = _chunk(LONG_TEXT)
+    caps_by_actual_length = {_cap_for(len(u)) for u in units}
+    # 실제 길이로 계산했다면 조각마다 값이 갈렸을 것이라는 사실 자체를 못박는다 —
+    # 이게 성립해야 아래 "system이 하나뿐"이라는 테스트가 의미를 가진다.
+    assert len(caps_by_actual_length) > 1
+
+
+def test_extract_sends_the_same_system_prompt_to_every_chunk(monkeypatch):
+    """조각이 몇 개든 system 프롬프트는 한 벌이어야 한다(캐시 프리픽스 안정성)."""
+    entity_calls: list[tuple] = []
+
+    # 등장인물 노드 조회는 Neo4j를 친다 — 여기서는 그래프 없이 빈 목록으로 대체한다.
+    def _render(tenant, up_to_chapter=None):
+        entity_calls.append((tenant, up_to_chapter))
+        return ""
+
+    monkeypatch.setattr(entity_nodes, "render", _render)
+
+    seen: list[dict] = []
+
+    async def _fake_completion(**kwargs):
+        seen.append(kwargs)
+        return _FakeResponse(json.dumps({"claims": []}))
+
+    monkeypatch.setattr(extract_service, "create_completion", _fake_completion)
+
+    asyncio.run(extract_service.extract(LONG_TEXT, TENANT, up_to_chapter=5))
+
+    assert len(seen) >= 2  # 조각마다 한 번씩 불렀다
+    systems = {call["messages"][0]["content"] for call in seen}
+    assert len(systems) == 1
+    # 캐시 라우팅 키도 호출마다 같아야 같은 캐시에 붙는다.
+    assert {call["prompt_cache_key"] for call in seen} == {"detect-extract"}
+    # 등장인물 노드는 회차 상한을 그대로 받아야 한다 — 상한이 없으면 6화 이후에 확립된
+    # 상태를 "이미 알려진 설정"으로 읽고, 뒤에 나올 반전을 5화의 오류로 판정한다.
+    assert entity_calls == [(TENANT, 5)]
+
+
+# ---------------------------------------------------------------------------
+# 3. claim 번호는 원고 등장 순서다
+# ---------------------------------------------------------------------------
+
+
+def test_claim_ids_follow_manuscript_order():
+    """P번호는 화면 정렬 키다 — 순서가 흐트러지면 오류 목록이 원고와 다른 순서로 뜬다."""
+    claims = [{"quote": f"q{i}"} for i in range(1, 6)]
+    assign_claim_ids(claims)
+
+    assert [c["id"] for c in claims] == ["P1", "P2", "P3", "P4", "P5"]
+    # 번호가 붙어도 원소 순서 자체는 그대로여야 한다(제자리 수정이지 재정렬이 아니다).
+    assert [c["quote"] for c in claims] == ["q1", "q2", "q3", "q4", "q5"]
+
+
+def test_claim_ids_are_assigned_after_chunks_are_merged(monkeypatch):
+    """조각별로 번호를 매기면 경계에서 P1이 두 번 나온다 — 합친 뒤에 한 번만 매겨야 한다."""
+    monkeypatch.setattr(entity_nodes, "render", lambda tenant, up_to_chapter=None: "")
+
+    # 조각 순서대로 서로 다른 claim을 돌려준다.
+    payloads = iter(
+        [
+            json.dumps({"claims": [{"quote": "앞1"}, {"quote": "앞2"}]}),
+            json.dumps({"claims": [{"quote": "뒤1"}]}),
+        ]
     )
-    assert [r["id"] for r in nodes] == ["c1", "e3"]
 
-    rels, _, _ = bounded.execute_query(
-        "MATCH (a)-[rel]->(b) RETURN elementId(a) AS s, type(rel) AS t, elementId(b) AS e, "
-        "properties(rel) AS props"
+    async def _fake_completion(**kwargs):
+        return _FakeResponse(next(payloads, json.dumps({"claims": []})))
+
+    monkeypatch.setattr(extract_service, "create_completion", _fake_completion)
+
+    claims, lines, _usage = asyncio.run(
+        extract_service.extract(LONG_TEXT, TENANT, up_to_chapter=5)
     )
-    assert [(r["s"], r["e"]) for r in rels] == [("c1", "e3")]
+
+    assert [(c["id"], c["quote"]) for c in claims] == [
+        ("P1", "앞1"),
+        ("P2", "앞2"),
+        ("P3", "뒤1"),  # 둘째 조각의 첫 claim이 다시 P1이 되면 안 된다
+    ]
+    # lines는 번호를 매긴 원본 줄 목록 — 호출자가 lineIds로 원문을 되짚는 통로다.
+    assert lines == split_lines(LONG_TEXT)
 
 
-def test_bounded_driver_passes_other_queries_through(fake_driver):
-    """상한 드라이버는 덤프가 던지는 쿼리만 손댄다 — 모르는 결과 모양은 그대로 통과시킨다."""
-    bounded = pipeline._ChapterBoundedDriver(fake_driver, "neo4j", 5)
-    records, _, _ = bounded.execute_query(
-        "MATCH (s:Story {id:'main'}) RETURN s.summary AS summary"
+# ---------------------------------------------------------------------------
+# 4. 라우팅표 — 모델이 아니라 코드가 도구를 고른다
+# ---------------------------------------------------------------------------
+
+
+def test_route_qav_sends_axis_and_axis_value_to_both_channels():
+    """axis와 `axis: value` 두 계열 × hybrid·fact 두 채널 = 네 번."""
+    calls = route_qav({"quote": "카엘은 검을 뽑았다", "axis": "카엘의 검 상태", "value": "온전함"})
+
+    assert calls == [
+        ("hybrid_search", {"query_text": "카엘의 검 상태"}),
+        ("fact_search", {"query_text": "카엘의 검 상태"}),
+        ("hybrid_search", {"query_text": "카엘의 검 상태: 온전함"}),
+        ("fact_search", {"query_text": "카엘의 검 상태: 온전함"}),
+    ]
+
+
+def test_route_qav_without_value_sends_axis_only():
+    """값이 비면 `axis: value` 계열이 성립하지 않는다 — 두 번만 나간다."""
+    calls = route_qav({"quote": "카엘은 검을 뽑았다", "axis": "카엘의 검 상태", "value": ""})
+
+    assert calls == [
+        ("hybrid_search", {"query_text": "카엘의 검 상태"}),
+        ("fact_search", {"query_text": "카엘의 검 상태"}),
+    ]
+
+
+def test_route_qav_falls_back_to_quote_when_axis_is_empty():
+    """axis를 못 세운 claim도 검색은 나가야 한다 — 안 그러면 근거가 0이라 무조건 무판정이다."""
+    calls = route_qav({"quote": "카엘은 검을 뽑았다", "axis": "", "value": "온전함"})
+
+    assert calls == [
+        ("hybrid_search", {"query_text": "카엘은 검을 뽑았다"}),
+        ("fact_search", {"query_text": "카엘은 검을 뽑았다"}),
+    ]
+
+
+def test_route_qav_with_quote_adds_a_third_series():
+    """with_quote는 "추출기가 axis를 빗맞혔을 때"의 안전망이다 — quote 계열이 앞에 더 붙는다."""
+    calls = route_qav(
+        {"quote": "카엘은 검을 뽑았다", "axis": "카엘의 검 상태", "value": "온전함"},
+        with_quote=True,
     )
-    assert records == [{"summary": "전역 요약(7화까지 반영됨)"}]
+
+    assert calls == [
+        ("hybrid_search", {"query_text": "카엘은 검을 뽑았다"}),
+        ("fact_search", {"query_text": "카엘은 검을 뽑았다"}),
+        ("hybrid_search", {"query_text": "카엘의 검 상태"}),
+        ("fact_search", {"query_text": "카엘의 검 상태"}),
+        ("hybrid_search", {"query_text": "카엘의 검 상태: 온전함"}),
+        ("fact_search", {"query_text": "카엘의 검 상태: 온전함"}),
+    ]
 
 
-# ---------- 회차 번호가 파이프라인 안까지 내려가는가 ----------
+def test_route_qav_returns_nothing_when_the_claim_is_empty():
+    """axis도 quote도 없으면 던질 질의가 없다 — 빈 질의로 검색을 때리지 않는다."""
+    assert routing.route_qav({}) == []
 
 
-def test_streaming_passes_the_bound_to_the_context(monkeypatch):
-    captured: list = []
+# ---------------------------------------------------------------------------
+# 5. 회차 상한 — 미래를 근거로 쓰면 검사가 무의미해진다
+# ---------------------------------------------------------------------------
 
-    def _fake_context(up_to_chapter=None):
-        captured.append(up_to_chapter)
-        return "배경"
 
-    async def _no_claims(text, background_context):
-        return []
+def test_future_evidence_is_excluded_but_chapterless_nodes_survive():
+    """5화를 검사하면 5화 이상은 근거에서 빠지고, 회차를 모르는 노드는 남는다.
 
-    monkeypatch.setattr(pipeline, "background_context", _fake_context)
-    monkeypatch.setattr(pipeline, "extract_claims", _no_claims)
+    같은 회차(5화)까지 빼는 이유: 검사 대상 회차 자신이 만든 사실을 근거로 쓰면 원고가
+    자기 자신과 일치한다고 자평한다.
 
-    assert asyncio.run(pipeline.check_new_episode_streaming("5화 원고", 5)) == []
-    assert captured == [5]
+    회차 없는 노드를 **남기는** 이유: 인물처럼 회차마다 같은 노드로 MERGE되는 정준
+    엔티티에는 회차 표시가 없다. 모른다고 버리면 배경 설정이 통째로 사라지고, 그러면
+    대조할 것이 없어 모든 claim이 조용히 "근거 없음"이 된다.
+    """
+    assert _is_future({"chapter": 6}, 5) is True  # 뒤에 나올 반전
+    assert _is_future({"chapter": 5}, 5) is True  # 검사 대상 회차 자신
+    assert _is_future({"chapter": 4}, 5) is False  # 과거 = 유효한 근거
+    assert _is_future({}, 5) is False  # 회차를 모르는 노드 — 버리지 않는다
+    assert _is_future({"chapter": None}, 5) is False
+    assert _is_future({"chapter": "5화"}, 5) is False  # 정수가 아니면 "모른다"로 다룬다
+    assert _is_future({"chapter": 6}, None) is False  # 상한이 없으면 아무것도 안 뺀다
 
-    # 회차를 모르면 상한 없이(=예전 동작) 돈다.
-    assert asyncio.run(pipeline.check_new_episode("원고")) == []
-    assert captured == [5, None]
+
+def test_norm_ignores_whitespace_differences():
+    """dedupe 키. 렌더링 차이(줄바꿈·들여쓰기)만으로 같은 원문을 두 번 싣지 않게 한다."""
+    assert _norm("카엘의 검은  부러졌다.\n") == _norm("카엘의\n검은 부러졌다.")
+    assert _norm(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# 6. dedupe는 content에만 걸린다
+# ---------------------------------------------------------------------------
+
+
+def test_dedupe_drops_repeated_text_but_keeps_the_reference():
+    """중복 제거는 **텍스트**에만 건다 — 참조(items)는 채널마다 남아야 한다.
+
+    문서고는 items로 "이 claim이 어느 노드를 봤는가"를 복원한다. dedupe가 items까지
+    지우면 두 번째 채널이 물어온 노드는 claim과의 연결이 끊기고, 판정기는 그 근거를
+    가리키는 별칭을 받지 못한다 — 근거는 문서고에 실려 있는데 아무도 못 보는 상태가 된다.
+    """
+    same = _chunk_meta("e-chunk-1", 3, 1, "카엘의 검은 3화에서 부러졌다.")
+    future = _chunk_meta("e-chunk-9", 9, 0, "카엘은 새 검을 얻는다.")
+
+    # 두 도구가 같은 원문을 (공백만 다르게) 물어온다. 미래 회차 항목도 한 건씩 섞는다.
+    hybrid = _FakeTool([_FakeItem("카엘의 검은 3화에서 부러졌다.", same), _FakeItem("미래", future)])
+    fact = _FakeTool([_FakeItem("카엘의 검은\n3화에서 부러졌다.\n", same)])
+    tools = {"hybrid_search": hybrid, "fact_search": fact}
+
+    claim = {"id": "P1", "quote": "카엘은 검을 뽑았다", "axis": "카엘의 검 상태", "value": "온전함"}
+    record = _retrieve_one(claim, tools, up_to_chapter=5)
+
+    channels = record["channels"]
+    assert len(channels) == 4  # route_qav의 네 채널
+    assert record["claim"] is claim
+
+    # 첫 채널만 원문을 싣는다.
+    assert "[결과 1]\n카엘의 검은 3화에서 부러졌다." in channels[0]["content"]
+    # 나머지 세 채널은 텍스트가 통째로 빠진다(공백만 다른 두 번째도 같은 것으로 본다).
+    for ch in channels[1:]:
+        assert ch["content"] == "(모든 결과가 이 claim의 앞 채널과 중복이라 생략)"
+    # 그러나 참조는 모든 채널에 남는다 — 여기가 claim↔노드 연결이 복원되는 통로다.
+    for ch in channels:
+        assert [item["metadata"]["eid"] for item in ch["items"]] == ["e-chunk-1"]
+
+    # 미래 회차(9화)는 content에도 items에도 없다. 검사 회차 상한이 items까지 걸린다.
+    assert all("e-chunk-9" not in json.dumps(ch["items"]) for ch in channels)
+    assert all("미래" not in ch["content"] for ch in channels)
+
+    # 채널마다 top_k가 붙어 나간다.
+    assert all(call["top_k"] == TOP_K for call in hybrid.calls + fact.calls)
+
+
+def test_a_failing_channel_is_recorded_as_no_evidence():
+    """검색 하나가 터져도 검사는 계속된다 — 한 채널 실패로 회차 전체가 ERROR가 되면 안 된다."""
+
+    class _Broken:
+        def execute(self, **kwargs):
+            raise RuntimeError("Neo4j 연결 끊김")
+
+    tools = {"hybrid_search": _Broken(), "fact_search": _Broken()}
+    record = _retrieve_one({"axis": "카엘의 검 상태"}, tools, up_to_chapter=5)
+
+    for ch in record["channels"]:
+        assert "도구 실행 오류" in ch["content"]
+        assert ch["items"] == []
+
+
+# ---------------------------------------------------------------------------
+# 7. parse_verdicts 폴백 — 위반은 버리지 않고 flag로 남긴다
+# ---------------------------------------------------------------------------
+
+
+def _verdict_json(*verdicts: dict) -> str:
+    return json.dumps({"verdicts": list(verdicts)})
+
+
+def test_unknown_claim_id_falls_back_to_the_numeric_index():
+    """모델이 P번호를 엉뚱하게 쓰면 옛 형식(`i`)으로 떨어지되 그 사실을 flag로 남긴다."""
+    claims = [{"id": "P1", "quote": "q1", "lines": [3, 4]}]
+    raw = _verdict_json(
+        {"claimId": "Q7", "i": 1, "score": 8, "lineIds": [3], "cited": ["C001"], "reason": "r"}
+    )
+
+    out, problems = parse_verdicts(raw, [0], claims)
+
+    assert list(out) == [0]
+    assert "claim_id_unknown" in out[0]["flags"]
+    assert out[0]["score"] == 8  # 판정 자체는 버리지 않는다
+    assert problems == []
+
+
+def test_line_ids_outside_the_claim_candidates_fall_back_to_all_candidates():
+    """판정기는 원고를 못 본다 — 없는 줄 번호를 지어내면 claim의 후보 줄 전체로 되돌린다.
+
+    되돌리지 않으면 화면이 원고에 없는 줄을 하이라이트하거나 아무 데도 못 칠한다.
+    """
+    claims = [
+        {"id": "P1", "quote": "q1", "lines": [3, 4]},
+        {"id": "P2", "quote": "q2", "lines": [10]},
+        {"id": "P3", "quote": "q3", "lines": [20, 21]},
+    ]
+    raw = _verdict_json(
+        {"claimId": "P1", "score": 8, "lineIds": [99], "reason": "r"},        # 후보 밖
+        {"claimId": "P2", "score": 8, "lineIds": [], "reason": "r"},          # 아예 안 골랐다
+        {"claimId": "P3", "score": 8, "lineIds": [21], "reason": "r"},        # 후보의 부분집합
+    )
+
+    out, _problems = parse_verdicts(raw, [0, 1, 2], claims)
+
+    assert out[0]["line_ids"] == [3, 4] and "line_fallback" in out[0]["flags"]
+    assert out[1]["line_ids"] == [10] and "line_fallback" in out[1]["flags"]
+    assert out[2]["line_ids"] == [21] and "line_fallback" not in out[2]["flags"]
+
+
+def test_scores_outside_the_range_are_clamped():
+    """0~10 밖의 점수는 잘라 담는다 — 12점짜리가 그대로 흐르면 임계값 비교가 무의미해진다."""
+    claims = [{"id": "P1", "quote": "q1", "lines": [1]}, {"id": "P2", "quote": "q2", "lines": [2]}]
+    raw = _verdict_json(
+        {"claimId": "P1", "score": 12, "lineIds": [1], "reason": "r"},
+        {"claimId": "P2", "score": -3, "lineIds": [2], "reason": "r"},
+    )
+
+    out, _problems = parse_verdicts(raw, [0, 1], claims)
+
+    assert out[0]["score"] == 10 and "score_out_of_range" in out[0]["flags"]
+    assert out[1]["score"] == 0 and "score_out_of_range" in out[1]["flags"]
+    # 원본은 그대로 남긴다 — 모델이 얼마나 벗어났는지가 다음 개선의 신호다.
+    assert out[0]["raw_score"] == 12
+
+
+def test_missing_claims_are_not_filled_with_zero():
+    """누락은 0점이 아니다.
+
+    0은 "근거를 봤지만 모순이 아니다"라는 **유효한 판정**이다. 누락을 0으로 메우면 둘이
+    영영 구분되지 않아, 판정기가 claim 절반을 통째로 빠뜨려도 "전부 정상"으로 보인다.
+    """
+    claims = [
+        {"id": "P1", "quote": "q1", "lines": [1]},
+        {"id": "P2", "quote": "q2", "lines": [2]},
+        {"id": "P3", "quote": "q3", "lines": [3]},
+    ]
+    raw = _verdict_json(
+        {"claimId": "P1", "score": 0, "lineIds": [1], "reason": "모순 아님"},  # 진짜 0점
+        {"claimId": "P3", "score": 9, "lineIds": [3], "reason": "모순"},
+    )
+
+    out, problems = parse_verdicts(raw, [0, 1, 2], claims)
+
+    assert 1 not in out  # P2는 자리 자체가 없다 — 0으로 채우지 않는다
+    assert out[0]["score"] == 0 and out[0]["flags"] == []  # 0점은 정상 판정이다
+    assert "missing:1" in problems
+
+
+def test_broken_json_is_reported_instead_of_raising():
+    """판정 응답이 JSON이 아니면 회차 전체가 터지는 대신 문제로 기록된다."""
+    out, problems = parse_verdicts("이건 JSON이 아니다", [0, 1], [])
+
+    assert out == {}
+    assert problems == ["json_parse_failed"]
+
+
+# ---------------------------------------------------------------------------
+# 8. cited 해소 — 별칭을 화면이 열 수 있는 좌표로 바꾼다
+# ---------------------------------------------------------------------------
+
+
+def _store(chunks: dict, facts: dict) -> dict:
+    """`build_docstore`가 만드는 문서고의 모양(필요한 부분만)."""
+    return {"chunks": chunks, "facts": facts, "entities": {}, "refs": []}
+
+
+def test_cited_chunk_alias_becomes_a_natural_key_with_its_text():
+    """C### 별칭은 (회차, 조각 번호) + **원문**으로 펼쳐진다.
+
+    좌표만 보내면 받는 쪽이 이 서버의 청킹을 재현할 수 없어 몇 번 조각이 어느 문장인지
+    알 수 없다. 원문을 함께 실어야 화면이 근거를 그대로 보여줄 수 있다.
+    """
+    store = _store(
+        {
+            "e-c1": {
+                "eid": "e-c1", "alias": "C001", "chapter": 3, "index": 1,
+                "text": "카엘의 검은 부러졌다.",
+            },
+            "e-c2": {
+                "eid": "e-c2", "alias": "C002", "chapter": 4, "index": 0,
+                "text": "카엘은 빈손으로 관문에 섰다.",
+            },
+        },
+        {},
+    )
+
+    assert _resolve_cited(["C002", "C001"], store) == [
+        {"episodeNo": 4, "chunkIndex": 0, "text": "카엘은 빈손으로 관문에 섰다."},
+        # 인용 순서를 그대로 지킨다
+        {"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."},
+    ]
+
+
+def test_cited_fact_alias_expands_to_its_evidence_chunks():
+    """F### 별칭은 그 사실의 **근거 청크들**로 펼쳐진다.
+
+    화면이 하이라이트할 수 있는 것은 원문 조각이지 사실 노드가 아니다. 사실을 그대로
+    돌려주면 작가는 "근거가 있다"는 말만 보고 그 근거를 볼 수 없다.
+
+    문서고에서 사실의 evidence는 **청크 eid 목록**이다(build_docstore가 근거 원문을 청크
+    사전으로 보내고 키만 남긴다). 여기서 청크를 되짚어야 좌표가 나온다.
+    """
+    store = _store(
+        {
+            "e-c1": {
+                "eid": "e-c1", "alias": "C001", "chapter": 2, "index": 0,
+                "text": "검날에 금이 갔다.",
+            },
+            "e-c2": {
+                "eid": "e-c2", "alias": "C002", "chapter": 3, "index": 1,
+                "text": "카엘의 검은 부러졌다.",
+            },
+        },
+        {
+            "e-f1": {
+                "eid": "e-f1",
+                "alias": "F001",
+                "name": "카엘의 검이 부러짐",
+                "chapter": 3,
+                "story_order": 1,
+                "evidence": ["e-c1", "e-c2"],
+            }
+        },
+    )
+
+    # 사실을 거쳐 와도 청크와 똑같이 원문이 붙는다 — 근거를 볼 수 있어야 한다는 이유가 같다.
+    assert _resolve_cited(["F001"], store) == [
+        {"episodeNo": 2, "chunkIndex": 0, "text": "검날에 금이 갔다."},
+        {"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."},
+    ]
+
+
+def test_hallucinated_aliases_are_dropped_and_duplicates_collapse():
+    """문서고에 없는 별칭은 버린다 — 지어낸 인용을 내보내면 화면이 없는 자리를 가리킨다."""
+    store = _store(
+        {
+            "e-c1": {
+                "eid": "e-c1", "alias": "C001", "chapter": 3, "index": 1,
+                "text": "카엘의 검은 부러졌다.",
+            }
+        },
+        {
+            "e-f1": {
+                "eid": "e-f1",
+                "alias": "F001",
+                "name": "f",
+                "chapter": 3,
+                "story_order": 1,
+                "evidence": ["e-c1"],  # 같은 청크를 가리킨다
+            }
+        },
+    )
+
+    # C999는 문서고에 없고, F001은 C001과 같은 좌표로 풀린다(중복은 한 번만 남는다).
+    # 원문이 붙어도 중복 판정은 좌표로 하므로 같은 조각이 두 벌 실리지 않는다.
+    assert _resolve_cited(["C001", "F001", "C999"], store) == [
+        {"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."}
+    ]
+    assert _resolve_cited(["C999", "F999"], store) == []
+
+
+# ---------------------------------------------------------------------------
+# 9. judge — τ 컷과 findings 조립
+# ---------------------------------------------------------------------------
+
+
+def _evidence_for(claims: list[dict], items_per_claim: list[list[dict]]) -> dict:
+    """`retrieve()`가 돌려주는 것과 **같은 모양**의 evidence를 만든다.
+
+    이 모양이 곧 retrieve→judge 사이의 계약이다. 여기가 어긋나면 파이프라인은 마지막
+    단계에서 통째로 터진다.
+    """
+    return {
+        "records": [
+            {
+                "claim": claim,
+                "channels": [
+                    {"tool": "hybrid_search", "args": {}, "content": "(생략)", "items": items}
+                ],
+            }
+            for claim, items in zip(claims, items_per_claim)
+        ]
+    }
+
+
+# 검사 중인 회차의 원고 줄 목록(extract가 돌려주는 것). judge는 판정이 고른 줄 번호를
+# 이 목록으로 되짚어 findings에 원문을 싣는다. 번호는 1-base라 12번 줄은 인덱스 11이다.
+MANUSCRIPT_LINES = [f"{i}번째 줄." for i in range(1, 61)]
+
+
+def test_judge_returns_only_findings_at_or_above_the_threshold(monkeypatch):
+    """τ 컷. 문턱 미만은 findings에 오지 않는다 — 응답은 오류 목록이지 판정 전량이 아니다."""
+    claims = [
+        {"quote": "카엘은 검을 뽑았다.", "axis": "카엘의 검 상태", "value": "온전함", "lines": [12]},
+        {"quote": "레아는 북부 출신이다.", "axis": "레아의 출신", "value": "북부", "lines": [40]},
+        {"quote": "성문은 남쪽이다.", "axis": "성문의 방향", "value": "남쪽", "lines": [55]},
+    ]
+    assign_claim_ids(claims)
+    evidence = _evidence_for(
+        claims,
+        [
+            [{"metadata": _chunk_meta("e-c1", 3, 1, "카엘의 검은 부러졌다.")}],
+            [],
+            [],
+        ],
+    )
+
+    raw = _verdict_json(
+        {"claimId": "P1", "score": ERROR_THRESHOLD, "lineIds": [12], "cited": ["C001"], "reason": "부러진 검"},
+        {"claimId": "P2", "score": ERROR_THRESHOLD - 1, "lineIds": [40], "cited": [], "reason": "애매"},
+        {"claimId": "P3", "score": 0, "lineIds": [55], "cited": [], "reason": "일치"},
+    )
+
+    seen: list[dict] = []
+
+    async def _fake_completion(**kwargs):
+        seen.append(kwargs)
+        return _FakeResponse(raw)
+
+    monkeypatch.setattr(judge_service, "create_completion", _fake_completion)
+
+    findings = asyncio.run(judge_service.judge(claims, evidence, MANUSCRIPT_LINES))
+
+    # 문턱 이상만 남는다. 문턱 **이상**(>=)이라 딱 7점인 P1은 포함된다.
+    assert [f["claimId"] for f in findings] == ["P1"]
+    assert findings[0]["quote"] == claims[0]["quote"]
+    assert findings[0]["axis"] == claims[0]["axis"]
+    assert findings[0]["value"] == claims[0]["value"]
+    # 줄 번호에 원문이 붙는다 — 받는 쪽은 이 서버의 줄 분할을 재현할 수 없다.
+    assert findings[0]["lines"] == [{"lineNo": 12, "text": "12번째 줄."}]
+    assert findings[0]["isError"] is True
+    assert findings[0]["cited"] == [
+        {"episodeNo": 3, "chunkIndex": 1, "text": "카엘의 검은 부러졌다."}
+    ]
+
+    # 판정은 claim마다 부르지 않고 **한 번의 배치**로 끝난다(문서고를 한 번만 싣는 근거).
+    assert len(seen) == 1
+    assert seen[0]["prompt_cache_key"] == "detect-judge"
+    assert seen[0]["response_format"] == {"type": "json_object"}
+
+
+def test_line_numbers_outside_the_manuscript_are_dropped_not_crashed(monkeypatch):
+    """원고 범위를 벗어난 줄 번호는 조용히 버린다 — 예외도, 없는 자리 인용도 아니다.
+
+    번호는 추출기가 claim에 붙인 후보 줄에서 오므로 원고 길이를 넘을 수 있다. 그대로
+    인덱싱하면 IndexError로 판정 전체가 죽고, 음수는 파이썬 규칙상 **뒤에서부터** 세어
+    엉뚱한 문장을 근거라고 내보낸다. 둘 다 막는다.
+    """
+    claims = [{"quote": "카엘은 검을 뽑았다.", "axis": "카엘의 검 상태", "value": "온전함",
+               "lines": [-1, 0, 2, 999]}]
+    assign_claim_ids(claims)
+    raw = _verdict_json(
+        {"claimId": "P1", "score": ERROR_THRESHOLD, "cited": [], "reason": "r"}
+    )
+
+    async def _fake_completion(**kwargs):
+        return _FakeResponse(raw)
+
+    monkeypatch.setattr(judge_service, "create_completion", _fake_completion)
+
+    findings = asyncio.run(
+        judge_service.judge(claims, _evidence_for(claims, [[]]), ["첫 줄", "둘째 줄"])
+    )
+
+    # 범위 안(2)만 남는다. 0과 음수, 목록보다 큰 번호는 전부 빠진다.
+    assert findings[0]["lines"] == [{"lineNo": 2, "text": "둘째 줄"}]
+
+
+def test_judge_without_claims_calls_no_llm(monkeypatch):
+    """추출이 0건이면 판정할 것이 없다 — 빈 문서고로 LLM을 부르는 낭비를 하지 않는다."""
+
+    async def _boom(**kwargs):
+        raise AssertionError("claim이 없는데 LLM을 불렀다")
+
+    monkeypatch.setattr(judge_service, "create_completion", _boom)
+
+    assert asyncio.run(judge_service.judge([], {"records": []}, [])) == []
+
+
+def test_retrieve_without_claims_touches_no_graph():
+    """같은 이유로 검색도 건너뛴다 — 도구를 조립하는 것만으로 Neo4j 드라이버가 열린다."""
+    assert asyncio.run(retrieve_service.retrieve([], TENANT, up_to_chapter=5)) == {"records": []}
+
+
+# ---------------------------------------------------------------------------
+# 9. 검색이 전부 실패하면 "오류 0건"이 아니라 실패다
+# ---------------------------------------------------------------------------
+
+
+class _BrokenTool:
+    """호출할 때마다 터지는 검색 도구(그래프에 못 닿는 상황을 흉내낸다)."""
+
+    def execute(self, **kwargs):
+        raise RuntimeError("Neo4j 연결 실패")
+
+
+def test_all_channels_failing_raises_instead_of_reporting_zero_errors(monkeypatch):
+    """모든 검색이 실패하면 검사를 실패로 끝낸다.
+
+    한 채널이 실패하는 건 흔하다 — 그 질의로 걸리는 게 없거나 일시적 오류라 근거가 조금
+    얇아질 뿐이다. 그런데 **전부** 실패했다면 근거가 없는 게 아니라 그래프에 못 닿은 것이다.
+
+    그대로 두면 판정기가 빈 문서고를 보고 "대조할 설정이 없다"며 전부 낮은 점수를 매기고,
+    검사는 status=DONE, 오류 0건으로 끝난다. 작가는 검사가 돌지도 않았다는 걸 모른 채
+    초록불을 본다 — 이 저장소가 예전에 한 번 겪은 "조용한 성공"이다.
+    """
+    monkeypatch.setattr(
+        retrieve_service,
+        "build_retrieval_tools",
+        lambda tenant: [
+            type("_T", (), {"get_name": lambda self: "hybrid_search", "execute": _BrokenTool.execute})(),
+            type("_T", (), {"get_name": lambda self: "fact_search", "execute": _BrokenTool.execute})(),
+        ],
+    )
+    claims = [{"id": "P1", "axis": "카엘의 검 상태", "value": "부러짐", "quote": "q", "lines": [1]}]
+
+    with pytest.raises(RuntimeError, match="검색이 전부 실패"):
+        asyncio.run(retrieve_service.retrieve(claims, TENANT, up_to_chapter=5))
+
+
+def test_partial_channel_failure_keeps_going():
+    """일부만 실패하면 계속 간다 — 근거가 얇아질 뿐 검사 자체는 성립한다."""
+    ok = _FakeTool([_FakeItem("근거 원문", _chunk_meta("e1", 3, 0, "근거 원문"))])
+    broken = _BrokenTool()
+    tools = {"hybrid_search": ok, "fact_search": broken}
+
+    record = _retrieve_one(
+        {"axis": "카엘의 검 상태", "value": "부러짐"}, tools, up_to_chapter=5
+    )
+    failed = [c for c in record["channels"] if c["failed"]]
+    alive = [c for c in record["channels"] if not c["failed"]]
+    assert failed and alive, "일부 실패 상황을 만들지 못했다"
+    # 살아남은 채널의 근거는 그대로 실린다.
+    assert any("근거 원문" in c["content"] for c in alive)
+    # 실패한 채널은 사유를 남긴다(빈 결과와 구분되게).
+    assert all("도구 실행 오류" in c["content"] for c in failed)
+
+
+# ---------------------------------------------------------------------------
+# 10. 테넌트 후필터가 라이브러리 LIMIT보다 뒤에 온다는 사실에 대한 보정
+# ---------------------------------------------------------------------------
+
+
+def test_tenant_filter_requires_oversampled_top_k(monkeypatch):
+    """검색은 top_k를 부풀려 요청하고 final_k로 되돌린다.
+
+    라이브러리가 만드는 쿼리는 `… LIMIT $top_k` **다음에** 우리 retrieval_query를 이어
+    붙인다. 즉 테넌트 구분 없이 top_k개로 자른 뒤에야 우리 필터가 돈다 — 남의 소설
+    결과가 상위 점수를 차지하면 그대로 버려지고 내 결과가 top_k보다 적어진다.
+
+    `effective_search_ratio`로는 못 고친다(벡터 인덱스의 후보 풀만 넓힐 뿐 그 뒤의
+    LIMIT을 안 바꾼다). top_k 자체를 부풀려야 한다.
+
+    실패해도 예외가 아니라 "결과가 좀 적음"으로 나타나는 종류라, 이 테스트가 없으면
+    누가 부풀리기를 걷어내도 아무 신호가 없다.
+    """
+    from src.common.tenant import Tenant
+    import src.repository.neo4j.retrieval as retrieval
+
+    captured: dict = {}
+
+    def _fake_super(self, **kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(retrieval.HybridCypherRetriever, "get_search_results", _fake_super)
+
+    r = retrieval._EscapedHybridCypherRetriever.__new__(retrieval._EscapedHybridCypherRetriever)
+    r._tenant = Tenant.of(42, 7)
+    r.get_search_results(query_text="검색어", query_vector=[0.1], top_k=3)
+
+    assert captured["top_k"] == 3 * retrieval._TENANT_OVERSAMPLE, "부풀려 요청해야 한다"
+    assert captured["query_params"]["final_k"] == 3, "원래 개수로 되돌릴 값을 넘겨야 한다"
+    # 두 채널 모두 테넌트로 좁는다 — 풀텍스트는 인덱스 안에서, 벡터는 retrieval_query에서.
+    assert captured["query_params"]["tenant_id"] == "42:7"
+    assert captured["query_text"].startswith("+tenant_ft:u42w7 +(")
+
+
+def test_retrieval_queries_truncate_with_final_k():
+    """두 retrieval_query 모두 테넌트로 거른 뒤 $final_k로 잘라야 한다."""
+    import src.repository.neo4j.retrieval as retrieval
+
+    for build in (lambda: retrieval._build_chunk_query(False), retrieval._build_fact_query):
+        q = build()
+        assert "$tenant_id" in q
+        assert "LIMIT $final_k" in q
+        # 절단은 필터 **뒤**에 와야 한다 — 앞에 오면 자르고 나서 거르는 꼴이라 의미가 없다.
+        assert q.index("$tenant_id") < q.index("LIMIT $final_k")
+
+
+def test_unreadable_judge_response_raises_instead_of_reporting_zero_errors(monkeypatch):
+    """판정 응답을 못 읽으면 "오류 0건"이 아니라 실패다.
+
+    판정 결과가 비면 findings=[]가 되고 검사는 status=DONE·오류 0건으로 끝난다. 작가는
+    검사가 성공했다고 믿는데 실제로는 아무것도 판정되지 않았고, LLM 비용은 이미 다 나갔다.
+
+    parse_verdicts는 "누락된 claim을 0점으로 채우지 않는다"는 구분을 지키고 있다 —
+    0점은 "근거가 없다"는 판정이고 빈 결과는 "판정을 못 읽었다"다. 그 구분을 상위에서
+    실제로 쓰는 자리가 여기다.
+    """
+    async def _broken(**kwargs):
+        return _FakeResponse("이건 JSON이 아니다")
+
+    monkeypatch.setattr(judge_service, "create_completion", _broken)
+    claims = [{"id": "P1", "quote": "q", "axis": "a", "value": "v", "lines": [1]}]
+
+    with pytest.raises(RuntimeError, match="판정 응답을 읽지 못했다"):
+        asyncio.run(judge_service.judge(claims, {"records": []}, []))
+
+
+def test_empty_verdicts_object_also_raises(monkeypatch):
+    """JSON은 멀쩡한데 verdicts가 비어 온 경우도 마찬가지다."""
+    async def _empty(**kwargs):
+        return _FakeResponse(json.dumps({"verdicts": []}))
+
+    monkeypatch.setattr(judge_service, "create_completion", _empty)
+    claims = [{"id": "P1", "quote": "q", "axis": "a", "value": "v", "lines": [1]}]
+
+    with pytest.raises(RuntimeError, match="판정 응답을 읽지 못했다"):
+        asyncio.run(judge_service.judge(claims, {"records": []}, []))
+
+
+# ---------- 검색 스레드풀 ----------
+
+
+def test_검색_스레드가_검사_수만큼_늘어나지_않는다(monkeypatch):
+    """풀은 프로세스 전역이라 동시 검사가 몇 건이든 스레드 총량이 고정이다.
+
+    예전에는 검사마다 새 풀을 만들어서 `_WORKERS=8`이 "검사 하나 안에서 8개"라는 뜻이었다
+    — 동시 검사 10건이면 스레드 80개다. 게이트웨이 세마포어는 OpenAI 호출만 세므로 이 축을
+    못 막는다(여기 스레드는 Neo4j 쿼리도 돌리고 드라이버 커넥션도 함께 쓴다).
+    """
+    import threading
+
+    from src.service.detect import retrieve_service
+
+    monkeypatch.setattr(retrieve_service, "build_retrieval_tools", lambda tenant: [])
+
+    본_스레드: set[str] = set()
+    잠금 = threading.Lock()
+
+    def _느린_조회(claim, tools, up_to_chapter):
+        with 잠금:
+            본_스레드.add(threading.current_thread().name)
+        threading.Event().wait(0.01)
+        return {"claim": claim, "channels": []}
+
+    monkeypatch.setattr(retrieve_service, "_retrieve_one", _느린_조회)
+
+    claims = [{"id": f"P{i}", "axis": "축", "value": "값"} for i in range(12)]
+
+    async def 세_검사_동시에():
+        await asyncio.gather(*[retrieve_service.retrieve(claims, tenant=None) for _ in range(3)])
+
+    asyncio.run(세_검사_동시에())
+
+    assert len(본_스레드) <= retrieve_service._WORKERS, (
+        f"검사 3건인데 스레드가 {len(본_스레드)}개 — 풀이 검사마다 새로 만들어지고 있다"
+    )
+
+
+def test_공유_풀에서도_결과_순서가_입력_순서와_같다(monkeypatch):
+    """문서고의 claim_index가 이 순서에 묶여 있다.
+
+    공유 풀이면 다른 검사의 작업과 섞여 실행되지만, map은 이 호출이 제출한 future만
+    순서대로 거둬들인다. 어긋나면 claim이 남의 근거를 가리키는데 예외는 안 난다.
+    """
+    from src.service.detect import retrieve_service
+
+    monkeypatch.setattr(retrieve_service, "build_retrieval_tools", lambda tenant: [])
+
+    def _역순으로_느리게(claim, tools, up_to_chapter):
+        # 앞쪽 claim일수록 오래 걸리게 해서 완료 순서를 입력 순서와 반대로 만든다.
+        threading.Event().wait(0.01 * (5 - int(claim["id"][1:])))
+        return {"claim": claim, "channels": []}
+
+    import threading
+
+    monkeypatch.setattr(retrieve_service, "_retrieve_one", _역순으로_느리게)
+
+    claims = [{"id": f"P{i}"} for i in range(5)]
+    결과 = asyncio.run(retrieve_service.retrieve(claims, tenant=None))
+
+    assert [r["claim"]["id"] for r in 결과["records"]] == [f"P{i}" for i in range(5)]
+
+
+def test_풀은_한_번_쓰고_죽지_않는다(monkeypatch):
+    """`with ThreadPoolExecutor(...)`로 감싸면 첫 검사 후 shutdown되어 두 번째가
+    RuntimeError로 죽는다. 전역 풀에 with를 다시 붙이는 실수를 막는다."""
+    from src.service.detect import retrieve_service
+
+    monkeypatch.setattr(retrieve_service, "build_retrieval_tools", lambda tenant: [])
+    monkeypatch.setattr(
+        retrieve_service, "_retrieve_one", lambda c, t, u: {"claim": c, "channels": []}
+    )
+
+    claims = [{"id": "P1"}]
+    for _ in range(3):
+        결과 = asyncio.run(retrieve_service.retrieve(claims, tenant=None))
+        assert len(결과["records"]) == 1

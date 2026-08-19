@@ -27,8 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 아티팩트에는 소스만 담는다. 의존성 설치와 lorekeeper-poc 클론은
-      # 인스턴스에서 한다 — 러너(x86_64)와 인스턴스(arm64)의 휠이 다르기 때문이다.
+      # 아티팩트에는 소스만 담는다. 의존성 설치는 인스턴스에서 한다 —
+      # 러너(x86_64)와 인스턴스(arm64)의 휠이 다르기 때문이다.
       #
       # data/ 와 reports/ 는 서버의 영속 디렉터리를 쓰므로 올리지 않는다.
       # 원고는 저작물이라 애초에 레포에도 없다(.gitignore).
@@ -44,7 +44,6 @@ jobs:
             --exclude='*.pyc' \
             --exclude='./data' \
             --exclude='./reports' \
-            --exclude='./lorekeeper-poc' \
             .
           ls -lh "$RUNNER_TEMP/agent.tar.gz"
 
