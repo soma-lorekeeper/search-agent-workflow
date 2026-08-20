@@ -559,6 +559,47 @@ def test_already_indexed_episodes_skip_work(client, stub_indexing, monkeypatch):
     assert stub_indexing == [7]  # 6화는 실제로 인덱싱되지 않았다
 
 
+def test_resubmit_while_running_is_not_indexed_twice(client, graph, monkeypatch):
+    """아직 처리 중인 화를 다시 제출해도 인덱싱은 한 번만 한다.
+
+    접수 관문은 이 재제출을 막지 않는다(막으면 안 된다 — 스펙 7.3의 "404 후 통째로 재제출"이
+    400을 맞는다). 그런데 그때는 아직 완료 마커가 없어 그 화가 작업 목록에 그대로 남고,
+    큐에 있는 화를 빼는 필터(fresh)는 회차 연속성 판정에만 쓰인다. 그래서 예전에는 워커가
+    같은 화를 두 번 인덱싱했고, 재인덱싱 전 정리 단계가 없어 Chunk가 한 벌 더 쌓였다.
+
+    워커는 job을 하나씩 순차 처리하므로, 뒤 job이 그 화를 집을 때는 앞 job이 이미 끝나
+    마커가 찍혀 있다. 인덱싱 직전에 마커를 다시 확인하면 그 한 겹으로 막힌다.
+    """
+    calls: list[int] = []
+    release = threading.Event()
+
+    async def _blocking(tenant: Tenant, episode_no: int, text: str) -> dict:
+        calls.append(episode_no)
+        await asyncio.to_thread(release.wait, 5)
+        graph.setdefault(tenant.id, set()).add(episode_no)  # 마커는 여기서 찍힌다
+        return {"chapter": episode_no}
+
+    monkeypatch.setattr(index_job_service, "run_indexing", _blocking)
+
+    first = _submit(client, [{"episodeId": 101, "episodeNo": 1, "text": "1화 원고"}])
+    assert first.status_code == 201
+    _wait_until(
+        client, first.json()["jobId"], lambda b: b["episodes"][0]["status"] == "RUNNING"
+    )
+
+    # 아직 안 끝난 같은 화를 다시 제출한다 — 400이 아니라 201이어야 한다(재제출 계약).
+    second = _submit(client, [{"episodeId": 101, "episodeNo": 1, "text": "1화 원고"}])
+    assert second.status_code == 201
+
+    release.set()
+    _wait_until(client, first.json()["jobId"], _terminal)
+    # 두 번째 작업도 종료 상태에 도달해야 한다(영원히 QUEUED로 남으면 호출자가 무한 폴링한다).
+    body = _wait_until(client, second.json()["jobId"], _terminal)
+
+    assert [e["status"] for e in body["episodes"]] == ["DONE"]
+    assert calls == [1]  # 두 번 일하지 않았다
+
+
 def test_marker_is_looked_up_within_the_requesting_tenant(client, stub_indexing, monkeypatch):
     """완료 마커 조회는 요청의 테넌트로 좁혀서 물어봐야 한다.
 

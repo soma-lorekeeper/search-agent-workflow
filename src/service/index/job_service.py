@@ -115,9 +115,34 @@ async def _run_index_job(job_id: str) -> None:
             )
             continue
 
+        # 접수 때 본 완료 마커는 이 시점에 낡아 있을 수 있다. 워커는 job을 하나씩 순차
+        # 처리하므로, 같은 회차를 담은 앞 job이 그 사이에 끝났으면 마커가 새로 찍혀 있다.
+        # 접수 시점 판단만 믿으면 그 회차를 한 번 더 인덱싱하는데, 재인덱싱 전 정리 단계가
+        # 없어 Chunk가 덮어써지지 않고 한 벌 더 쌓인다(예외도 로그도 없이 검색 결과만 오염된다).
+        #
+        # 접수 관문에서 걸러지지 않는 이유: 그때는 아직 마커가 없어 pending에 남고,
+        # 큐에 있는 화를 빼는 필터(fresh)는 회차 연속성 판정에만 쓰인다.
+        #
+        # 조회가 실패하면 _already_indexed가 빈 집합을 주므로 그대로 인덱싱한다 — 접수
+        # 때와 같은 판단이다(안 된 화를 done으로 보고해 영영 빠뜨리는 편이 더 나쁘다).
+        # Neo4j 왕복이라 스레드로 뺀다(이벤트 루프를 잡으면 상태 조회·채팅이 함께 멈춘다).
+        tenant = kg_scope(job["user_id"], job["work_id"])
+        indexed, _ = await asyncio.to_thread(
+            _already_indexed, tenant, [episode["episode_no"]]
+        )
+        if episode["episode_no"] in indexed:
+            logger.info(
+                "완료 마커 확인 — 재인덱싱하지 않는다 | jobId=%s episodeId=%s episodeNo=%s",
+                job_id,
+                episode["episode_id"],
+                episode["episode_no"],
+            )
+            # 원고는 여기서도 놓아준다(아래 성공 경로와 같은 이유).
+            episode.update({"text": "", "status": "DONE"})
+            continue
+
         episode["status"] = "RUNNING"
         try:
-            tenant = kg_scope(job["user_id"], job["work_id"])
             logger.info(
                 "인덱싱 시작 | jobId=%s userId=%s workId=%s episodeId=%s episodeNo=%s",
                 job_id,
