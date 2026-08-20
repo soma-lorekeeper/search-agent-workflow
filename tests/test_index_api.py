@@ -434,6 +434,9 @@ def test_episode_status_transitions(client, graph, monkeypatch):
         started.append(episode_no)
         while not gate.is_set():
             await asyncio.sleep(0.01)
+        # 성공하면 마커가 찍힌다 — 워커가 다음 화의 앞 화를 이 값으로 확인하므로
+        # 스텁도 실제 인덱싱과 같은 흔적을 남겨야 한다(graph 픽스처 설명 참고).
+        graph.setdefault(tenant.id, set()).add(episode_no)
         return {}
 
     monkeypatch.setattr(index_job_service, "run_indexing", _blocking)
@@ -468,6 +471,8 @@ def test_failure_skips_following_episodes(client, graph, monkeypatch):
     async def _fail_on_seven(tenant: Tenant, episode_no: int, text: str) -> dict:
         if episode_no == 7:
             raise RuntimeError("추출 실패")
+        # 성공한 화만 마커를 남긴다(실패한 7화는 그래프에 안 들어간다).
+        graph.setdefault(tenant.id, set()).add(episode_no)
         return {}
 
     monkeypatch.setattr(index_job_service, "run_indexing", _fail_on_seven)
@@ -600,6 +605,50 @@ def test_resubmit_while_running_is_not_indexed_twice(client, graph, monkeypatch)
     assert calls == [1]  # 두 번 일하지 않았다
 
 
+def test_later_job_stops_when_a_preceding_episode_failed(client, graph, monkeypatch):
+    """앞 job에서 실패한 화가 있으면, 다른 job에 실린 뒤 화도 인덱싱하지 않는다.
+
+    연쇄 스킵(failed_no)은 **같은 job 안에서만** 동작한다. 접수 관문은 큐에 있는 화를
+    "곧 생길 것"으로 쳐서 뒤 화를 미리 받아주는데(파이프라이닝), 앞 화가 실패하면 그
+    전제가 깨진다. 예전에는 그때 뒤 job이 그대로 돌아 중간이 빈 채로 그래프가 이어졌다 —
+    예외도 로그도 없이 조용히 틀어지는 종류의 사고다.
+
+    워커가 인덱싱 직전에 "앞 화가 그래프에 있는가"를 다시 보면 그 한 겹으로 막힌다.
+    """
+    _indexed_up_to(graph, 6)
+    release = threading.Event()
+    calls: list[int] = []
+
+    async def _fail_on_seven(tenant: Tenant, episode_no: int, text: str) -> dict:
+        calls.append(episode_no)
+        await asyncio.to_thread(release.wait, 5)
+        if episode_no == 7:
+            raise RuntimeError("추출 실패")
+        graph.setdefault(tenant.id, set()).add(episode_no)
+        return {}
+
+    monkeypatch.setattr(index_job_service, "run_indexing", _fail_on_seven)
+
+    first = _submit(client, [{"episodeId": 107, "episodeNo": 7, "text": "7화"}])
+    assert first.status_code == 201
+    _wait_until(
+        client, first.json()["jobId"], lambda b: b["episodes"][0]["status"] == "RUNNING"
+    )
+
+    # 7화가 도는 동안 8화를 **다른 job으로** 보낸다 — 접수는 통과해야 한다(파이프라이닝).
+    second = _submit(client, [{"episodeId": 108, "episodeNo": 8, "text": "8화"}])
+    assert second.status_code == 201
+
+    release.set()
+    _wait_until(client, first.json()["jobId"], _terminal)
+    body = _wait_until(client, second.json()["jobId"], _terminal)
+
+    # 7화가 실패했으므로 8화는 시도조차 하지 않고 ERROR여야 한다.
+    assert [e["status"] for e in body["episodes"]] == ["ERROR"]
+    assert "expected episodeNo 7" in body["episodes"][0]["error"]
+    assert calls == [7]  # 8화는 run_indexing에 닿지 않았다
+
+
 def test_marker_is_looked_up_within_the_requesting_tenant(client, stub_indexing, monkeypatch):
     """완료 마커 조회는 요청의 테넌트로 좁혀서 물어봐야 한다.
 
@@ -622,7 +671,10 @@ def test_marker_is_looked_up_within_the_requesting_tenant(client, stub_indexing,
         ).status_code
         == 201
     )
-    assert seen == ["7:3"]
+    # 조회 **횟수**는 고정하지 않는다 — 접수 때 한 번, 워커가 인덱싱 직전에 한 번 더 본다
+    # (실행 시점 재확인. _run_index_job 참고). 여기서 지켜야 할 것은 "어느 테넌트로
+    # 물었는가"뿐이라, 모든 조회가 요청의 테넌트였는지만 확인한다.
+    assert seen and set(seen) == {"7:3"}
 
 
 def test_fully_indexed_resubmit_is_not_gated(client, stub_indexing, monkeypatch):

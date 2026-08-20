@@ -127,7 +127,7 @@ async def _run_index_job(job_id: str) -> None:
         # 때와 같은 판단이다(안 된 화를 done으로 보고해 영영 빠뜨리는 편이 더 나쁘다).
         # Neo4j 왕복이라 스레드로 뺀다(이벤트 루프를 잡으면 상태 조회·채팅이 함께 멈춘다).
         tenant = kg_scope(job["user_id"], job["work_id"])
-        indexed, _ = await asyncio.to_thread(
+        indexed, latest = await asyncio.to_thread(
             _already_indexed, tenant, [episode["episode_no"]]
         )
         if episode["episode_no"] in indexed:
@@ -139,6 +139,43 @@ async def _run_index_job(job_id: str) -> None:
             )
             # 원고는 여기서도 놓아준다(아래 성공 경로와 같은 이유).
             episode.update({"text": "", "status": "DONE"})
+            continue
+
+        # 앞 화가 그래프에 있는지 **실행 직전에** 다시 본다.
+        #
+        # 접수 관문도 같은 규칙을 보지만(submit의 연속성 검증), 그때는 큐에 있는 화까지
+        # "곧 생길 것"으로 쳐서 통과시킨다 — 그래야 앞 화가 도는 동안 다음 화를 미리 보낼
+        # 수 있다(파이프라이닝). 문제는 그 전제가 나중에 깨질 수 있다는 것이다: 앞 화가
+        # 실패하면 그래프에 안 들어가는데, **연쇄 스킵(failed_no)은 같은 job 안에서만
+        # 동작하므로** 다른 job에 실린 뒤 화는 그 사실을 모른 채 그대로 인덱싱된다.
+        # 그러면 중간이 빈 채로 뒤가 얹혀 그래프가 조용히 틀어진다(예외도 로그도 없다).
+        #
+        # latest 는 이 소설에서 **완료된 최대 화**다. 위에서 이미 받아온 값이라 Neo4j
+        # 왕복이 늘지 않는다. None 이면 인덱싱된 화가 없다는 뜻이라 1화만 허용된다.
+        # _MARKER_UNKNOWN 이면 그래프를 못 읽은 것이므로 통과시킨다 — 접수 관문과 같은
+        # 판단이다(모른다고 전부 막으면 인덱싱이 통째로 멈추는데, 어차피 인덱싱도 실패할
+        # 상황이라 막아서 얻는 것이 없다).
+        expected = (latest or 0) + 1
+        if latest is not _MARKER_UNKNOWN and episode["episode_no"] != expected:
+            logger.warning(
+                "앞 회차가 그래프에 없어 인덱싱하지 않는다 | jobId=%s episodeNo=%s expected=%s",
+                job_id,
+                episode["episode_no"],
+                expected,
+            )
+            episode.update(
+                {
+                    "error": (
+                        f"expected episodeNo {expected} but chapter "
+                        f"{episode['episode_no'] - 1} is not indexed"
+                    ),
+                    "status": "ERROR",
+                    "text": "",
+                }
+            )
+            # 같은 job의 뒤 화들도 어차피 같은 이유로 막힌다. 기존 연쇄 스킵에 태워
+            # 회차마다 Neo4j를 다시 묻지 않는다.
+            failed_no = episode["episode_no"]
             continue
 
         episode["status"] = "RUNNING"
