@@ -32,7 +32,7 @@ lorekeeper-ai/
 │  ├─ chatting-api-spec.md    # Chatting API 스펙 (Spring 팀용)
 │  └─ claim-pipeline-eval-result.md  # 파이프라인 확정 근거(실측)
 ├─ data/                      # 원문(저작권상 미커밋)
-├─ docker-compose.yml         # 로컬 Neo4j 2026.07 + PostgreSQL 17
+├─ compose.dev.yml            # 로컬 스택: 에이전트 + Neo4j 2026.07 (PostgreSQL 은 backend 쪽)
 ├─ requirements.txt           # 운영 의존성
 └─ requirements-dev.txt       # + 테스트
 ```
@@ -75,8 +75,9 @@ CloudFront ──/api/*──▶ Spring (:8080) ──▶ 이 서버 (127.0.0.1:
 ## 로컬 실행
 
 ```bash
-# 1. DB 기동 — Neo4j + PostgreSQL
-docker compose up -d
+# 1. DB 기동 — Neo4j 는 여기서, PostgreSQL 은 lorekeeper-backend 에서 띄운다
+docker compose -f compose.dev.yml up -d neo4j
+(cd ../lorekeeper-backend && docker compose -f compose.dev.yml up -d postgres)
 
 # 2. .env 구성 (.env.example 참고)
 cp .env.example .env    # OPENAI_API_KEY 와 DATABASE_URL 을 채운다
@@ -95,9 +96,10 @@ python3.12 -m venv .venv
 > **파이썬은 3.12로 고정한다.** 의존성 `python-mecab-ko`의 aarch64 휠이 cp312까지만
 > 제공된다. CI와 프로덕션도 같은 버전을 쓴다.
 
-> **포트 충돌 주의** — `lorekeeper-backend`의 `compose.dev.yml`도 5432와 7687을 쓴다.
-> 두 레포는 **같은 DB를 공유하는 것이 정상**이므로, 둘 중 한쪽만 띄우고 나머지는 그걸
-> 그대로 쓰면 된다.
+> **PostgreSQL은 이 레포에서 띄우지 않는다.** `lorekeeper-backend`의 `compose.dev.yml`이
+> 띄우는 것을 함께 쓴다 — 두 서비스가 **같은 DB를 공유하는 것이 정상**이고 스키마를 만드는
+> 쪽도 Spring이라 그쪽을 정본으로 둔다. 그래서 5432는 더 이상 겹치지 않는다.
+> 다만 Neo4j(7474/7687)는 양쪽 compose가 모두 띄우므로 여전히 **한쪽만** 올려야 한다.
 
 ### 확인
 
@@ -110,8 +112,8 @@ curl localhost:8000/api/health | python3 -m json.tool
 | | 로컬 | 프로덕션 |
 |---|---|---|
 | 설정 | `.env` | `/opt/agent/agent.env` — 배포 시 SSM/Secrets Manager 에서 생성 |
-| Neo4j | `docker compose` 컨테이너 | 전용 EC2 (사설 IP) |
-| PostgreSQL | `docker compose` 컨테이너 | RDS. 비밀번호는 RDS가 Secrets Manager에서 회전 |
+| Neo4j | `compose.dev.yml` 컨테이너 | 전용 EC2 (사설 IP) |
+| PostgreSQL | `lorekeeper-backend`의 `compose.dev.yml` 컨테이너 | RDS. 비밀번호는 RDS가 Secrets Manager에서 회전 |
 | OpenAI 키 | `.env` | SSM SecureString `/mono/openai_api_key` |
 
 **두 DB 모두 API 서버(`lorekeeper-backend`)와 공유한다.** PostgreSQL은 원고를 읽고
@@ -119,8 +121,8 @@ curl localhost:8000/api/health | python3 -m json.tool
 접속 변수의 형식은 서로 다르니 주의한다 — Spring은 URL·계정·비밀번호를 세 변수로 나눠
 받고(`SPRING_DATASOURCE_*`), 여기는 자격증명까지 담은 DSN 하나(`DATABASE_URL`)로 받는다.
 
-로컬에서 두 레포의 compose를 동시에 올리면 Neo4j·PostgreSQL 포트가 겹친다. **한쪽만**
-띄우고 다른 쪽은 그것을 가리킨다.
+로컬에서 두 레포의 compose를 동시에 올리면 Neo4j 포트(7474/7687)가 겹친다. **한쪽만**
+띄우고 다른 쪽은 그것을 가리킨다. PostgreSQL은 이 레포가 아예 띄우지 않으므로 겹치지 않는다.
 
 **프로덕션 자격증명은 이 레포에 없다.** 인스턴스가 자기 IAM 역할로 읽어간다.
 전체 그림은

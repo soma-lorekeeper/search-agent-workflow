@@ -1,0 +1,136 @@
+# 로컬 개발 스택. 에이전트 서버(FastAPI)와 Neo4j 를 띄운다.
+# 프로덕션에서는 둘 다 별도 리소스다 (에이전트 = EC2 의 systemd, Neo4j = 전용 EC2).
+# 여기 값들은 전부 로컬 전용이라 비밀이 아니다.
+#
+# **PostgreSQL 은 여기 없다.** API 서버(lorekeeper-backend)의 compose.dev.yml 이 띄우는
+# 것을 함께 쓴다 — 어차피 두 서비스가 같은 DB 를 보고, 스키마를 만드는 쪽도 Spring 이라
+# 그쪽을 정본으로 둔다. 그래서 이 스택만 띄우면 /api/health 의 postgres 점검이 실패한다.
+#
+#   docker compose -f compose.dev.yml up -d          # 에이전트 + Neo4j
+#   docker compose -f compose.dev.yml up -d neo4j    # Neo4j 만
+#
+# 파일 이름이 compose.dev.yml 이라 `-f` 가 필요하다(기본 파일명이 아니다).
+# lorekeeper-backend 의 compose.dev.yml 과 같은 이름·같은 구조로 맞춘 것이다.
+
+# 프로젝트명을 못 박는다. 지정하지 않으면 디렉터리명이 쓰이는데, 그러면 폴더를 옮기거나
+# 이름을 바꾸는 순간 볼륨 접두어가 달라져 기존 DB 데이터가 통째로 안 보이게 된다.
+name: lorekeeper-ai
+
+services:
+  agent:
+    # 이미지를 따로 빌드하지 않는다(Dockerfile 없음). 공식 slim 이미지에 소스를 마운트하고
+    # 의존성은 이름 붙인 볼륨 안의 venv 에 깔아 재사용한다 — lorekeeper-backend 의
+    # compose.dev.yml 이 devcontainer 이미지 + gradle-cache 볼륨으로 하는 것과 같은 구조다.
+    # 파이썬은 3.12 로 고정한다 — CI(.github/workflows/ci.yml)와 프로덕션이 쓰는 버전이고,
+    # 의존성 python-mecab-ko 의 aarch64 휠이 cp312 까지만 제공된다(readme 참고).
+    # 호스트의 .venv 는 3.11 이지만 그건 옛 경로에서 만들어져 방치된 것이라 기준으로 삼지 않는다.
+    image: python:3.12-slim
+    container_name: lorekeeper-ai-agent
+    # PID 1 로 뜬 셸이 시그널을 안 넘겨 Ctrl-C/stop 이 10초 타임아웃까지 매달리는 걸 막는다.
+    init: true
+    working_dir: /workspace
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        # venv 는 볼륨에 남으므로 두 번째 기동부터는 만들지 않는다.
+        [ -x /opt/venv/bin/python ] || python -m venv /opt/venv
+        # 매 기동마다 돌리지만, 이미 깔려 있으면 "already satisfied" 로 몇 초 만에 끝난다.
+        # requirements 가 바뀌었을 때 자동으로 따라오게 하려는 것이다.
+        /opt/venv/bin/pip install --disable-pip-version-check -q -r requirements-dev.txt
+        # 개발 스택이라 --reload 를 켠다. 마운트된 소스가 바뀌면 알아서 다시 로드한다.
+        exec /opt/venv/bin/uvicorn src.app:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      # ── 컨테이너 안에서만 다른 값 ────────────────────────────────
+      # .env 에는 호스트 기준 localhost 주소가 들어 있지만, 컨테이너 안에서 DB 는
+      # localhost 가 아니라 compose 서비스 이름으로 보인다.
+      #
+      # 여기 적은 값이 .env 를 **이긴다**: src/config.py 의 load_dotenv() 는 override 를
+      # 켜지 않아 이미 환경변수에 있는 값을 덮어쓰지 않는다. 그래서 컨테이너용 .env 를
+      # 따로 만들 필요가 없다.
+      NEO4J_URI: bolt://neo4j:7687
+      # Neo4j 는 같은 compose 네트워크라 서비스 이름으로 닿지만, PostgreSQL 은 다른
+      # 프로젝트(lorekeeper-backend)의 컨테이너라 네트워크가 다르다. 그쪽이 호스트에
+      # 5432 를 열어두므로 호스트를 경유해 닿는다.
+      # (backend 가 이 서버를 http://host.docker.internal:8000 으로 부르는 것과 대칭이다.)
+      SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5432/lorekeeper
+
+      # ── 나머지(OPENAI_API_KEY, NEO4J_USER/PASSWORD, SPRING_DATASOURCE_USERNAME/PASSWORD,
+      #    CHAT_MODEL, EXTRACTION_MODEL)는 여기 적지 않는다. 마운트된 /workspace/.env 를
+      #    src/config.py 가 읽는다 — 비밀을 compose 파일에 옮겨 적지 않기 위해서다.
+
+      # uvicorn 이 src 패키지를 확실히 찾게 한다(cwd 가 sys.path 에 들어가는지에 기대지 않는다).
+      PYTHONPATH: /workspace
+      # 로그가 파이프에 갇히지 않고 docker logs 에 바로 나오게 한다.
+      PYTHONUNBUFFERED: "1"
+      # 마운트된 호스트 소스에 컨테이너가 만든 .pyc 를 남기지 않는다.
+      # 호스트 파이썬과 버전이 어긋난 캐시가 섞이는 것도 함께 막는다.
+      PYTHONDONTWRITEBYTECODE: "1"
+      # (--reload 는 watchfiles 가 없어 StatReload 로 돈다. requirements 가 uvicorn 을
+      #  extras 없이 선언하기 때문이다. StatReload 는 파일 이벤트가 아니라 os.stat 폴링이라
+      #  이벤트가 잘 안 넘어오는 macOS 바인드 마운트에서 오히려 안전하다 — 따로 켤 설정이 없다.)
+    ports:
+      # 호스트에 그대로 노출한다. API 서버(lorekeeper-backend)의 compose.dev.yml 이
+      # LOREKEEPER_AGENT_BASE_URL=http://host.docker.internal:8000 으로 이 포트를 부른다.
+      # (프로덕션은 같은 EC2 의 127.0.0.1:8000 이라 외부에 열리지 않는다.)
+      - "8000:8000"
+    extra_hosts:
+      # Docker Desktop 은 이 이름을 기본 제공하지만, 리눅스 도커에는 없다.
+      # 명시해 두면 어느 환경에서든 같은 주소로 호스트에 닿는다.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 소스를 그대로 마운트한다 — 이미지를 다시 굽지 않고 코드를 고칠 수 있다.
+      - .:/workspace
+      # 의존성은 호스트의 .venv 와 섞이지 않게 컨테이너 전용 볼륨에 둔다.
+      # (호스트 .venv 는 리눅스가 아닌 macOS 용이라 애초에 재사용할 수 없다.)
+      - agent-venv:/opt/venv
+    depends_on:
+      # Neo4j 가 응답할 수 있을 때까지 기다린다. 그냥 started 로 두면 앱이 먼저 떠서
+      # 첫 요청이 연결 거부로 실패한다.
+      # PostgreSQL 은 다른 프로젝트라 여기서 기다릴 수단이 없다 — 그쪽 스택을 먼저 띄운다.
+      neo4j:
+        condition: service_healthy
+
+  neo4j:
+    # 2026.x 달력 버저닝. 5.26에서 올린 이유는 벡터 인덱스의 인-인덱스 필터(SEARCH 절)다 —
+    # 2026.02 GA이고 Community에서도 쓸 수 있다. 테넌트 격리가 검색 단계에서 걸러지면
+    # top_k가 남의 소설로 채워지지 않는다.
+    # 패치까지 고정한다 — `2026.07-community`도 같은 이미지를 가리키지만, 태그가 움직이면
+    # 로컬과 운영이 다른 빌드를 볼 수 있다. (참고: 2026.x에는 아직 LTS가 없다. 현행 LTS는
+    # 5.26이고 2028-11까지 지원된다 — 안정성이 우선이면 그쪽이 선택지지만, 인-인덱스 필터가
+    # 2026.02 GA라 테넌트 격리를 위해 올린다.)
+    image: neo4j:2026.07.1-community
+    container_name: lorekeeper-ai-neo4j
+    ports:
+      - "7474:7474"   # Neo4j Browser
+      - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/lorekeeper
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      # Cypher 언어 버전을 명시적으로 못박는다.
+      #
+      # 2025.06부터 Cypher가 5와 25로 갈렸고, SEARCH 절 같은 신규 기능은 25 전용이다.
+      # 2026.x 이미지는 빈 볼륨에 새로 뜨면 25가 기본이지만, **기존 볼륨을 살려 올리면
+      # 그 DB가 자기 설정(Cypher 5)을 유지한다.** 그러면 SEARCH 절이
+      # "42I67: parsable in CYPHER 25, but run in CYPHER 5"로 깨지는데,
+      # neo4j-graphrag는 쿼리에 `CYPHER 25` 프리픽스를 붙이지 않아서 라이브러리 경로도
+      # 함께 죽는다. 볼륨을 지웠는지에 동작이 달리는 걸 막으려고 여기서 고정한다.
+      # (도커 규칙: 설정 키의 `.`→`_`, 원래 `_`→`__`, 접두사 NEO4J_)
+      NEO4J_db_query_default__language: CYPHER_25
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "lorekeeper", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  agent-venv:
