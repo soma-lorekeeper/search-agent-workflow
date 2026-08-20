@@ -22,12 +22,30 @@ import asyncio
 import logging
 import random
 
-from openai import APIConnectionError, APIStatusError, AsyncOpenAI, RateLimitError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    RateLimitError,
+)
 
 from src.common import llm_limit
 from src.config import OPENAI_API_KEY
 
 logger = logging.getLogger("openai")
+
+# 호출 하나의 상한(초). 넉넉하게 잡는다.
+#
+# 예전에는 180초였고, 근거는 "죽은 요청이 세마포어 슬롯을 붙드는 시간"이었다. 그 계산은
+# 동시성이 4일 때 성립했는데, Tier 3 승격으로 LLM_MAX_CONCURRENCY가 80이 되어 슬롯
+# 압박이 사라졌다(src/common/llm_limit.py 참고).
+#
+# 반대로 인덱싱은 회차가 쌓일수록 추출 호출이 무거워진다 — 배경 컨텍스트(그래프 덤프)가
+# 회차당 약 1,900자씩 선형으로 자라기 때문이다(context_service.dump_graph_text). 실제로
+# 7화에서 180초를 넘겨 3번을 버리고 4번째에야 통과한 적이 있다. **될 호출을 상한 때문에
+# 버리는 것**이 이 값이 낮을 때의 진짜 손해라, 지연이 아니라 여유 쪽으로 잡는다.
+_TIMEOUT_SECONDS = 1800.0
 
 _client = AsyncOpenAI(
     api_key=OPENAI_API_KEY,
@@ -36,15 +54,22 @@ _client = AsyncOpenAI(
     # SDK가 재시도를 소진한 뒤에야 도달한다. 재시도 정책은 이 관문 한 층에만 둔다.
     # 대신 SDK가 커버하던 연결 오류·5xx 재시도는 아래 루프가 인수한다.
     max_retries=0,
-    # 기본값 600초는 죽은 요청이 세마포어 슬롯을 10분 붙드는 시간이다. 모든 호출이
-    # non-streaming이라 완결 응답 기준의 상한이면 충분하다. 넘기면 APITimeoutError
-    # (APIConnectionError의 하위 클래스)가 나서 아래 루프의 재시도 대상이 된다.
-    timeout=180.0,
+    # 모든 호출이 non-streaming이라 이 값은 "완결 응답까지의 상한"이다. 넘기면
+    # APITimeoutError(APIConnectionError의 하위 클래스)가 나서 아래 루프가 잡는다.
+    timeout=_TIMEOUT_SECONDS,
 )
 
 # 재시도 상한(429·연결 오류·5xx 공통). 판정은 한 호출에 27k 토큰을 쓰므로 몇 편만 겹쳐도
 # 조직 TPM에 순간적으로 몰린다 — 대개 몇 초 쉬면 풀린다.
 _MAX_ATTEMPTS = 5
+
+# 타임아웃만 따로, 훨씬 적게 시도한다.
+#
+# 위의 재시도들은 "기다리면 풀리는" 일시적 장애가 대상이다. 타임아웃은 성격이 다르다 —
+# 호출이 상한보다 오래 걸린다는 **결정적** 실패라, 다시 보내도 대개 같은 자리에서 죽는다.
+# 상한이 30분이므로 5회를 반복하면 그 회차 하나가 큐를 2시간 30분 막는다. 2회면 최악
+# 60분이고, 그 뒤엔 ERROR로 올려 호출자가 재제출을 판단하게 하는 편이 낫다.
+_TIMEOUT_MAX_ATTEMPTS = 2
 
 
 def _headers_of(exc: Exception) -> dict:
@@ -105,13 +130,31 @@ async def _request(create_raw, kwargs: dict):
                 raise
             await _backoff(attempt)
             continue
-        except APIConnectionError:
-            # 연결 실패와 타임아웃(APITimeoutError는 APIConnectionError의 하위 클래스).
+        except APITimeoutError:
+            # ⚠️ APIConnectionError의 **하위 클래스**라 반드시 그 분기보다 먼저 와야 한다.
+            #    순서가 바뀌면 아래 분기가 타임아웃까지 삼켜 _TIMEOUT_MAX_ATTEMPTS가 죽는다.
+            if attempt >= _TIMEOUT_MAX_ATTEMPTS - 1:
+                raise
+            logger.warning(
+                "OpenAI 호출 타임아웃(%.0f초) — 재시도한다 | attempt=%d",
+                _TIMEOUT_SECONDS,
+                attempt + 1,
+            )
+            await _backoff(attempt)
+            continue
+        except APIConnectionError as exc:
+            # 여기 오는 것은 순수 연결 실패다(타임아웃은 위에서 갈라졌다).
             # SDK 재시도를 껐으므로 일시적 네트워크 문제는 여기서 다시 시도해야 한다 —
             # 인덱싱은 한 화의 실패가 뒤 화 전부를 쓰러뜨리는 구조라 즉시 실패가 특히 아프다.
+            #
+            # 예외 타입을 함께 찍는다. 예전에는 문구가 "연결 실패" 하나여서 타임아웃과
+            # 진짜 연결 장애를 구분할 수 없었고, 네트워크가 멀쩡한데도 로그만 보고
+            # 네트워크를 의심하느라 원인 파악이 늦어진 적이 있다.
             if attempt == _MAX_ATTEMPTS - 1:
                 raise
-            logger.warning("OpenAI 연결 실패 — 재시도한다 | attempt=%d", attempt + 1)
+            logger.warning(
+                "OpenAI 연결 실패(%s) — 재시도한다 | attempt=%d", type(exc).__name__, attempt + 1
+            )
             await _backoff(attempt)
             continue
         except APIStatusError as exc:
